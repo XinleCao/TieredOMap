@@ -177,3 +177,142 @@ TEST(TieredOMap, SplitORAM_BandwidthSaving) {
     EXPECT_LT(r_split.total_bw.total_bytes(), r_nosplit.total_bw.total_bytes())
         << "Split-ORAM hot query should use less bandwidth than non-split";
 }
+
+// ─── Dynamic Maintenance tests ──────────────────────────────────────────────
+
+TEST(DynamicMaintenance, EpochMetadataEncodeDecode) {
+    Bytes val = int_to_bytes(42);
+    EpochMeta m{5, 3};
+    Bytes encoded = encode_with_epoch(val, m);
+    auto [decoded_val, decoded_m] = decode_epoch(encoded);
+    EXPECT_EQ(bytes_to_int(decoded_val), 42);
+    EXPECT_EQ(decoded_m.cnt, 5);
+    EXPECT_EQ(decoded_m.ep, 3);
+}
+
+TEST(DynamicMaintenance, MaintenanceManagerBasic) {
+    MaintenanceConfig mcfg;
+    mcfg.epoch_length = 10;
+    mcfg.promote_threshold = 3;
+    mcfg.demote_threshold = 1;
+    mcfg.staleness_epochs = 2;
+    mcfg.enabled = true;
+
+    MaintenanceManager mgr(mcfg);
+
+    EpochMeta stored{0, 0};
+    bool should_promote = false;
+
+    // Access a cold key multiple times within same epoch.
+    for (int i = 0; i < 5; ++i) {
+        stored = mgr.on_access(100, false, stored, should_promote);
+    }
+    EXPECT_EQ(stored.cnt, 5);
+    EXPECT_EQ(stored.ep, 1);
+
+    // The key should have been promoted (prev_freq >= threshold on epoch change).
+    // But we need to cross an epoch boundary for prev_freq to be set.
+    // Let's fill the epoch.
+    EpochMeta dummy{0, 0};
+    for (int i = 0; i < 5; ++i) {
+        dummy = mgr.on_access(200, true, dummy, should_promote);
+    }
+    // Now epoch should have advanced.
+    EXPECT_EQ(mgr.current_epoch(), 2);
+
+    // Access key 100 again in new epoch.
+    stored = mgr.on_access(100, false, stored, should_promote);
+    // prev_freq should be 5 (from last epoch), which >= promote_threshold=3.
+    EXPECT_TRUE(should_promote);
+}
+
+TEST(DynamicMaintenance, PromoteColdKey) {
+    int N = 64, n = 8;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys;
+    for (int i = 0; i < n; ++i) hot_keys.push_back(i);
+    tmap.init(data, hot_keys);
+
+    EXPECT_EQ(tmap.hot_set_size(), 8);
+
+    // Access cold key 32 repeatedly across epochs to trigger promotion.
+    for (int round = 0; round < 100; ++round) {
+        tmap.access(32);
+    }
+
+    // After enough accesses, key 32 should have been promoted.
+    auto result = tmap.access(32);
+    EXPECT_TRUE(result.found_in_hot)
+        << "Key 32 should have been promoted to hot tier";
+}
+
+TEST(DynamicMaintenance, DemoteStaleKey) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 100;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    EXPECT_EQ(tmap.hot_set_size(), 4);
+
+    // Only access cold keys for many epochs so hot keys become stale.
+    for (int round = 0; round < 200; ++round) {
+        tmap.access(16);
+    }
+
+    // At least some hot keys should have been demoted by the scan.
+    EXPECT_LT(tmap.hot_set_size(), 4)
+        << "Some stale hot keys should have been demoted";
+}
+
+TEST(DynamicMaintenance, ValuesPreservedWithEpoch) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.promote_threshold = 100;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 100;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    // Values should still be correctly readable despite epoch encoding.
+    for (int k = 0; k < N; ++k) {
+        auto result = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(result.value), k * 100)
+            << "Value mismatch at key " << k;
+    }
+
+    // Write a new value and read it back.
+    Bytes new_val = int_to_bytes(9999);
+    tmap.access(2, &new_val);
+    auto r = tmap.access(2);
+    EXPECT_EQ(bytes_to_int(r.value), 9999);
+}

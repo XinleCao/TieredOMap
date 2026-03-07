@@ -43,3 +43,6 @@ endforeach()
 
 add_executable(bench_tiered_omap benchmark/bench_tiered_omap.cpp)
 target_link_libraries(bench_tiered_omap PRIVATE tiered_omap)
+
+add_executable(bench_dynamic benchmark/bench_dynamic.cpp)
+target_link_libraries(bench_dynamic PRIVATE tiered_omap)
