@@ -1,6 +1,7 @@
 #include "tiered_omap/tiered_omap.h"
 #include "tiered_omap/omap/avl_omap.h"
 #include "tiered_omap/omap/bplus_omap.h"
+#include "tiered_omap/omap/da_ost_omap.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -42,10 +43,22 @@ void TieredOMap::init(
     int cold_cap = use_epoch ? std::max(N_cold, config_.total_keys) : std::max(N_cold, 1);
     hot_capacity_ = hot_cap;
 
-    if (config_.backend == OmapBackend::BPlus) {
+    switch (config_.backend) {
+    case OmapBackend::BPlus:
         hot_omap_ = std::make_unique<BPlusOmap>(hot_cap, config_.bplus_order, bs);
         cold_omap_ = std::make_unique<BPlusOmap>(cold_cap, config_.bplus_order, bs);
-    } else {
+        break;
+    case OmapBackend::DaAvl:
+        hot_omap_ = std::make_unique<DaOstOmap>(hot_cap, OdsTreeType::AVL, 0, bs);
+        cold_omap_ = std::make_unique<DaOstOmap>(cold_cap, OdsTreeType::AVL, 0, bs);
+        break;
+    case OmapBackend::DaBplus:
+        hot_omap_ = std::make_unique<DaOstOmap>(
+            hot_cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order);
+        cold_omap_ = std::make_unique<DaOstOmap>(
+            cold_cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order);
+        break;
+    default:  // AVL
         hot_omap_ = std::make_unique<AVLOmap>(hot_cap, bs);
         if (config_.use_split_oram && n > 0) {
             int split_depth = ceil_log2(std::max(n, 2));
@@ -54,6 +67,7 @@ void TieredOMap::init(
         } else {
             cold_omap_ = std::make_unique<AVLOmap>(cold_cap, bs);
         }
+        break;
     }
     hot_omap_->init(hot_data);
     cold_omap_->init(cold_data);

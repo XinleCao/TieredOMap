@@ -202,6 +202,62 @@ void DAOram::dummy_access() {
     total_bw_ += last_bw_;
 }
 
+// ─── Split access ───────────────────────────────────────────────────────────
+
+Bytes DAOram::access_without_eviction(int key) {
+    last_bw_.reset();
+
+    auto [cur_leaf, new_leaf] = update_counter(key);
+    int group = key / num_ic_;
+    auto [r_key, r_cur_leaf, r_new_leaf] = perform_reset(group);
+
+    {
+        auto merged = storage_.read_multiple_paths({cur_leaf, r_cur_leaf});
+        for (auto& [node, bucket] : merged)
+            for (auto& block : bucket)
+                if (!block.is_dummy()) stash_.push_back(block);
+    }
+
+    Block* target = find_in_stash(key);
+    if (!target)
+        throw std::runtime_error("DAOram::access_without_eviction: key " +
+                                 std::to_string(key) + " not found");
+    Bytes result = target->value;
+    target->leaf = new_leaf;
+
+    if (r_key >= 0) {
+        Block* r_block = find_in_stash(r_key);
+        if (r_block) r_block->leaf = r_new_leaf;
+    }
+
+    pending_leaves_ = {cur_leaf, r_cur_leaf};
+
+    last_bw_.rounds = 1;
+    int path_blocks = storage_.level() * bucket_size_;
+    last_bw_.bytes_downloaded = 2 * path_blocks * (block_size_bytes_ + 8);
+    last_bw_.bytes_uploaded = 0;
+    total_bw_ += last_bw_;
+
+    return result;
+}
+
+void DAOram::complete_eviction(int key, const Bytes& new_value) {
+    last_bw_.reset();
+
+    Block* target = find_in_stash(key);
+    if (target) target->value = new_value;
+
+    evict_and_write_paths(pending_leaves_);
+
+    last_bw_.rounds = 1;
+    int path_blocks = storage_.level() * bucket_size_;
+    last_bw_.bytes_downloaded = 0;
+    last_bw_.bytes_uploaded = 2 * path_blocks * (block_size_bytes_ + 8);
+    total_bw_ += last_bw_;
+
+    pending_leaves_.clear();
+}
+
 // ─── Low-level ORAM operations ──────────────────────────────────────────────
 
 void DAOram::read_path_to_stash(int leaf) {

@@ -13,6 +13,7 @@ add_library(tiered_omap STATIC
     src/oram/da_oram.cpp
     src/omap/avl_omap.cpp
     src/omap/bplus_omap.cpp
+    src/omap/da_ost_omap.cpp
     src/tiered_omap.cpp
 )
 
@@ -33,13 +34,14 @@ find_package(GTest REQUIRED)
 
 enable_testing()
 
-add_executable(test_path_oram   tests/test_path_oram.cpp)
-add_executable(test_da_oram     tests/test_da_oram.cpp)
-add_executable(test_avl_omap    tests/test_avl_omap.cpp)
-add_executable(test_bplus_omap  tests/test_bplus_omap.cpp)
-add_executable(test_tiered_omap tests/test_tiered_omap.cpp)
+add_executable(test_path_oram    tests/test_path_oram.cpp)
+add_executable(test_da_oram      tests/test_da_oram.cpp)
+add_executable(test_avl_omap     tests/test_avl_omap.cpp)
+add_executable(test_bplus_omap   tests/test_bplus_omap.cpp)
+add_executable(test_da_ost_omap  tests/test_da_ost_omap.cpp)
+add_executable(test_tiered_omap  tests/test_tiered_omap.cpp)
 
-foreach(tgt test_path_oram test_da_oram test_avl_omap test_bplus_omap test_tiered_omap)
+foreach(tgt test_path_oram test_da_oram test_avl_omap test_bplus_omap test_da_ost_omap test_tiered_omap)
     target_link_libraries(${tgt} PRIVATE tiered_omap GTest::gtest_main)
     add_test(NAME ${tgt} COMMAND ${tgt})
 endforeach()

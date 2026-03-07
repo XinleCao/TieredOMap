@@ -44,6 +44,18 @@ public:
     const BandwidthStats& total_stats() const override { return total_bw_; }
     void reset_stats() override { last_bw_.reset(); total_bw_.reset(); }
 
+    // ODS mode: used as inner tree by DaOstOmap.
+    void set_ods_mode(int tree_height_bound) {
+        ods_mode_ = true;
+        max_height_ = tree_height_bound;
+    }
+    void set_root(int id, int leaf) { root_id_ = id; root_leaf_ = leaf; }
+    std::pair<int,int> get_root() const { return {root_id_, root_leaf_}; }
+    int last_op_count() const { return op_count_; }
+    PathORAM& oram() { return oram_; }
+    void set_next_block_id(int id) { next_block_id_ = id; }
+    int next_block_id() const { return next_block_id_; }
+
 private:
     struct LocalNode {
         int id;
@@ -90,6 +102,7 @@ private:
     PathORAM oram_;
     std::vector<LocalNode> local_;
     std::vector<CachedSibling> sibling_cache_;
+    bool ods_mode_ = false;
     int op_count_ = 0;
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;

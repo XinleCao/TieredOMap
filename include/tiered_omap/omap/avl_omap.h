@@ -52,6 +52,16 @@ public:
     int max_height() const { return max_height_; }
     bool is_split() const { return split_depth_ > 0; }
 
+    // ODS mode: used as inner tree by DaOstOmap.
+    void set_ods_mode(int tree_height_bound) {
+        ods_mode_ = true;
+        max_height_ = tree_height_bound;
+    }
+    void set_root(int key, int leaf) { root_key_ = key; root_leaf_ = leaf; }
+    std::pair<int,int> get_root() const { return {root_key_, root_leaf_}; }
+    int last_op_count() const { return op_count_; }
+    PathORAM& oram() { return oram_; }
+
 private:
     struct LocalNode {
         int key;
@@ -88,6 +98,7 @@ private:
     PathORAM oram_;              // lower ORAM (or sole ORAM when no split)
 
     std::vector<LocalNode> local_;
+    bool ods_mode_ = false;
     int op_count_ = 0;          // used in non-split mode
     int upper_op_count_ = 0;    // split mode: ops on upper_oram
     int lower_op_count_ = 0;    // split mode: ops on oram_ (lower)

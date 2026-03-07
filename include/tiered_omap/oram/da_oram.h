@@ -30,6 +30,10 @@ public:
     Bytes access(int key, const Bytes* new_value = nullptr);
     void dummy_access();
 
+    // Split access: read without eviction, then evict with updated value.
+    Bytes access_without_eviction(int key);
+    void complete_eviction(int key, const Bytes& new_value);
+
     // Low-level interface for ODS OMAPs (same as PathORAM).
     void read_path_to_stash(int leaf);
     void evict_and_write_path(int leaf);
@@ -78,6 +82,7 @@ private:
 
     uint64_t prf_seed_ = 0;
     int block_size_bytes_ = 0;
+    std::vector<int> pending_leaves_;
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;
 };

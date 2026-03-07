@@ -317,13 +317,15 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
     reassign_leaves();
     flush_local_to_stash();
 
-    int pad = std::max(0, budget - ops);
-    if (split_depth_ > 0) {
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        lower_op_count_ += pad;
-    } else {
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        op_count_ += pad;
+    if (!ods_mode_) {
+        int pad = std::max(0, budget - ops);
+        if (split_depth_ > 0) {
+            for (int i = 0; i < pad; ++i) oram_.dummy_access();
+            lower_op_count_ += pad;
+        } else {
+            for (int i = 0; i < pad; ++i) oram_.dummy_access();
+            op_count_ += pad;
+        }
     }
     finalize_bw();
     return result;
@@ -454,13 +456,15 @@ void AVLOmap::insert(int key, const Bytes& value) {
     reassign_leaves();
     flush_local_to_stash();
 
-    int pad = std::max(0, budget - ops);
-    if (split_depth_ > 0) {
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        lower_op_count_ += pad;
-    } else {
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        op_count_ += pad;
+    if (!ods_mode_) {
+        int pad = std::max(0, budget - ops);
+        if (split_depth_ > 0) {
+            for (int i = 0; i < pad; ++i) oram_.dummy_access();
+            lower_op_count_ += pad;
+        } else {
+            for (int i = 0; i < pad; ++i) oram_.dummy_access();
+            op_count_ += pad;
+        }
     }
     finalize_bw();
 }
@@ -705,11 +709,12 @@ void AVLOmap::remove(int key) {
     reassign_leaves();
     flush_local_to_stash();
 
-    // Pad to budget.
-    int total_ops = phase1_ops + phase2_ops;
-    int pad = std::max(0, budget - total_ops);
-    for (int i = 0; i < pad; ++i) oram_.dummy_access();
-    if (split_depth_ == 0) op_count_ += pad;
+    if (!ods_mode_) {
+        int total_ops = phase1_ops + phase2_ops;
+        int pad = std::max(0, budget - total_ops);
+        for (int i = 0; i < pad; ++i) oram_.dummy_access();
+        if (split_depth_ == 0) op_count_ += pad;
+    }
     finalize_bw();
 }
 

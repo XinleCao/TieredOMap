@@ -525,7 +525,7 @@ Bytes BPlusOmap::search(int key, const Bytes* update) {
     op_count_ = 0;
 
     if (root_id_ == INVALID_KEY) {
-        do_dummy_ops(2 * max_height_);
+        if (!ods_mode_) do_dummy_ops(2 * max_height_);
         finalize_bw();
         return {};
     }
@@ -543,7 +543,7 @@ Bytes BPlusOmap::search(int key, const Bytes* update) {
 
     reassign_all_leaves();
     flush_all_to_stash();
-    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    if (!ods_mode_) do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
     finalize_bw();
     return result;
 }
@@ -563,7 +563,7 @@ void BPlusOmap::insert(int key, const Bytes& value) {
         oram_.add_to_stash({id, lf, leaf.encode()});
         root_id_ = id;
         root_leaf_ = lf;
-        do_dummy_ops(2 * max_height_);
+        if (!ods_mode_) do_dummy_ops(2 * max_height_);
         finalize_bw();
         return;
     }
@@ -621,7 +621,7 @@ void BPlusOmap::insert(int key, const Bytes& value) {
 
     reassign_all_leaves();
     flush_all_to_stash();
-    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    if (!ods_mode_) do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
     finalize_bw();
 }
 
@@ -630,7 +630,7 @@ void BPlusOmap::remove(int key) {
     op_count_ = 0;
 
     if (root_id_ == INVALID_KEY) {
-        do_dummy_ops(2 * max_height_);
+        if (!ods_mode_) do_dummy_ops(2 * max_height_);
         finalize_bw();
         return;
     }
@@ -648,14 +648,14 @@ void BPlusOmap::remove(int key) {
     handle_delete_underflow();
     reassign_all_leaves();
     flush_all_to_stash();
-    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    if (!ods_mode_) do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
     finalize_bw();
 }
 
 void BPlusOmap::dummy_access() {
     last_bw_.reset();
     op_count_ = 0;
-    do_dummy_ops(2 * max_height_);
+    if (!ods_mode_) do_dummy_ops(2 * max_height_);
     finalize_bw();
 }
 

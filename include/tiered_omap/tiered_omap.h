@@ -16,7 +16,9 @@ enum class SecurityMode {
 
 enum class OmapBackend {
     AVL,
-    BPlus
+    BPlus,
+    DaAvl,
+    DaBplus
 };
 
 struct TieredOMapConfig {
