@@ -55,3 +55,6 @@ target_link_libraries(bench_comptime PRIVATE tiered_omap)
 
 add_executable(bench_rounds benchmark/bench_rounds.cpp)
 target_link_libraries(bench_rounds PRIVATE tiered_omap)
+
+add_executable(bench_large benchmark/bench_large.cpp)
+target_link_libraries(bench_large PRIVATE tiered_omap)
