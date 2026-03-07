@@ -18,6 +18,8 @@ public:
 
     virtual void init(const std::vector<std::pair<int, Bytes>>& data) = 0;
 
+    virtual void set_round_delay_us(int /*us*/) {}
+
     virtual const BandwidthStats& last_stats() const = 0;
     virtual const BandwidthStats& total_stats() const = 0;
     virtual void reset_stats() = 0;

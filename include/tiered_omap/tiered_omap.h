@@ -44,6 +44,11 @@ public:
     void promote(int key);
     void demote(int key);
 
+    void set_round_delay_us(int us) {
+        if (hot_omap_) hot_omap_->set_round_delay_us(us);
+        if (cold_omap_) cold_omap_->set_round_delay_us(us);
+    }
+
     SecurityMode mode() const { return config_.mode; }
     int hot_set_size() const { return static_cast<int>(hot_keys_.size()); }
     int cold_set_size() const { return config_.total_keys - hot_set_size(); }

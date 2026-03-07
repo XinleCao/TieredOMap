@@ -1,0 +1,4 @@
+config,read_bw,write_bw
+SingleOMAP,117632,117632
+TM_split,110191,107645
+FO_split,147744,147744

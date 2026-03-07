@@ -46,3 +46,12 @@ target_link_libraries(bench_tiered_omap PRIVATE tiered_omap)
 
 add_executable(bench_dynamic benchmark/bench_dynamic.cpp)
 target_link_libraries(bench_dynamic PRIVATE tiered_omap)
+
+add_executable(bench_latency benchmark/bench_latency.cpp)
+target_link_libraries(bench_latency PRIVATE tiered_omap)
+
+add_executable(bench_comptime benchmark/bench_comptime.cpp)
+target_link_libraries(bench_comptime PRIVATE tiered_omap)
+
+add_executable(bench_rounds benchmark/bench_rounds.cpp)
+target_link_libraries(bench_rounds PRIVATE tiered_omap)

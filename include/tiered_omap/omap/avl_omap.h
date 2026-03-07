@@ -39,6 +39,11 @@ public:
     void dummy_access() override;
     void partial_dummy_access() override;
 
+    void set_round_delay_us(int us) override {
+        oram_.set_round_delay_us(us);
+        if (split_depth_ > 0) upper_oram_.set_round_delay_us(us);
+    }
+
     const BandwidthStats& last_stats() const override { return last_bw_; }
     const BandwidthStats& total_stats() const override { return total_bw_; }
     void reset_stats() override { last_bw_.reset(); total_bw_.reset(); }

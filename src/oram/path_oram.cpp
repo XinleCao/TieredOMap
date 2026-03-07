@@ -71,6 +71,7 @@ Bytes PathORAM::access(int key, const Bytes* new_value) {
 
     // Evict and write back.
     evict_and_write_path(old_leaf);
+    inject_round_delay();
 
     last_bw_.rounds = 1;
     int path_blocks = storage_.level() * bucket_size_;
@@ -85,6 +86,7 @@ void PathORAM::dummy_access() {
     int leaf = random_leaf();
     read_path_to_stash(leaf);
     evict_and_write_path(leaf);
+    inject_round_delay();
 
     last_bw_.reset();
     last_bw_.rounds = 1;

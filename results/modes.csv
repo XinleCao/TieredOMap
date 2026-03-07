@@ -1,0 +1,4 @@
+mode,avg_bw,avg_rnd,avg_ans_rnd,hit_pct,wan30_latency_ms,wan30_ans_ms,wan80_latency_ms,wan80_ans_ms
+SingleOMAP,117504,24,24,0,720,720,1920,1920
+TierMembership,110191,18.69,18.69,59,560.7,560.7,1495.2,1495.2
+FullOblivious,147744,24,18.69,59,720,560.7,1920,1495.2

@@ -197,6 +197,7 @@ void AVLOmap::move_to_local(int key, int leaf, int parent_key, int depth) {
     AVLNodeData nd = AVLNodeData::decode(block.value);
     local_.push_back({key, block.leaf, nd, parent_key, depth});
     oram.evict_and_write_path(leaf);
+    oram.inject_round_delay();
 
     if (split_depth_ > 0) {
         if (depth < split_depth_) ++upper_op_count_;
