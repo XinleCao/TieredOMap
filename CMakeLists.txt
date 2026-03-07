@@ -22,6 +22,11 @@ target_include_directories(tiered_omap PUBLIC
 
 target_compile_options(tiered_omap PRIVATE -Wall -Wextra -Wpedantic)
 
+# ─── OpenSSL (AES-128 encryption) ────────────────────────────────────────────
+
+find_package(OpenSSL REQUIRED)
+target_link_libraries(tiered_omap PUBLIC OpenSSL::Crypto)
+
 # ─── Google Test ─────────────────────────────────────────────────────────────
 
 find_package(GTest REQUIRED)

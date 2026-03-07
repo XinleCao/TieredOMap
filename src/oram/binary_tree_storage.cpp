@@ -4,8 +4,7 @@
 namespace tiered_omap {
 
 BinaryTreeStorage::BinaryTreeStorage(int num_data, int bucket_size)
-    : num_data_(num_data),
-      bucket_size_(bucket_size) {
+    : bucket_size_(bucket_size) {
     level_ = ceil_log2(num_data) + 1;
     leaf_range_ = 1 << (level_ - 1);
     total_nodes_ = (1 << level_) - 1;
@@ -62,7 +61,7 @@ BinaryTreeStorage::read_path(int leaf) const {
 }
 
 void BinaryTreeStorage::write_path(
-    int leaf, const std::unordered_map<int, std::vector<Block>>& buckets) {
+    int /*leaf*/, const std::unordered_map<int, std::vector<Block>>& buckets) {
     for (auto& [node, blocks] : buckets)
         storage_[node] = blocks;
 }
@@ -85,7 +84,7 @@ void BinaryTreeStorage::write_multiple_paths(
 bool BinaryTreeStorage::fill_block_to_path(
     const Block& block,
     std::unordered_map<int, std::vector<Block>>& path,
-    const std::vector<int>& leaves,
+    const std::vector<int>& /*leaves*/,
     int level, int bucket_size) {
     int leaf_range = 1 << (level - 1);
 

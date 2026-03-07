@@ -33,6 +33,13 @@ public:
     void remove(int key) override;
     void dummy_access() override;
 
+    Bytes search_piggyback(int key, const Bytes* update,
+                           int extra_key, char extra_op,
+                           const Bytes* extra_value,
+                           Bytes* extra_result) override;
+
+    void set_round_delay_us(int us) override { oram_.set_round_delay_us(us); }
+
     const BandwidthStats& last_stats() const override { return last_bw_; }
     const BandwidthStats& total_stats() const override { return total_bw_; }
     void reset_stats() override { last_bw_.reset(); total_bw_.reset(); }
@@ -45,26 +52,33 @@ private:
         int parent_id;
     };
 
+    struct CachedSibling {
+        int id = INVALID_KEY;
+        int leaf = INVALID_LEAF;
+        BPlusNode node;
+        int parent_local_idx = -1;
+        int child_idx_in_parent = -1;
+    };
+
     void move_to_local(int id, int leaf, int parent_id);
-    void flush_local_to_stash();
-    void reassign_leaves();
+    void move_to_sibling_cache(int id, int leaf, int parent_local_idx, int child_idx);
+    int traverse_with_siblings(int key);
+    void flush_all_to_stash();
+    void reassign_all_leaves();
     void do_dummy_ops(int count);
 
-    // Find the child index for key in an internal node.
     static int find_child_index(const BPlusNode& node, int key);
-    // Find the value index for key in a leaf node.
     static int find_leaf_index(const BPlusNode& node, int key);
 
-    // Split a full leaf node; returns the new sibling's ORAM id.
     int split_leaf(LocalNode& leaf_node);
-    // Split a full internal node; returns the new sibling's ORAM id.
     int split_internal(LocalNode& internal_node);
 
-    // Build B+ tree bottom-up from sorted data, returns root ORAM id.
+    int min_leaf_keys() const;
+    void handle_delete_underflow();
+
     int build_tree(const std::vector<std::pair<int, Bytes>>& sorted,
                    std::unordered_map<int, Bytes>& oram_data);
 
-    int capacity_ = 0;
     int order_ = 8;
     int max_height_ = 0;
     int root_id_ = INVALID_KEY;
@@ -75,6 +89,7 @@ private:
 
     PathORAM oram_;
     std::vector<LocalNode> local_;
+    std::vector<CachedSibling> sibling_cache_;
     int op_count_ = 0;
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;

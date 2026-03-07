@@ -11,6 +11,7 @@ struct MaintenanceConfig {
     int demote_threshold = 2;
     int staleness_epochs = 3;
     bool enabled = false;
+    bool piggyback = false;
 };
 
 enum class MaintenanceAction { None, Promote, Demote };
@@ -58,6 +59,12 @@ public:
     // Check if a maintenance step (scan+demote or promote) should run now.
     bool should_maintain() const {
         return access_counter_ == 0 && current_epoch_ > 0;
+    }
+
+    // Will the *next* access tick trigger maintenance?
+    // (counter is at epoch_length-1 before the on_access that will wrap it)
+    bool should_maintain_next() const {
+        return access_counter_ == cfg_.epoch_length - 1;
     }
 
     // Get the next hot entry index to scan for demotion.

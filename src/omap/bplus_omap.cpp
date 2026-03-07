@@ -6,9 +6,6 @@
 namespace tiered_omap {
 
 // ─── BPlusNode encoding ────────────────────────────────────────────────────
-// Format: [is_leaf:1][num_keys:4][keys...][children or values...]
-// Internal: after keys → [child_id:4, child_leaf:4] × (num_keys+1)
-// Leaf:     after keys → [val_size:4, val_data...] × num_keys
 
 Bytes BPlusNode::encode() const {
     Bytes buf;
@@ -77,8 +74,7 @@ BPlusNode BPlusNode::decode(const Bytes& raw) {
 // ─── BPlusOmap ──────────────────────────────────────────────────────────────
 
 BPlusOmap::BPlusOmap(int capacity, int order, int bucket_size)
-    : capacity_(capacity),
-      order_(order),
+    : order_(order),
       oram_(capacity, bucket_size) {
     int half = std::max(static_cast<int>(std::ceil(order / 2.0)), 2);
     max_height_ = std::max(1,
@@ -93,8 +89,7 @@ int BPlusOmap::build_tree(
     std::unordered_map<int, Bytes>& oram_data) {
     if (sorted.empty()) return INVALID_KEY;
 
-    // Step 1: Create leaf nodes.
-    std::vector<std::pair<int, int>> level_ids;  // (smallest_key, oram_id)
+    std::vector<std::pair<int, int>> level_ids;
     int max_leaf_keys = order_ - 1;
 
     for (size_t i = 0; i < sorted.size(); ) {
@@ -111,7 +106,6 @@ int BPlusOmap::build_tree(
         i = end;
     }
 
-    // Step 2: Build internal levels bottom-up until one root remains.
     int max_children = order_;
     while (level_ids.size() > 1) {
         std::vector<std::pair<int, int>> next_level;
@@ -121,7 +115,7 @@ int BPlusOmap::build_tree(
             size_t end = std::min(i + max_children, level_ids.size());
             for (size_t j = i; j < end; ++j) {
                 internal.child_ids.push_back(level_ids[j].second);
-                internal.child_leaves.push_back(INVALID_LEAF);  // fixed later
+                internal.child_leaves.push_back(INVALID_LEAF);
                 if (j > i)
                     internal.keys.push_back(level_ids[j].first);
             }
@@ -151,7 +145,6 @@ void BPlusOmap::init(const std::vector<std::pair<int, Bytes>>& data) {
     std::unordered_map<int, Bytes> oram_data;
     int root = build_tree(sorted, oram_data);
 
-    // Decode all nodes, assign leaves from ORAM pos_map, fix child_leaves.
     std::unordered_map<int, BPlusNode> nodes;
     for (auto& [k, v] : oram_data)
         nodes[k] = BPlusNode::decode(v);
@@ -160,7 +153,6 @@ void BPlusOmap::init(const std::vector<std::pair<int, Bytes>>& data) {
     for (auto& [k, _] : nodes)
         oram_.set_leaf(k, oram_.random_leaf());
 
-    // Fix child_leaves in internal nodes.
     for (auto& [k, nd] : nodes) {
         if (!nd.is_leaf) {
             for (size_t i = 0; i < nd.child_ids.size(); ++i)
@@ -177,10 +169,9 @@ void BPlusOmap::init(const std::vector<std::pair<int, Bytes>>& data) {
     root_leaf_ = oram_.get_leaf(root);
 }
 
-// ─── Core operations ────────────────────────────────────────────────────────
+// ─── Low-level helpers ──────────────────────────────────────────────────────
 
 int BPlusOmap::find_child_index(const BPlusNode& node, int key) {
-    // Returns index i such that keys[i-1] <= key < keys[i].
     int i = 0;
     while (i < static_cast<int>(node.keys.size()) && key >= node.keys[i])
         ++i;
@@ -202,46 +193,14 @@ void BPlusOmap::move_to_local(int id, int leaf, int parent_id) {
     ++op_count_;
 }
 
-void BPlusOmap::flush_local_to_stash() {
-    for (auto& ln : local_) {
-        Block block{ln.id, ln.leaf, ln.node.encode()};
-        oram_.add_to_stash(block);
-    }
-    local_.clear();
-}
-
-void BPlusOmap::reassign_leaves() {
-    for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
-        auto& ln = local_[i];
-        int new_leaf = oram_.random_leaf();
-        oram_.set_leaf(ln.id, new_leaf);
-        ln.leaf = new_leaf;
-    }
-
-    // Fix child_leaves in parent nodes.
-    for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
-        auto& child = local_[i];
-        if (child.parent_id == INVALID_KEY) continue;
-        for (auto& parent : local_) {
-            if (parent.id != child.parent_id) continue;
-            if (parent.node.is_leaf) break;
-            for (size_t j = 0; j < parent.node.child_ids.size(); ++j) {
-                if (parent.node.child_ids[j] == child.id) {
-                    parent.node.child_leaves[j] = child.leaf;
-                    break;
-                }
-            }
-            break;
-        }
-    }
-
-    // Update root_leaf_.
-    for (auto& ln : local_) {
-        if (ln.id == root_id_) {
-            root_leaf_ = ln.leaf;
-            break;
-        }
-    }
+void BPlusOmap::move_to_sibling_cache(int id, int leaf,
+                                       int parent_local_idx, int child_idx) {
+    oram_.read_path_to_stash(leaf);
+    Block block = oram_.extract_from_stash(id);
+    BPlusNode nd = BPlusNode::decode(block.value);
+    sibling_cache_.push_back({id, block.leaf, nd, parent_local_idx, child_idx});
+    oram_.evict_and_write_path(leaf);
+    ++op_count_;
 }
 
 void BPlusOmap::do_dummy_ops(int count) {
@@ -258,152 +217,263 @@ void BPlusOmap::finalize_bw() {
     total_bw_ += last_bw_;
 }
 
-Bytes BPlusOmap::search(int key, const Bytes* update) {
-    last_bw_.reset();
-    op_count_ = 0;
+int BPlusOmap::min_leaf_keys() const {
+    return std::max(1, (order_ + 1) / 2 - 1);
+}
 
-    if (root_id_ == INVALID_KEY) {
-        do_dummy_ops(max_height_);
-        finalize_bw();
-        return {};
-    }
+// ─── Unified traversal: reads target + sibling at every level ───────────────
 
+int BPlusOmap::traverse_with_siblings(int key) {
     local_.clear();
-    Bytes result;
+    sibling_cache_.clear();
+
     int cur_id = root_id_;
     int cur_leaf = root_leaf_;
-    int ops = 0;
+    int ops_start = op_count_;
 
     for (int d = 0; d < max_height_; ++d) {
         if (cur_id == INVALID_KEY) break;
 
         int parent = local_.empty() ? INVALID_KEY : local_.back().id;
         move_to_local(cur_id, cur_leaf, parent);
-        ops++;
         auto& ln = local_.back();
 
         if (ln.node.is_leaf) {
-            int idx = find_leaf_index(ln.node, key);
-            if (idx >= 0) {
-                result = ln.node.values[idx];
-                if (update) ln.node.values[idx] = *update;
-            }
+            oram_.dummy_access();
+            op_count_++;
             break;
-        } else {
-            int ci = find_child_index(ln.node, key);
-            cur_id = ln.node.child_ids[ci];
-            cur_leaf = ln.node.child_leaves[ci];
         }
+
+        int ci = find_child_index(ln.node, key);
+        int num_ch = static_cast<int>(ln.node.child_ids.size());
+        int sib_idx = (ci > 0) ? ci - 1 : ((ci + 1 < num_ch) ? ci + 1 : -1);
+
+        if (sib_idx >= 0) {
+            int ploc = static_cast<int>(local_.size()) - 1;
+            move_to_sibling_cache(
+                ln.node.child_ids[sib_idx],
+                ln.node.child_leaves[sib_idx],
+                ploc, sib_idx);
+        } else {
+            oram_.dummy_access();
+            op_count_++;
+        }
+
+        cur_id = ln.node.child_ids[ci];
+        cur_leaf = ln.node.child_leaves[ci];
     }
 
-    do_dummy_ops(max_height_ - ops);
-    reassign_leaves();
-    flush_local_to_stash();
-
-    finalize_bw();
-    return result;
+    return op_count_ - ops_start;
 }
 
-void BPlusOmap::dummy_access() {
-    last_bw_.reset();
-    op_count_ = 0;
-    do_dummy_ops(max_height_);
-    finalize_bw();
-}
+// ─── Reassign ORAM leaves for all cached nodes ─────────────────────────────
 
-// ─── Insert (simplified: in-place if leaf has room, otherwise no-op) ────────
-
-void BPlusOmap::insert(int key, const Bytes& value) {
-    last_bw_.reset();
-    op_count_ = 0;
-
-    if (root_id_ == INVALID_KEY) {
-        BPlusNode leaf;
-        leaf.is_leaf = true;
-        leaf.keys = {key};
-        leaf.values = {value};
-        int id = next_block_id_++;
-        int lf = oram_.random_leaf();
-        oram_.set_leaf(id, lf);
-        oram_.add_to_stash({id, lf, leaf.encode()});
-        root_id_ = id;
-        root_leaf_ = lf;
-        do_dummy_ops(max_height_);
-        finalize_bw();
-        return;
+void BPlusOmap::reassign_all_leaves() {
+    for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+        auto& ln = local_[i];
+        int nl = oram_.random_leaf();
+        oram_.set_leaf(ln.id, nl);
+        ln.leaf = nl;
     }
 
-    // Traverse to the target leaf.
-    local_.clear();
-    int cur_id = root_id_;
-    int cur_leaf = root_leaf_;
-    int ops = 0;
+    for (auto& sib : sibling_cache_) {
+        if (sib.id == INVALID_KEY) continue;
+        int nl = oram_.random_leaf();
+        oram_.set_leaf(sib.id, nl);
+        sib.leaf = nl;
+    }
 
-    for (int d = 0; d < max_height_; ++d) {
-        if (cur_id == INVALID_KEY) break;
-        int parent = local_.empty() ? INVALID_KEY : local_.back().id;
-        move_to_local(cur_id, cur_leaf, parent);
-        ops++;
-        auto& ln = local_.back();
-
-        if (ln.node.is_leaf) {
-            // Insert in sorted order.
-            auto it = std::lower_bound(ln.node.keys.begin(),
-                                       ln.node.keys.end(), key);
-            int pos = static_cast<int>(it - ln.node.keys.begin());
-            ln.node.keys.insert(it, key);
-            ln.node.values.insert(ln.node.values.begin() + pos, value);
-
-            // If full, split.
-            if (static_cast<int>(ln.node.keys.size()) >= order_) {
-                int new_id = split_leaf(ln);
-                // Propagate split up to parent if needed.
-                if (ln.parent_id != INVALID_KEY) {
-                    for (auto& p : local_) {
-                        if (p.id == ln.parent_id && !p.node.is_leaf) {
-                            // Find position and insert new child.
-                            int ci = find_child_index(p.node, ln.node.keys.back());
-                            // The new sibling's smallest key becomes a separator.
-                            BPlusNode& new_sib_node = local_.back().node;
-                            int sep = new_sib_node.keys[0];
-                            p.node.keys.insert(
-                                p.node.keys.begin() + ci, sep);
-                            int new_leaf = oram_.get_leaf(new_id);
-                            p.node.child_ids.insert(
-                                p.node.child_ids.begin() + ci + 1, new_id);
-                            p.node.child_leaves.insert(
-                                p.node.child_leaves.begin() + ci + 1, new_leaf);
-                            break;
-                        }
-                    }
-                } else {
-                    // Split at root: create new root.
-                    BPlusNode new_root;
-                    new_root.is_leaf = false;
-                    BPlusNode& new_sib = local_.back().node;
-                    new_root.keys = {new_sib.keys[0]};
-                    new_root.child_ids = {ln.id, new_id};
-                    new_root.child_leaves = {ln.leaf, oram_.get_leaf(new_id)};
-                    int rid = next_block_id_++;
-                    int rlf = oram_.random_leaf();
-                    oram_.set_leaf(rid, rlf);
-                    local_.push_back({rid, rlf, new_root, INVALID_KEY});
-                    root_id_ = rid;
+    for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+        auto& child = local_[i];
+        if (child.parent_id == INVALID_KEY) continue;
+        for (auto& p : local_) {
+            if (p.id != child.parent_id || p.node.is_leaf) continue;
+            for (size_t j = 0; j < p.node.child_ids.size(); ++j) {
+                if (p.node.child_ids[j] == child.id) {
+                    p.node.child_leaves[j] = child.leaf;
+                    break;
                 }
             }
             break;
-        } else {
-            int ci = find_child_index(ln.node, key);
-            cur_id = ln.node.child_ids[ci];
-            cur_leaf = ln.node.child_leaves[ci];
         }
     }
 
-    reassign_leaves();
-    flush_local_to_stash();
-    do_dummy_ops(std::max(0, 2 * max_height_ - ops));
-    finalize_bw();
+    for (auto& sib : sibling_cache_) {
+        if (sib.id == INVALID_KEY || sib.parent_local_idx < 0) continue;
+        if (sib.parent_local_idx >= static_cast<int>(local_.size())) continue;
+        auto& p = local_[sib.parent_local_idx];
+        if (p.node.is_leaf) continue;
+        for (size_t j = 0; j < p.node.child_ids.size(); ++j) {
+            if (p.node.child_ids[j] == sib.id) {
+                p.node.child_leaves[j] = sib.leaf;
+                break;
+            }
+        }
+    }
+
+    for (auto& ln : local_) {
+        if (ln.id == root_id_) {
+            root_leaf_ = ln.leaf;
+            break;
+        }
+    }
 }
+
+// ─── Flush all cached nodes back to ORAM stash ─────────────────────────────
+
+void BPlusOmap::flush_all_to_stash() {
+    for (auto& ln : local_) {
+        Block block{ln.id, ln.leaf, ln.node.encode()};
+        oram_.add_to_stash(block);
+    }
+    for (auto& sib : sibling_cache_) {
+        if (sib.id == INVALID_KEY) continue;
+        Block block{sib.id, sib.leaf, sib.node.encode()};
+        oram_.add_to_stash(block);
+    }
+    local_.clear();
+    sibling_cache_.clear();
+}
+
+// ─── Delete underflow handling ──────────────────────────────────────────────
+
+void BPlusOmap::handle_delete_underflow() {
+    int mk = min_leaf_keys();
+
+    for (int i = static_cast<int>(local_.size()) - 1; i > 0; --i) {
+        auto& nd = local_[i];
+        auto& par = local_[i - 1];
+
+        if (static_cast<int>(nd.node.keys.size()) >= mk) continue;
+
+        int nd_idx = -1;
+        for (int j = 0; j < static_cast<int>(par.node.child_ids.size()); ++j)
+            if (par.node.child_ids[j] == nd.id) { nd_idx = j; break; }
+        if (nd_idx < 0) continue;
+
+        CachedSibling* sib = nullptr;
+        for (auto& s : sibling_cache_)
+            if (s.parent_local_idx == i - 1 && s.id != INVALID_KEY)
+                { sib = &s; break; }
+        if (!sib) continue;
+
+        bool sib_left = (sib->child_idx_in_parent < nd_idx);
+        int sep = sib_left ? sib->child_idx_in_parent : nd_idx;
+        if (sep >= static_cast<int>(par.node.keys.size())) continue;
+
+        bool leaf = nd.node.is_leaf;
+
+        if (static_cast<int>(sib->node.keys.size()) > mk) {
+            // ─── BORROW ─────────────────────────────────────────────
+            if (leaf) {
+                if (sib_left) {
+                    nd.node.keys.insert(nd.node.keys.begin(), sib->node.keys.back());
+                    nd.node.values.insert(nd.node.values.begin(), sib->node.values.back());
+                    sib->node.keys.pop_back();
+                    sib->node.values.pop_back();
+                    par.node.keys[sep] = nd.node.keys[0];
+                } else {
+                    nd.node.keys.push_back(sib->node.keys[0]);
+                    nd.node.values.push_back(sib->node.values[0]);
+                    sib->node.keys.erase(sib->node.keys.begin());
+                    sib->node.values.erase(sib->node.values.begin());
+                    par.node.keys[sep] = sib->node.keys[0];
+                }
+            } else {
+                if (sib_left) {
+                    nd.node.keys.insert(nd.node.keys.begin(), par.node.keys[sep]);
+                    nd.node.child_ids.insert(nd.node.child_ids.begin(), sib->node.child_ids.back());
+                    nd.node.child_leaves.insert(nd.node.child_leaves.begin(), sib->node.child_leaves.back());
+                    par.node.keys[sep] = sib->node.keys.back();
+                    sib->node.keys.pop_back();
+                    sib->node.child_ids.pop_back();
+                    sib->node.child_leaves.pop_back();
+                } else {
+                    nd.node.keys.push_back(par.node.keys[sep]);
+                    nd.node.child_ids.push_back(sib->node.child_ids[0]);
+                    nd.node.child_leaves.push_back(sib->node.child_leaves[0]);
+                    par.node.keys[sep] = sib->node.keys[0];
+                    sib->node.keys.erase(sib->node.keys.begin());
+                    sib->node.child_ids.erase(sib->node.child_ids.begin());
+                    sib->node.child_leaves.erase(sib->node.child_leaves.begin());
+                }
+            }
+        } else {
+            // ─── MERGE ──────────────────────────────────────────────
+            if (leaf) {
+                if (sib_left) {
+                    sib->node.keys.insert(sib->node.keys.end(),
+                        nd.node.keys.begin(), nd.node.keys.end());
+                    sib->node.values.insert(sib->node.values.end(),
+                        nd.node.values.begin(), nd.node.values.end());
+                    par.node.keys.erase(par.node.keys.begin() + sep);
+                    par.node.child_ids.erase(par.node.child_ids.begin() + nd_idx);
+                    par.node.child_leaves.erase(par.node.child_leaves.begin() + nd_idx);
+                    nd.node.keys.clear();
+                    nd.node.values.clear();
+                } else {
+                    nd.node.keys.insert(nd.node.keys.end(),
+                        sib->node.keys.begin(), sib->node.keys.end());
+                    nd.node.values.insert(nd.node.values.end(),
+                        sib->node.values.begin(), sib->node.values.end());
+                    int sp = -1;
+                    for (int j = 0; j < (int)par.node.child_ids.size(); ++j)
+                        if (par.node.child_ids[j] == sib->id) { sp = j; break; }
+                    if (sp >= 0) {
+                        par.node.keys.erase(par.node.keys.begin() + sep);
+                        par.node.child_ids.erase(par.node.child_ids.begin() + sp);
+                        par.node.child_leaves.erase(par.node.child_leaves.begin() + sp);
+                    }
+                    sib->id = INVALID_KEY;
+                }
+            } else {
+                if (sib_left) {
+                    sib->node.keys.push_back(par.node.keys[sep]);
+                    sib->node.keys.insert(sib->node.keys.end(),
+                        nd.node.keys.begin(), nd.node.keys.end());
+                    sib->node.child_ids.insert(sib->node.child_ids.end(),
+                        nd.node.child_ids.begin(), nd.node.child_ids.end());
+                    sib->node.child_leaves.insert(sib->node.child_leaves.end(),
+                        nd.node.child_leaves.begin(), nd.node.child_leaves.end());
+                    par.node.keys.erase(par.node.keys.begin() + sep);
+                    par.node.child_ids.erase(par.node.child_ids.begin() + nd_idx);
+                    par.node.child_leaves.erase(par.node.child_leaves.begin() + nd_idx);
+                    nd.node.keys.clear();
+                    nd.node.child_ids.clear();
+                    nd.node.child_leaves.clear();
+                } else {
+                    nd.node.keys.push_back(par.node.keys[sep]);
+                    nd.node.keys.insert(nd.node.keys.end(),
+                        sib->node.keys.begin(), sib->node.keys.end());
+                    nd.node.child_ids.insert(nd.node.child_ids.end(),
+                        sib->node.child_ids.begin(), sib->node.child_ids.end());
+                    nd.node.child_leaves.insert(nd.node.child_leaves.end(),
+                        sib->node.child_leaves.begin(), sib->node.child_leaves.end());
+                    int sp = -1;
+                    for (int j = 0; j < (int)par.node.child_ids.size(); ++j)
+                        if (par.node.child_ids[j] == sib->id) { sp = j; break; }
+                    if (sp >= 0) {
+                        par.node.keys.erase(par.node.keys.begin() + sep);
+                        par.node.child_ids.erase(par.node.child_ids.begin() + sp);
+                        par.node.child_leaves.erase(par.node.child_leaves.begin() + sp);
+                    }
+                    sib->id = INVALID_KEY;
+                }
+            }
+        }
+    }
+
+    if (!local_.empty() && !local_[0].node.is_leaf && local_[0].node.keys.empty()) {
+        if (local_[0].node.child_ids.size() == 1) {
+            root_id_ = local_[0].node.child_ids[0];
+        } else if (local_[0].node.child_ids.empty()) {
+            root_id_ = INVALID_KEY;
+            root_leaf_ = INVALID_LEAF;
+        }
+    }
+}
+
+// ─── Split helpers (unchanged) ──────────────────────────────────────────────
 
 int BPlusOmap::split_leaf(LocalNode& leaf_ln) {
     auto& nd = leaf_ln.node;
@@ -445,8 +515,258 @@ int BPlusOmap::split_internal(LocalNode& int_ln) {
     return new_id;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// All three operations use traverse_with_siblings + pad to 2*max_height_
+// so the server sees an identical ORAM access pattern regardless of op type.
+// ═══════════════════════════════════════════════════════════════════════════
+
+Bytes BPlusOmap::search(int key, const Bytes* update) {
+    last_bw_.reset();
+    op_count_ = 0;
+
+    if (root_id_ == INVALID_KEY) {
+        do_dummy_ops(2 * max_height_);
+        finalize_bw();
+        return {};
+    }
+
+    traverse_with_siblings(key);
+
+    Bytes result;
+    if (!local_.empty() && local_.back().node.is_leaf) {
+        int idx = find_leaf_index(local_.back().node, key);
+        if (idx >= 0) {
+            result = local_.back().node.values[idx];
+            if (update) local_.back().node.values[idx] = *update;
+        }
+    }
+
+    reassign_all_leaves();
+    flush_all_to_stash();
+    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    finalize_bw();
+    return result;
+}
+
+void BPlusOmap::insert(int key, const Bytes& value) {
+    last_bw_.reset();
+    op_count_ = 0;
+
+    if (root_id_ == INVALID_KEY) {
+        BPlusNode leaf;
+        leaf.is_leaf = true;
+        leaf.keys = {key};
+        leaf.values = {value};
+        int id = next_block_id_++;
+        int lf = oram_.random_leaf();
+        oram_.set_leaf(id, lf);
+        oram_.add_to_stash({id, lf, leaf.encode()});
+        root_id_ = id;
+        root_leaf_ = lf;
+        do_dummy_ops(2 * max_height_);
+        finalize_bw();
+        return;
+    }
+
+    traverse_with_siblings(key);
+
+    if (!local_.empty() && local_.back().node.is_leaf) {
+        int leaf_idx = static_cast<int>(local_.size()) - 1;
+        {
+            auto& leaf_ln = local_[leaf_idx];
+            auto it = std::lower_bound(leaf_ln.node.keys.begin(),
+                                       leaf_ln.node.keys.end(), key);
+            int pos = static_cast<int>(it - leaf_ln.node.keys.begin());
+            leaf_ln.node.keys.insert(it, key);
+            leaf_ln.node.values.insert(leaf_ln.node.values.begin() + pos, value);
+        }
+
+        if (static_cast<int>(local_[leaf_idx].node.keys.size()) >= order_) {
+            int new_id = split_leaf(local_[leaf_idx]);
+            // split_leaf pushes to local_, possibly reallocating the buffer.
+            // All prior references into local_ are now invalid; use indices.
+            int parent_id = local_[leaf_idx].parent_id;
+            if (parent_id != INVALID_KEY) {
+                for (auto& p : local_) {
+                    if (p.id == parent_id && !p.node.is_leaf) {
+                        int ci = find_child_index(
+                            p.node, local_[leaf_idx].node.keys.back());
+                        int sep_key = local_.back().node.keys[0];
+                        p.node.keys.insert(p.node.keys.begin() + ci, sep_key);
+                        int new_leaf_val = oram_.get_leaf(new_id);
+                        p.node.child_ids.insert(
+                            p.node.child_ids.begin() + ci + 1, new_id);
+                        p.node.child_leaves.insert(
+                            p.node.child_leaves.begin() + ci + 1, new_leaf_val);
+                        break;
+                    }
+                }
+            } else {
+                int sep_key = local_.back().node.keys[0];
+                int old_id = local_[leaf_idx].id;
+                int old_leaf = local_[leaf_idx].leaf;
+                BPlusNode new_root;
+                new_root.is_leaf = false;
+                new_root.keys = {sep_key};
+                new_root.child_ids = {old_id, new_id};
+                new_root.child_leaves = {old_leaf, oram_.get_leaf(new_id)};
+                int rid = next_block_id_++;
+                int rlf = oram_.random_leaf();
+                oram_.set_leaf(rid, rlf);
+                local_.push_back({rid, rlf, new_root, INVALID_KEY});
+                root_id_ = rid;
+            }
+        }
+    }
+
+    reassign_all_leaves();
+    flush_all_to_stash();
+    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    finalize_bw();
+}
+
 void BPlusOmap::remove(int key) {
-    search(key);
+    last_bw_.reset();
+    op_count_ = 0;
+
+    if (root_id_ == INVALID_KEY) {
+        do_dummy_ops(2 * max_height_);
+        finalize_bw();
+        return;
+    }
+
+    traverse_with_siblings(key);
+
+    if (!local_.empty() && local_.back().node.is_leaf) {
+        int idx = find_leaf_index(local_.back().node, key);
+        if (idx >= 0) {
+            local_.back().node.keys.erase(local_.back().node.keys.begin() + idx);
+            local_.back().node.values.erase(local_.back().node.values.begin() + idx);
+        }
+    }
+
+    handle_delete_underflow();
+    reassign_all_leaves();
+    flush_all_to_stash();
+    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    finalize_bw();
+}
+
+void BPlusOmap::dummy_access() {
+    last_bw_.reset();
+    op_count_ = 0;
+    do_dummy_ops(2 * max_height_);
+    finalize_bw();
+}
+
+Bytes BPlusOmap::search_piggyback(int key, const Bytes* update,
+                                   int extra_key, char extra_op,
+                                   const Bytes* extra_value,
+                                   Bytes* extra_result) {
+    last_bw_.reset();
+    op_count_ = 0;
+
+    if (root_id_ == INVALID_KEY) {
+        do_dummy_ops(2 * max_height_);
+        finalize_bw();
+        return {};
+    }
+
+    // Phase 1: traverse for the main key (h rounds + h sibling rounds).
+    traverse_with_siblings(key);
+
+    // Process main search result.
+    Bytes result;
+    if (!local_.empty() && local_.back().node.is_leaf) {
+        int idx = find_leaf_index(local_.back().node, key);
+        if (idx >= 0) {
+            result = local_.back().node.values[idx];
+            if (update) local_.back().node.values[idx] = *update;
+        }
+    }
+
+    // Flush main traversal to stash so the ORAM is ready for phase 2.
+    reassign_all_leaves();
+    flush_all_to_stash();
+    int main_ops = op_count_;
+
+    // Phase 2: piggyback — traverse for extra_key within remaining budget.
+    int budget = 2 * max_height_ - main_ops;
+    if (extra_key != INVALID_KEY && budget > 0) {
+        traverse_with_siblings(extra_key);
+        int extra_ops_used = op_count_ - main_ops;
+
+        if (extra_op == 's' && extra_result) {
+            // Scan-read: just return the value.
+            if (!local_.empty() && local_.back().node.is_leaf) {
+                int idx = find_leaf_index(local_.back().node, extra_key);
+                if (idx >= 0)
+                    *extra_result = local_.back().node.values[idx];
+            }
+        } else if (extra_op == 'd') {
+            // Delete the extra key from its leaf.
+            if (!local_.empty() && local_.back().node.is_leaf) {
+                int idx = find_leaf_index(local_.back().node, extra_key);
+                if (idx >= 0) {
+                    if (extra_result)
+                        *extra_result = local_.back().node.values[idx];
+                    local_.back().node.keys.erase(
+                        local_.back().node.keys.begin() + idx);
+                    local_.back().node.values.erase(
+                        local_.back().node.values.begin() + idx);
+                }
+            }
+            handle_delete_underflow();
+        } else if (extra_op == 'i' && extra_value) {
+            // Insert the extra key into the correct leaf.
+            if (!local_.empty() && local_.back().node.is_leaf) {
+                int leaf_idx = static_cast<int>(local_.size()) - 1;
+                {
+                    auto& lf = local_[leaf_idx];
+                    auto it = std::lower_bound(
+                        lf.node.keys.begin(), lf.node.keys.end(), extra_key);
+                    int pos = static_cast<int>(it - lf.node.keys.begin());
+                    lf.node.keys.insert(it, extra_key);
+                    lf.node.values.insert(
+                        lf.node.values.begin() + pos, *extra_value);
+                }
+                if (static_cast<int>(local_[leaf_idx].node.keys.size())
+                    >= order_) {
+                    int new_id = split_leaf(local_[leaf_idx]);
+                    int parent_id = local_[leaf_idx].parent_id;
+                    if (parent_id != INVALID_KEY) {
+                        for (auto& p : local_) {
+                            if (p.id == parent_id && !p.node.is_leaf) {
+                                int ci = find_child_index(
+                                    p.node,
+                                    local_[leaf_idx].node.keys.back());
+                                int sep = local_.back().node.keys[0];
+                                p.node.keys.insert(
+                                    p.node.keys.begin() + ci, sep);
+                                int nlv = oram_.get_leaf(new_id);
+                                p.node.child_ids.insert(
+                                    p.node.child_ids.begin() + ci + 1,
+                                    new_id);
+                                p.node.child_leaves.insert(
+                                    p.node.child_leaves.begin() + ci + 1,
+                                    nlv);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        reassign_all_leaves();
+        flush_all_to_stash();
+        (void)extra_ops_used;
+    }
+
+    // Phase 3: pad remaining budget with dummies.
+    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    finalize_bw();
+    return result;
 }
 
 }  // namespace tiered_omap

@@ -8,10 +8,10 @@ namespace tiered_omap {
 PathORAM::PathORAM(int num_data, int bucket_size, int stash_scale)
     : num_data_(num_data),
       bucket_size_(bucket_size),
-      storage_(num_data, bucket_size) {
+      storage_(num_data, bucket_size),
+      aes_key_(generate_aes_key()) {
     int lvl = storage_.level();
     stash_max_size_ = stash_scale * std::max(lvl - 1, 1);
-    // pos_map_ is populated lazily during init() and set_leaf().
 }
 
 void PathORAM::init(const std::unordered_map<int, Bytes>& data) {
@@ -26,10 +26,10 @@ void PathORAM::init(const std::unordered_map<int, Bytes>& data) {
             block_size_bytes_ = static_cast<int>(value.size());
     }
 
-    // Reset storage and fill.
     storage_ = BinaryTreeStorage(num_data_, bucket_size_);
     for (auto& [key, value] : data) {
-        Block block{key, pos_map_.at(key), value};
+        Bytes enc_val = value.empty() ? value : aes_encrypt(aes_key_, value);
+        Block block{key, pos_map_.at(key), enc_val};
         storage_.fill_data_to_leaf(block);
     }
 
@@ -96,12 +96,34 @@ void PathORAM::dummy_access() {
     total_bw_ += last_bw_;
 }
 
+void PathORAM::encrypt_bucket(std::vector<Block>& bucket) {
+    for (auto& block : bucket) {
+        if (!block.is_dummy() && !block.value.empty())
+            block.value = aes_encrypt(aes_key_, block.value);
+    }
+}
+
+void PathORAM::decrypt_bucket(std::vector<Block>& bucket) {
+    for (auto& block : bucket) {
+        if (!block.is_dummy() && !block.value.empty())
+            block.value = aes_decrypt(aes_key_, block.value);
+    }
+}
+
 void PathORAM::read_path_to_stash(int leaf) {
     auto path_data = storage_.read_path(leaf);
+
+    std::unordered_set<int> stash_ids;
+    for (auto& b : stash_)
+        if (!b.is_dummy()) stash_ids.insert(b.key);
+
     for (auto& [node, bucket] : path_data) {
+        decrypt_bucket(bucket);
         for (auto& block : bucket) {
-            if (!block.is_dummy())
+            if (!block.is_dummy() && stash_ids.find(block.key) == stash_ids.end()) {
+                stash_ids.insert(block.key);
                 stash_.push_back(std::move(block));
+            }
         }
     }
 }
@@ -136,6 +158,9 @@ void PathORAM::evict_stash(const std::vector<int>& leaves) {
             "PathORAM: stash overflow (" + std::to_string(stash_.size()) +
             " > " + std::to_string(stash_max_size_) + ")");
     }
+
+    for (auto& [node, bucket] : path)
+        encrypt_bucket(bucket);
 
     storage_.write_multiple_paths(path);
 }

@@ -104,6 +104,79 @@ TEST(TieredOMap, RepeatedAccess) {
     }
 }
 
+// ─── B+ Tree backend tests ──────────────────────────────────────────────────
+
+TEST(TieredOMap, BPlusBackend_FullOblivious) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 64;
+    cfg.hot_set_size = 8;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 8;
+
+    TieredOMap tmap(cfg);
+
+    auto data = make_data(64);
+    std::vector<int> hot_keys = {0, 1, 2, 3, 4, 5, 6, 7};
+    tmap.init(data, hot_keys);
+
+    for (int k : hot_keys) {
+        auto result = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(result.value), k * 100);
+        EXPECT_TRUE(result.found_in_hot);
+    }
+
+    for (int k = 8; k < 64; ++k) {
+        auto result = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(result.value), k * 100);
+        EXPECT_FALSE(result.found_in_hot);
+    }
+}
+
+TEST(TieredOMap, BPlusBackend_WriteAndReadBack) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 32;
+    cfg.hot_set_size = 4;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+
+    TieredOMap tmap(cfg);
+
+    auto data = make_data(32);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    Bytes new_val = int_to_bytes(5555);
+    tmap.access(1, &new_val);
+    auto r = tmap.access(1);
+    EXPECT_EQ(bytes_to_int(r.value), 5555);
+
+    Bytes cold_val = int_to_bytes(7777);
+    tmap.access(20, &cold_val);
+    auto r2 = tmap.access(20);
+    EXPECT_EQ(bytes_to_int(r2.value), 7777);
+}
+
+TEST(TieredOMap, BPlusBackend_RepeatedAccess) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 32;
+    cfg.hot_set_size = 4;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+
+    TieredOMap tmap(cfg);
+
+    auto data = make_data(32);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    for (int round = 0; round < 50; ++round) {
+        int key = round % 32;
+        auto result = tmap.access(key);
+        EXPECT_EQ(bytes_to_int(result.value), key * 100);
+    }
+}
+
 // ─── Split-ORAM tests ───────────────────────────────────────────────────────
 
 TEST(TieredOMap, SplitORAM_FullOblivious) {
@@ -284,6 +357,333 @@ TEST(DynamicMaintenance, DemoteStaleKey) {
     // At least some hot keys should have been demoted by the scan.
     EXPECT_LT(tmap.hot_set_size(), 4)
         << "Some stale hot keys should have been demoted";
+}
+
+// ─── B+ Tree Physical Migration tests ────────────────────────────────────
+
+TEST(DynamicMaintenance, BPlusPhysicalPromotion) {
+    int N = 64, n = 8;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 4;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys;
+    for (int i = 0; i < n; ++i) hot_keys.push_back(i);
+    tmap.init(data, hot_keys);
+
+    EXPECT_EQ(tmap.hot_set_size(), 8);
+
+    for (int round = 0; round < 120; ++round)
+        tmap.access(32);
+
+    auto result = tmap.access(32);
+    EXPECT_TRUE(result.found_in_hot)
+        << "Key 32 should have been physically promoted to hot tier";
+
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value mismatch at key " << k << " after physical promotion";
+    }
+}
+
+TEST(DynamicMaintenance, BPlusPhysicalDemotion) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 4;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 100;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    EXPECT_EQ(tmap.hot_set_size(), 4);
+
+    for (int round = 0; round < 200; ++round)
+        tmap.access(16);
+
+    EXPECT_LT(tmap.hot_set_size(), 4)
+        << "Stale hot keys should have been physically demoted";
+
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value mismatch at key " << k << " after physical demotion";
+    }
+}
+
+TEST(DynamicMaintenance, BPlusPhysicalRoundTrip) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 4;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    // Phase 1: access cold key 20 heavily -> promote it.
+    for (int round = 0; round < 100; ++round)
+        tmap.access(20);
+
+    auto r1 = tmap.access(20);
+    EXPECT_TRUE(r1.found_in_hot)
+        << "Key 20 should be promoted after heavy access";
+
+    // Phase 2: stop accessing key 20, access cold keys to age it out.
+    for (int round = 0; round < 200; ++round)
+        tmap.access(25);
+
+    // Phase 3: verify all values are still correct after migrations.
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value mismatch at key " << k << " after round-trip migration";
+    }
+}
+
+// ---------- Piggyback tests ----------
+
+TEST(Piggyback, BPlusDemotionZeroExtraRounds) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 4;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 100;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.piggyback = true;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    // Run normal accesses to collect baseline round count.
+    auto r0 = tmap.access(0);
+    int baseline_rounds = static_cast<int>(r0.total_bw.rounds);
+
+    // Keep accessing cold keys to push epoch forward and trigger maintenance.
+    // In piggyback mode, maintenance should not add extra rounds.
+    for (int i = 0; i < 200; ++i) {
+        int k = 10 + (i % 10);
+        auto r = tmap.access(k);
+        EXPECT_LE(static_cast<int>(r.total_bw.rounds), baseline_rounds)
+            << "Piggyback access " << i << " exceeded baseline rounds ("
+            << r.total_bw.rounds << " > " << baseline_rounds << ")";
+    }
+}
+
+TEST(Piggyback, BPlusValuesPreservedAfterDemotion) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 4;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 100;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.piggyback = true;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    // Access only cold keys — hot keys should age out and get demoted.
+    for (int round = 0; round < 200; ++round)
+        tmap.access(10 + (round % 10));
+
+    // Verify all values survive piggybacked demotions.
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value lost at key " << k << " after piggyback demotion";
+    }
+}
+
+TEST(Piggyback, StandaloneVsPiggybackConsistency) {
+    int N = 32, n = 4;
+
+    auto run_scenario = [&](bool piggyback) -> std::vector<int> {
+        TieredOMapConfig cfg;
+        cfg.total_keys = N;
+        cfg.hot_set_size = n;
+        cfg.mode = SecurityMode::FullOblivious;
+        cfg.backend = OmapBackend::BPlus;
+        cfg.bplus_order = 4;
+        cfg.maintenance.enabled = true;
+        cfg.maintenance.epoch_length = 8;
+        cfg.maintenance.promote_threshold = 100;
+        cfg.maintenance.demote_threshold = 1;
+        cfg.maintenance.staleness_epochs = 2;
+        cfg.maintenance.piggyback = piggyback;
+
+        TieredOMap tmap(cfg);
+        auto data = make_data(N);
+        std::vector<int> hot_keys = {0, 1, 2, 3};
+        tmap.init(data, hot_keys);
+
+        for (int round = 0; round < 200; ++round)
+            tmap.access(10 + (round % 10));
+
+        std::vector<int> vals;
+        for (int k = 0; k < N; ++k) {
+            auto r = tmap.access(k);
+            vals.push_back(bytes_to_int(r.value));
+        }
+        return vals;
+    };
+
+    auto standalone_vals = run_scenario(false);
+    auto piggyback_vals = run_scenario(true);
+
+    for (int k = 0; k < N; ++k) {
+        EXPECT_EQ(standalone_vals[k], piggyback_vals[k])
+            << "Standalone vs piggyback mismatch at key " << k;
+    }
+}
+
+// ---------- AVL physical migration tests ----------
+
+TEST(DynamicMaintenance, AVLPhysicalPromotion) {
+    int N = 64, n = 8;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::AVL;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys;
+    for (int i = 0; i < n; ++i) hot_keys.push_back(i);
+    tmap.init(data, hot_keys);
+
+    EXPECT_EQ(tmap.hot_set_size(), 8);
+
+    for (int round = 0; round < 120; ++round)
+        tmap.access(32);
+
+    auto result = tmap.access(32);
+    EXPECT_TRUE(result.found_in_hot)
+        << "Key 32 should have been physically promoted to hot tier";
+
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value mismatch at key " << k << " after AVL physical promotion";
+    }
+}
+
+TEST(DynamicMaintenance, AVLPhysicalDemotion) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::AVL;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 100;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    EXPECT_EQ(tmap.hot_set_size(), 4);
+
+    for (int round = 0; round < 200; ++round)
+        tmap.access(16);
+
+    EXPECT_LT(tmap.hot_set_size(), 4)
+        << "Stale hot keys should have been physically demoted";
+
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value mismatch at key " << k << " after AVL physical demotion";
+    }
+}
+
+TEST(DynamicMaintenance, AVLPhysicalRoundTrip) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::AVL;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    for (int round = 0; round < 100; ++round)
+        tmap.access(20);
+
+    auto r1 = tmap.access(20);
+    EXPECT_TRUE(r1.found_in_hot)
+        << "Key 20 should be promoted after heavy access";
+
+    for (int round = 0; round < 200; ++round)
+        tmap.access(25);
+
+    for (int k = 0; k < N; ++k) {
+        auto r = tmap.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k * 100)
+            << "Value mismatch at key " << k << " after AVL round-trip migration";
+    }
 }
 
 TEST(DynamicMaintenance, ValuesPreservedWithEpoch) {

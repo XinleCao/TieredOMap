@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tiered_omap/common.h"
+#include "tiered_omap/crypto.h"
 #include "tiered_omap/oram/binary_tree_storage.h"
 #include <chrono>
 #include <thread>
@@ -77,6 +78,9 @@ private:
     int round_delay_us_ = 0;
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;
+    CryptoKey aes_key_;
+    void encrypt_bucket(std::vector<Block>& bucket);
+    void decrypt_bucket(std::vector<Block>& bucket);
 };
 
 }  // namespace tiered_omap

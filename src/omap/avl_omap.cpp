@@ -269,17 +269,19 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
     last_bw_.reset();
     reset_op_counts();
 
+    int budget = 3 * max_height_;
+
     if (root_key_ == INVALID_KEY) {
         if (split_depth_ > 0) {
-            int eff_split = std::min(split_depth_, max_height_);
+            int eff_split = std::min(split_depth_, budget);
             for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
             upper_op_count_ = eff_split;
-            int lower_count = max_height_ - eff_split;
+            int lower_count = budget - eff_split;
             for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
             lower_op_count_ = lower_count;
         } else {
-            for (int i = 0; i < max_height_; ++i) oram_.dummy_access();
-            op_count_ = max_height_;
+            for (int i = 0; i < budget; ++i) oram_.dummy_access();
+            op_count_ = budget;
         }
         finalize_bw();
         return {};
@@ -312,25 +314,17 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
         }
     }
 
-    // Pad remaining levels with dummy accesses.
+    reassign_leaves();
+    flush_local_to_stash();
+
+    int pad = std::max(0, budget - ops);
     if (split_depth_ > 0) {
-        int eff_split = std::min(split_depth_, max_height_);
-        int upper_real = std::min(ops, eff_split);
-        int lower_real = ops - upper_real;
-        int upper_pad = eff_split - upper_real;
-        int lower_pad = (max_height_ - eff_split) - lower_real;
-        for (int i = 0; i < upper_pad; ++i) upper_oram_.dummy_access();
-        upper_op_count_ += upper_pad;
-        for (int i = 0; i < lower_pad; ++i) oram_.dummy_access();
-        lower_op_count_ += lower_pad;
+        for (int i = 0; i < pad; ++i) oram_.dummy_access();
+        lower_op_count_ += pad;
     } else {
-        int pad = max_height_ - ops;
         for (int i = 0; i < pad; ++i) oram_.dummy_access();
         op_count_ += pad;
     }
-
-    reassign_leaves();
-    flush_local_to_stash();
     finalize_bw();
     return result;
 }
@@ -341,16 +335,18 @@ void AVLOmap::dummy_access() {
     last_bw_.reset();
     reset_op_counts();
 
+    int budget = 3 * max_height_;
+
     if (split_depth_ > 0) {
-        int eff_split = std::min(split_depth_, max_height_);
+        int eff_split = std::min(split_depth_, budget);
         for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
         upper_op_count_ = eff_split;
-        int lower_count = max_height_ - eff_split;
+        int lower_count = budget - eff_split;
         for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
         lower_op_count_ = lower_count;
     } else {
-        for (int i = 0; i < max_height_; ++i) oram_.dummy_access();
-        op_count_ = max_height_;
+        for (int i = 0; i < budget; ++i) oram_.dummy_access();
+        op_count_ = budget;
     }
     finalize_bw();
 }
@@ -363,7 +359,7 @@ void AVLOmap::partial_dummy_access() {
     last_bw_.reset();
     reset_op_counts();
 
-    int eff_split = std::min(split_depth_, max_height_);
+    int eff_split = std::min(split_depth_, 3 * max_height_);
     for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
     upper_op_count_ = eff_split;
 
@@ -379,6 +375,8 @@ void AVLOmap::insert(int key, const Bytes& value) {
     last_bw_.reset();
     reset_op_counts();
 
+    int budget = 3 * max_height_;
+
     if (root_key_ == INVALID_KEY) {
         AVLNodeData nd;
         nd.data = value;
@@ -388,17 +386,16 @@ void AVLOmap::insert(int key, const Bytes& value) {
         root_oram.add_to_stash({key, leaf, nd.encode()});
         root_key_ = key;
         root_leaf_ = leaf;
-        // Pad with dummy ops.
         if (split_depth_ > 0) {
-            int eff_split = std::min(split_depth_, 2 * max_height_ + 1);
+            int eff_split = std::min(split_depth_, budget);
             for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
             upper_op_count_ = eff_split;
-            int lower_count = (2 * max_height_ + 1) - eff_split;
+            int lower_count = budget - eff_split;
             for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
             lower_op_count_ = lower_count;
         } else {
-            for (int i = 0; i < 2 * max_height_ + 1; ++i) oram_.dummy_access();
-            op_count_ = 2 * max_height_ + 1;
+            for (int i = 0; i < budget; ++i) oram_.dummy_access();
+            op_count_ = budget;
         }
         finalize_bw();
         return;
@@ -457,8 +454,7 @@ void AVLOmap::insert(int key, const Bytes& value) {
     reassign_leaves();
     flush_local_to_stash();
 
-    int total_needed = 3 * max_height_ + 1;
-    int pad = std::max(0, total_needed - ops * 2);
+    int pad = std::max(0, budget - ops);
     if (split_depth_ > 0) {
         for (int i = 0; i < pad; ++i) oram_.dummy_access();
         lower_op_count_ += pad;
@@ -475,18 +471,11 @@ void AVLOmap::remove(int key) {
     last_bw_.reset();
     reset_op_counts();
 
+    int budget = 3 * max_height_;
+
     if (root_key_ == INVALID_KEY) {
-        if (split_depth_ > 0) {
-            int eff_split = std::min(split_depth_, max_height_);
-            for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
-            upper_op_count_ = eff_split;
-            int lower_count = max_height_ - eff_split;
-            for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
-            lower_op_count_ = lower_count;
-        } else {
-            for (int i = 0; i < max_height_; ++i) oram_.dummy_access();
-            op_count_ = max_height_;
-        }
+        for (int i = 0; i < budget; ++i) oram_.dummy_access();
+        op_count_ = budget;
         finalize_bw();
         return;
     }
@@ -494,85 +483,233 @@ void AVLOmap::remove(int key) {
     local_.clear();
     int cur_key = root_key_;
     int cur_leaf = root_leaf_;
-    int ops = 0;
+    int phase1_ops = 0;
+    int target_idx = -1;
 
+    // Phase 1: traverse down to find key.
+    bool two_child = false;
     for (int d = 0; d < max_height_; ++d) {
         if (cur_key == INVALID_KEY) break;
-
         int parent = local_.empty() ? INVALID_KEY : local_.back().key;
         move_to_local(cur_key, cur_leaf, parent, d);
-        ops++;
-        auto& node = local_.back();
+        phase1_ops++;
+
+        int last_idx = static_cast<int>(local_.size()) - 1;
+        int nk = local_[last_idx].key;
 
         if (key == cur_key) {
-            if (node.avl.l_key == INVALID_KEY && node.avl.r_key == INVALID_KEY) {
-                if (node.parent_key != INVALID_KEY) {
-                    for (auto& p : local_) {
-                        if (p.key != node.parent_key) continue;
-                        if (p.avl.l_key == key) {
-                            p.avl.l_key = INVALID_KEY;
-                            p.avl.l_leaf = INVALID_LEAF;
-                            p.avl.l_height = 0;
-                        } else {
-                            p.avl.r_key = INVALID_KEY;
-                            p.avl.r_leaf = INVALID_LEAF;
-                            p.avl.r_height = 0;
-                        }
-                        break;
-                    }
-                } else {
-                    root_key_ = INVALID_KEY;
-                    root_leaf_ = INVALID_LEAF;
+            target_idx = last_idx;
+            if (local_[last_idx].avl.l_key != INVALID_KEY &&
+                local_[last_idx].avl.r_key != INVALID_KEY) {
+                two_child = true;
+                int s_key = local_[last_idx].avl.r_key;
+                int s_leaf = local_[last_idx].avl.r_leaf;
+                for (int sd = d + 1; sd < max_height_; ++sd) {
+                    int sp = local_.back().key;
+                    move_to_local(s_key, s_leaf, sp, sd);
+                    phase1_ops++;
+                    int si = static_cast<int>(local_.size()) - 1;
+                    if (local_[si].avl.l_key == INVALID_KEY) break;
+                    s_key = local_[si].avl.l_key;
+                    s_leaf = local_[si].avl.l_leaf;
                 }
-                local_.pop_back();
-            } else if (node.avl.l_key == INVALID_KEY ||
-                       node.avl.r_key == INVALID_KEY) {
-                int child_key = (node.avl.l_key != INVALID_KEY)
-                                    ? node.avl.l_key : node.avl.r_key;
-                int child_leaf = (node.avl.l_key != INVALID_KEY)
-                                     ? node.avl.l_leaf : node.avl.r_leaf;
-                if (node.parent_key != INVALID_KEY) {
-                    for (auto& p : local_) {
-                        if (p.key != node.parent_key) continue;
-                        if (p.avl.l_key == key) {
-                            p.avl.l_key = child_key;
-                            p.avl.l_leaf = child_leaf;
-                        } else {
-                            p.avl.r_key = child_key;
-                            p.avl.r_leaf = child_leaf;
-                        }
-                        break;
-                    }
-                } else {
-                    root_key_ = child_key;
-                    root_leaf_ = child_leaf;
-                }
-                local_.pop_back();
-            } else {
-                node.avl.data.clear();
             }
             break;
-        } else if (key < cur_key) {
-            cur_key = node.avl.l_key;
-            cur_leaf = node.avl.l_leaf;
+        } else if (key < nk) {
+            cur_key = local_[last_idx].avl.l_key;
+            cur_leaf = local_[last_idx].avl.l_leaf;
         } else {
-            cur_key = node.avl.r_key;
-            cur_leaf = node.avl.r_leaf;
+            cur_key = local_[last_idx].avl.r_key;
+            cur_leaf = local_[last_idx].avl.r_leaf;
         }
     }
 
-    update_heights();
+    // Perform deletion.
+    if (target_idx >= 0 &&
+        target_idx < static_cast<int>(local_.size())) {
+
+        if (two_child) {
+            int succ_idx = static_cast<int>(local_.size()) - 1;
+            int succ_key = local_[succ_idx].key;
+            Bytes succ_data = local_[succ_idx].avl.data;
+
+            // Rename target node: key changes from old to successor's key.
+            int old_key = local_[target_idx].key;
+            local_[target_idx].key = succ_key;
+            local_[target_idx].avl.data = succ_data;
+
+            // Update parent's child pointer to the renamed key.
+            int par = local_[target_idx].parent_key;
+            if (par != INVALID_KEY) {
+                for (auto& p : local_) {
+                    if (p.key != par) continue;
+                    if (p.avl.l_key == old_key) {
+                        p.avl.l_key = succ_key;
+                    } else if (p.avl.r_key == old_key) {
+                        p.avl.r_key = succ_key;
+                    }
+                    break;
+                }
+            }
+            if (root_key_ == old_key) root_key_ = succ_key;
+
+            // Also update children's parent_key references.
+            for (auto& c : local_) {
+                if (c.parent_key == old_key) c.parent_key = succ_key;
+            }
+
+            // Now delete the successor position (0 or 1 child).
+            target_idx = succ_idx;
+        }
+
+        int del_key = local_[target_idx].key;
+        int child_key = (local_[target_idx].avl.l_key != INVALID_KEY)
+                            ? local_[target_idx].avl.l_key
+                            : local_[target_idx].avl.r_key;
+        int child_leaf = (local_[target_idx].avl.l_key != INVALID_KEY)
+                             ? local_[target_idx].avl.l_leaf
+                             : local_[target_idx].avl.r_leaf;
+        int child_h = (local_[target_idx].avl.l_key != INVALID_KEY)
+                          ? local_[target_idx].avl.l_height
+                          : local_[target_idx].avl.r_height;
+        if (child_key == INVALID_KEY) child_h = 0;
+
+        int del_parent = local_[target_idx].parent_key;
+        if (del_parent != INVALID_KEY) {
+            for (auto& p : local_) {
+                if (p.key != del_parent) continue;
+                if (p.avl.l_key == del_key) {
+                    p.avl.l_key = child_key;
+                    p.avl.l_leaf = child_leaf;
+                    p.avl.l_height = child_h;
+                } else if (p.avl.r_key == del_key) {
+                    p.avl.r_key = child_key;
+                    p.avl.r_leaf = child_leaf;
+                    p.avl.r_height = child_h;
+                }
+                break;
+            }
+        } else {
+            root_key_ = child_key;
+            root_leaf_ = (child_key != INVALID_KEY) ? child_leaf
+                                                     : INVALID_LEAF;
+        }
+        local_.erase(local_.begin() + target_idx);
+    }
+
+    // Save path node keys (bottom to top) for Phase 2 iteration.
+    std::vector<int> path_keys;
+    path_keys.reserve(local_.size());
+    for (auto& ln : local_) path_keys.push_back(ln.key);
+
+    // Phase 2: back-up rebalancing — read siblings bottom-to-top.
+    int phase2_ops = 0;
+    for (int pi = static_cast<int>(path_keys.size()) - 1; pi >= 0; --pi) {
+        int nd_key = path_keys[pi];
+        int nd_idx = -1;
+        for (int j = 0; j < static_cast<int>(local_.size()); ++j)
+            if (local_[j].key == nd_key) { nd_idx = j; break; }
+        if (nd_idx < 0) {
+            oram_.dummy_access();
+            oram_.dummy_access();
+            phase2_ops += 2;
+            if (split_depth_ == 0) op_count_ += 2;
+            continue;
+        }
+
+        // Refresh child heights from local_ nodes.
+        for (auto& c : local_) {
+            if (c.key == local_[nd_idx].avl.l_key)
+                local_[nd_idx].avl.l_height = c.avl.height();
+            if (c.key == local_[nd_idx].avl.r_key)
+                local_[nd_idx].avl.r_height = c.avl.height();
+        }
+
+        int bal = local_[nd_idx].avl.balance();
+        int nd_depth = local_[nd_idx].depth;
+
+        if (std::abs(bal) <= 1) {
+            oram_for_depth(nd_depth).dummy_access();
+            oram_for_depth(nd_depth).dummy_access();
+            phase2_ops += 2;
+            if (split_depth_ == 0) op_count_ += 2;
+            continue;
+        }
+
+        // Unbalanced — cache values before move_to_local may invalidate.
+        int tall_key = (bal > 1) ? local_[nd_idx].avl.l_key
+                                 : local_[nd_idx].avl.r_key;
+        int tall_leaf = (bal > 1) ? local_[nd_idx].avl.l_leaf
+                                  : local_[nd_idx].avl.r_leaf;
+
+        bool tall_in_local = false;
+        for (auto& n : local_)
+            if (n.key == tall_key) { tall_in_local = true; break; }
+
+        if (tall_key != INVALID_KEY && !tall_in_local) {
+            move_to_local(tall_key, tall_leaf, nd_key, nd_depth + 1);
+        } else {
+            oram_for_depth(nd_depth).dummy_access();
+            if (split_depth_ == 0) ++op_count_;
+        }
+        phase2_ops++;
+
+        // Check if double rotation is needed.
+        int tall_idx = -1;
+        for (int j = 0; j < static_cast<int>(local_.size()); ++j)
+            if (local_[j].key == tall_key) { tall_idx = j; break; }
+
+        bool need_inner = false;
+        int inner_key = INVALID_KEY, inner_leaf = INVALID_LEAF;
+        int tall_depth_val = nd_depth + 1;
+        if (tall_idx >= 0) {
+            tall_depth_val = local_[tall_idx].depth;
+            int tb_bal = local_[tall_idx].avl.balance();
+            if (bal > 1 && tb_bal < 0) {
+                inner_key = local_[tall_idx].avl.r_key;
+                inner_leaf = local_[tall_idx].avl.r_leaf;
+                need_inner = true;
+            } else if (bal < -1 && tb_bal > 0) {
+                inner_key = local_[tall_idx].avl.l_key;
+                inner_leaf = local_[tall_idx].avl.l_leaf;
+                need_inner = true;
+            }
+        }
+
+        if (need_inner && inner_key != INVALID_KEY) {
+            bool inner_in_local = false;
+            for (auto& n : local_)
+                if (n.key == inner_key) { inner_in_local = true; break; }
+            if (!inner_in_local) {
+                move_to_local(inner_key, inner_leaf,
+                              tall_key, tall_depth_val + 1);
+            } else {
+                oram_for_depth(nd_depth).dummy_access();
+                if (split_depth_ == 0) ++op_count_;
+            }
+        } else {
+            oram_for_depth(nd_depth).dummy_access();
+            if (split_depth_ == 0) ++op_count_;
+        }
+        phase2_ops++;
+
+        // Rebalance: refresh heights then rotate.
+        update_heights();
+        int ni = -1;
+        for (int j = 0; j < static_cast<int>(local_.size()); ++j)
+            if (local_[j].key == nd_key) { ni = j; break; }
+        if (ni >= 0) balance_node(ni);
+        update_heights();
+    }
+
     reassign_leaves();
     flush_local_to_stash();
 
-    int pad = std::max(0, 2 * max_height_ - ops);
-    if (split_depth_ > 0) {
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        lower_op_count_ += pad;
-    } else {
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        op_count_ += pad;
-    }
+    // Pad to budget.
+    int total_ops = phase1_ops + phase2_ops;
+    int pad = std::max(0, budget - total_ops);
+    for (int i = 0; i < pad; ++i) oram_.dummy_access();
+    if (split_depth_ == 0) op_count_ += pad;
     finalize_bw();
 }
 
@@ -601,7 +738,9 @@ std::tuple<int, int, int> AVLOmap::rotate(int idx, bool left) {
 
     auto& pivot = local_[pivot_idx];
 
+    int transferred_key = INVALID_KEY;
     if (left) {
+        transferred_key = pivot.avl.l_key;
         node.avl.r_key = pivot.avl.l_key;
         node.avl.r_leaf = pivot.avl.l_leaf;
         node.avl.r_height = pivot.avl.l_height;
@@ -609,6 +748,7 @@ std::tuple<int, int, int> AVLOmap::rotate(int idx, bool left) {
         pivot.avl.l_leaf = node.leaf;
         pivot.avl.l_height = node.avl.height();
     } else {
+        transferred_key = pivot.avl.r_key;
         node.avl.l_key = pivot.avl.r_key;
         node.avl.l_leaf = pivot.avl.r_leaf;
         node.avl.l_height = pivot.avl.r_height;
@@ -634,6 +774,15 @@ std::tuple<int, int, int> AVLOmap::rotate(int idx, bool left) {
 
     pivot.parent_key = node.parent_key;
     node.parent_key = pivot.key;
+
+    if (transferred_key != INVALID_KEY) {
+        for (auto& c : local_) {
+            if (c.key == transferred_key) {
+                c.parent_key = node.key;
+                break;
+            }
+        }
+    }
 
     if (root_key_ == node.key)
         root_key_ = pivot.key;

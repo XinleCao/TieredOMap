@@ -109,11 +109,11 @@ scripts/
 
 ### P0 — 必须修复
 
-1. **无加解密**
-   - 论文写 "AES-128 via OpenSSL"，但代码中所有数据明文存储
-   - Path ORAM 的 block 读写没有 encrypt/decrypt
-   - **修复**：在 `PathORAM::evict_and_write_path()` 写入时 AES-128-CTR 加密每个 block，`read_path_to_stash()` 读出时解密
-   - 对 rounds/bandwidth 无影响，只增加常数计算开销
+1. ~~**无加解密**~~ ✅ **已完成**
+   - PathORAM 已集成 AES-128-CTR 加密（OpenSSL 3.x）
+   - 构造时自动生成随机 AES key；写入 storage 前加密 block value，读出后解密
+   - Stash 始终持有明文；对 rounds/bandwidth 无影响，增加微秒级计算开销
+   - 所有 5 个 test suite 通过验证
 
 2. **无 client-server 网络**
    - 论文写 "over TCP sockets"，但一切在本地单进程运行
@@ -142,9 +142,10 @@ scripts/
    - VLDB 通常要求 N=2^24 (16M) 以上
    - N=2^22 到 2^24 的趋势可以解析外推（rounds 是确定性的），但需要实测验证
 
-6. **B+ tree OMAP 未集成到 TieredOMap**
-   - `bplus_omap.h` 存在但未在 TieredOMap 中使用
-   - 论文声称 backend-agnostic，需要用 B+ OMAP 跑一组实验验证
+6. ~~**B+ tree OMAP 未集成到 TieredOMap**~~ ✅ **已完成**
+   - `TieredOMapConfig` 新增 `OmapBackend::BPlus` 选项和 `bplus_order` 参数
+   - `TieredOMap::init()` 根据 backend 自动创建 AVL 或 B+ tree OMAP
+   - 新增 3 个 B+ tree backend 测试全部通过
 
 7. **Workload 多样性不足**
    - 只有 Zipf 合成工作负载
@@ -180,7 +181,7 @@ scripts/
 ## 服务器上的工作计划
 
 ### 第一步：基础设施（1-2 天）
-1. 加入 AES-128 加密（OpenSSL）
+1. ~~加入 AES-128 加密（OpenSSL）~~ ✅ 已完成
 2. 实现 TCP client-server 通信
 3. 验证加密后 bandwidth/rounds 不变，测量加密开销
 
@@ -201,7 +202,7 @@ scripts/
 
 ### 第五步：补充实验（2-3 天）
 1. YCSB / real trace
-2. B+ tree backend 验证 backend-agnostic
+2. ~~B+ tree backend 验证 backend-agnostic~~ ✅ 已集成 + 测试通过
 3. 有条件的话对比 Pancake/Waffle
 
 ---

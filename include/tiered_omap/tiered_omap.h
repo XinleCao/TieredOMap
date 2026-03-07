@@ -14,12 +14,19 @@ enum class SecurityMode {
     TierMembership
 };
 
+enum class OmapBackend {
+    AVL,
+    BPlus
+};
+
 struct TieredOMapConfig {
     int total_keys = 0;
     int hot_set_size = 0;
     SecurityMode mode = SecurityMode::FullOblivious;
     bool use_split_oram = false;
     int bucket_size = 4;
+    OmapBackend backend = OmapBackend::AVL;
+    int bplus_order = 8;
     MaintenanceConfig maintenance;
 };
 
@@ -60,6 +67,7 @@ public:
 
 private:
     void do_maintenance_step();
+    void do_promotion_standalone();
 
     TieredOMapConfig config_;
     std::unique_ptr<OmapInterface> hot_omap_;
@@ -68,6 +76,7 @@ private:
     std::unordered_set<int> phys_hot_keys_;
     std::vector<int> hot_key_list_;
     std::unique_ptr<MaintenanceManager> maint_;
+    int hot_capacity_ = 0;
 };
 
 }  // namespace tiered_omap

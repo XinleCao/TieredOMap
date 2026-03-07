@@ -46,7 +46,6 @@ private:
     static int left_child(int node) { return 2 * node + 1; }
     static int right_child(int node) { return 2 * node + 2; }
 
-    int num_data_ = 0;
     int level_ = 0;
     int leaf_range_ = 0;
     int bucket_size_ = 0;
