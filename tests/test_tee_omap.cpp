@@ -291,6 +291,110 @@ TEST(TeeOmap, PageMetrics) {
     EXPECT_LT(hot_r.total_pages, cold_r.total_pages);
 }
 
+// ── TEE Maintenance ─────────────────────────────────────────────────────────
+
+TEST(TeeOmap, MaintenanceConvergence) {
+    // Setup: keys 0..7 are initially hot, keys 8..31 are cold.
+    // Workload: repeatedly access cold keys 24..31 (promote candidates)
+    // and never access hot keys 0..3 (demote candidates).
+    // After enough epochs, keys 24..31 should be promoted and 0..3 demoted.
+
+    TeeOmapConfig cfg;
+    cfg.total_keys = 32;
+    cfg.hot_set_size = 8;
+    cfg.value_size = 16;
+    cfg.mode = TeeSecurityMode::TierMembership;
+    cfg.use_split_oram = false;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TeeOmap omap(cfg);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 32; ++i)
+        data.push_back({i, int_to_bytes(i * 10)});
+    std::vector<int> hk = {0, 1, 2, 3, 4, 5, 6, 7};
+    omap.init(data, hk);
+
+    // Verify initial state.
+    EXPECT_EQ(omap.hot_count(), 8);
+    EXPECT_TRUE(omap.hot_keys().count(0));
+    EXPECT_FALSE(omap.hot_keys().count(24));
+
+    // Run workload: hit cold keys 24..27 heavily (4+ times/epoch to exceed
+    // promote_threshold=3), hit hot keys 4..7 to keep them alive.
+    // Never access hot keys 0..3 → they go stale and get demoted.
+    for (int epoch = 0; epoch < 12; ++epoch) {
+        for (int i = 0; i < cfg.maintenance.epoch_length; ++i) {
+            int key;
+            if (i % 4 < 3)
+                key = 24 + (i / 4) % 4;   // cold keys 24..27 (3 out of 4 slots)
+            else
+                key = 4 + (i / 4) % 4;    // hot keys 4..7
+            omap.access(key);
+        }
+    }
+
+    // After 12 epochs, keys 0..3 should have been demoted (never accessed).
+    // Keys 24..27 should have been promoted (heavily accessed).
+    int promoted_count = 0;
+    for (int k = 24; k < 28; ++k)
+        if (omap.hot_keys().count(k)) ++promoted_count;
+
+    int demoted_count = 0;
+    for (int k = 0; k < 4; ++k)
+        if (!omap.hot_keys().count(k)) ++demoted_count;
+
+    EXPECT_GE(promoted_count, 2) << "Expected at least 2 of keys 24..27 promoted";
+    EXPECT_GE(demoted_count, 2) << "Expected at least 2 of keys 0..3 demoted";
+
+    // Verify correctness: all keys should still return correct values.
+    for (int i = 0; i < 32; ++i) {
+        auto r = omap.access(i);
+        EXPECT_EQ(bytes_to_int(r.value), i * 10) << "key=" << i;
+    }
+}
+
+TEST(TeeOmap, MaintenanceFullOblivious) {
+    // Same test but in FullOblivious mode — extra dummy ops should not break things.
+    TeeOmapConfig cfg;
+    cfg.total_keys = 32;
+    cfg.hot_set_size = 8;
+    cfg.value_size = 16;
+    cfg.mode = TeeSecurityMode::FullOblivious;
+    cfg.use_split_oram = false;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.promote_threshold = 3;
+    cfg.maintenance.demote_threshold = 1;
+    cfg.maintenance.staleness_epochs = 2;
+
+    TeeOmap omap(cfg);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 32; ++i)
+        data.push_back({i, int_to_bytes(i)});
+    std::vector<int> hk = {0, 1, 2, 3, 4, 5, 6, 7};
+    omap.init(data, hk);
+
+    // Run workload.
+    for (int epoch = 0; epoch < 8; ++epoch) {
+        for (int i = 0; i < cfg.maintenance.epoch_length; ++i) {
+            int key = (i % 2 == 0) ? (24 + i % 8) : (4 + i % 4);
+            EXPECT_NO_THROW(omap.access(key));
+        }
+    }
+
+    // Verify all keys are still accessible.
+    for (int i = 0; i < 32; ++i) {
+        auto r = omap.access(i);
+        EXPECT_EQ(bytes_to_int(r.value), i) << "key=" << i;
+    }
+}
+
 // ── TEE Server / Client (local loopback) ────────────────────────────────────
 
 TEST(TeeServerClient, RoundTrip) {
