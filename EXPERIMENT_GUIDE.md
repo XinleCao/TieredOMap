@@ -277,7 +277,58 @@ bash scripts/run_paper_experiments.sh 24 1000 <SERVER_IP>
 
 ---
 
-## 六、注意事项
+## 六、资源估算（内存 & 时间）
+
+下表基于 Q=500、value_size=4B 估算。实际时间受网络 RTT 影响较大：LAN 下以计算为主，WAN-80 下以网络等待为主。
+
+**内存说明**：每个 Path ORAM tree (capacity N, bucket_size Z=4) 的 server 端内存约 `2N × Z × block_size ≈ 1.5~2 KB × N`。递归 position map 再加约 10-15%。DAORAM backend 因为额外的去摊销结构，内存约为 AVL/B+ 的 1.5 倍。TieredOMap 同时持有 3 个 ORAM instance（hot、cold-up、cold-low），但 hot 和 cold-up 容量仅为 n，远小于 N。各实验按顺序运行，峰值内存取单次最大配置。
+
+### max_logN = 20, Q = 500（推荐首次运行）
+
+| # | 实验 | 峰值 N | ORAM 实例数 | Server 峰值内存 | Client 内存 | 预估时间 |
+|---|------|--------|------------|----------------|------------|---------|
+| 1 | backend_cmp | 2^20 | 1 | ~2 GB | ~200 MB | 15-25 min |
+| 2 | bandwidth | 2^20 | 3 (tiered) | ~3 GB | ~300 MB | 25-40 min |
+| 3 | skewness | 2^16 | 3 | ~300 MB | ~100 MB | 8-12 min |
+| 4 | hotsize | 2^16 | 3 | ~300 MB | ~100 MB | 8-12 min |
+| 5 | latency | 2^16 | 3 | ~300 MB | ~100 MB | 8-12 min |
+| 6 | modes | 2^20 | 3 | ~3 GB | ~300 MB | 30-50 min |
+| 7 | write | 2^16 | 1 | ~200 MB | ~80 MB | 5-8 min |
+| 8 | dynamic | 512 | 3 | ~30 MB | ~10 MB | 3-5 min |
+| 9 | workload | 2^16 | 3 | ~300 MB | ~100 MB | 8-12 min |
+| 10 | drift | 512 | 3 | ~30 MB | ~10 MB | 3-5 min |
+| | **合计** | | | **峰值 ~3 GB** | **峰值 ~300 MB** | **~2-3 小时** |
+
+### max_logN = 24, Q = 1000（大规模实验）
+
+| # | 实验 | 峰值 N | Server 峰值内存 | 预估时间 |
+|---|------|--------|----------------|---------|
+| 1 | backend_cmp | 2^24 | ~30 GB | 2-4 hr |
+| 2 | bandwidth | 2^24 | ~35 GB | 3-5 hr |
+| 6 | modes | 2^24 | ~35 GB | 4-6 hr |
+| 3-5,7-10 | 其余 | ≤ 2^16 | < 1 GB | ~1 hr |
+| | **合计** | | **峰值 ~35 GB** | **~10-16 小时** |
+
+### 关键瓶颈说明
+
+- **初始化时间**：OMAP init 需要逐一插入 N 条数据，N=2^20 时约 1-3 分钟，N=2^24 时约 30-60 分钟。DAORAM backend 因去摊销结构额外慢 30-50%。
+- **backend_cmp / bandwidth / modes** 是三个最耗时的实验，因为它们遍历多个 logN 值，每个值都要重新 init。
+- **dynamic / drift** 用小 N (512) 跑 3000-5000 次查询，几分钟即可完成。
+- **TCP 网络开销**：LAN 环境下 TCP 开销可忽略（<5%）。WAN-80 环境下每次 ORAM 访问多 ~80ms RTT，实验时间会显著增加（约 3-5 倍）。
+
+### 资源规划建议
+
+| 场景 | Server 机器 | Client 机器 | 总时间 |
+|------|------------|------------|--------|
+| 快速验证 (logN≤14, Q=50) | 1 GB RAM | 512 MB RAM | ~10 min |
+| 标准实验 (logN≤20, Q=500) | **8 GB RAM** | 2 GB RAM | ~2-3 hr |
+| 大规模 (logN≤24, Q=1000) | **64 GB RAM** | 4 GB RAM | ~10-16 hr |
+
+> 建议周一先跑 `logN≤20, Q=500` 的标准实验，确认数据合理后再跑 `logN=24` 的大规模实验。大规模实验可以晚上挂着跑。
+
+---
+
+## 七、注意事项
 
 1. **Server 不需要重启**：`oram_server` 支持多次 client 连接，每次实验 client 断开后 server 会自动清理状态。
 2. **网络延迟**：如果两台机器在同一局域网，RTT 约 0.1ms (LAN)。如果要模拟 WAN，可用 `tc` 命令加延迟：
