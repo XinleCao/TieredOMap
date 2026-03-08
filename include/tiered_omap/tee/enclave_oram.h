@@ -38,6 +38,29 @@ public:
     // Dummy access (touch a random path, no real key).
     void dummy_access();
 
+    // ── Low-level interface for multi-node operations (AVL tree) ────────
+    //
+    // Pattern: read_path_to_stash → extract_from_stash → (modify locally)
+    //          → add_to_stash (with new leaf) → evict_one_path
+    //
+    // Allows reading multiple nodes before writing them all back.
+
+    // Read a leaf-to-root path; move all non-dummy blocks into stash.
+    void read_path_to_stash(int leaf);
+
+    // Remove a specific key's block from the stash and return it.
+    // Returns a block with key==INVALID_KEY if not found.
+    Block extract_from_stash(int key);
+
+    // Add a block to the stash (e.g. after modifying it locally).
+    void add_to_stash(int key, int leaf, const Bytes& value);
+
+    // Evict stash along the specified leaf's path (should match the path
+    // that was read).  Call once per read_path_to_stash.
+    void evict_one_path(int leaf);
+
+    // ────────────────────────────────────────────────────────────────────
+
     int random_leaf() const;
     int level() const { return level_; }
     int leaf_range() const { return leaf_range_; }
@@ -46,11 +69,14 @@ public:
     const Stats& total_stats() const { return total_stats_; }
     void reset_stats() { last_stats_.reset(); total_stats_.reset(); }
 
-    // Position map access (client-side, in-enclave).
+    // Position map access (in-enclave).
     int get_leaf(int key) const;
     void set_leaf(int key, int leaf);
 
     int stash_size() const { return static_cast<int>(stash_.size()); }
+
+    void begin_page_tracking();
+    uint64_t end_page_tracking();
 
     static constexpr int PAGE_SIZE = 4096;
 
@@ -93,9 +119,6 @@ private:
     int node_byte_size() const;
     void record_node_access(int node_idx);
     std::unordered_map<uint64_t, bool> touched_pages_;
-
-    void begin_page_tracking();
-    uint64_t end_page_tracking();
 
     // Path helpers.
     static int parent(int i) { return (i - 1) / 2; }

@@ -1,6 +1,7 @@
 #include "tiered_omap/tee/oblivious.h"
 #include "tiered_omap/tee/packed_directory.h"
 #include "tiered_omap/tee/enclave_oram.h"
+#include "tiered_omap/tee/tee_avl_omap.h"
 #include "tiered_omap/tee/tee_omap.h"
 #include "tiered_omap/tee/tee_server.h"
 #include <gtest/gtest.h>
@@ -127,6 +128,72 @@ TEST(EnclaveOram, PageTracking) {
 
     oram.access(0);
     EXPECT_GT(oram.last_stats().pages_touched, 0u);
+}
+
+// ── TEE AVL OMAP (cold tier) ────────────────────────────────────────────────
+
+TEST(TeeAvlOmap, SearchInsertRemove) {
+    TeeAvlOmap avl(128, 32, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i)
+        data.push_back({i, int_to_bytes(i * 11)});
+    avl.init(data);
+
+    for (int i = 0; i < 64; ++i) {
+        Bytes val = avl.search(i);
+        EXPECT_EQ(bytes_to_int(val), i * 11) << "key=" << i;
+    }
+
+    // Insert new keys.
+    for (int i = 64; i < 80; ++i)
+        avl.insert(i, int_to_bytes(i * 11));
+
+    // Verify all keys.
+    for (int i = 0; i < 80; ++i)
+        EXPECT_EQ(bytes_to_int(avl.search(i)), i * 11) << "key=" << i;
+
+    // Remove some keys.
+    for (int i = 0; i < 16; ++i)
+        avl.remove(i);
+
+    // Verify removed keys are gone and others remain.
+    for (int i = 0; i < 16; ++i)
+        EXPECT_TRUE(avl.search(i).empty()) << "key=" << i;
+    for (int i = 16; i < 80; ++i)
+        EXPECT_EQ(bytes_to_int(avl.search(i)), i * 11) << "key=" << i;
+}
+
+TEST(TeeAvlOmap, SplitOram) {
+    int split_d = 3;
+    TeeAvlOmap avl(128, 16, 4, split_d);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i)
+        data.push_back({i, int_to_bytes(i)});
+    avl.init(data);
+
+    EXPECT_TRUE(avl.is_split());
+
+    for (int i = 0; i < 64; ++i) {
+        Bytes val = avl.search(i);
+        EXPECT_EQ(bytes_to_int(val), i) << "key=" << i;
+    }
+
+    EXPECT_GE(avl.last_stats().lower_pages, 0u);
+}
+
+TEST(TeeAvlOmap, Update) {
+    TeeAvlOmap avl(32, 16, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 16; ++i)
+        data.push_back({i, int_to_bytes(i)});
+    avl.init(data);
+
+    Bytes new_val = int_to_bytes(999);
+    avl.search(7, &new_val);
+    EXPECT_EQ(bytes_to_int(avl.search(7)), 999);
 }
 
 // ── TEE OMAP ────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ add_library(tiered_omap STATIC
     src/network/storage_server.cpp
     src/tee/packed_directory.cpp
     src/tee/enclave_oram.cpp
+    src/tee/tee_avl_omap.cpp
     src/tee/tee_omap.cpp
     src/tee/tee_server.cpp
 )
@@ -79,6 +80,9 @@ target_link_libraries(bench_large PRIVATE tiered_omap)
 
 add_executable(bench_paper benchmark/bench_paper.cpp)
 target_link_libraries(bench_paper PRIVATE tiered_omap)
+
+add_executable(bench_tee benchmark/bench_tee.cpp)
+target_link_libraries(bench_tee PRIVATE tiered_omap)
 
 # ─── ORAM Server ─────────────────────────────────────────────────────────────
 

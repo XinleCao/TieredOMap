@@ -24,10 +24,12 @@ EnclaveOram::EnclaveOram(int num_data, int value_size, int bucket_size,
 
 void EnclaveOram::init(const std::vector<std::pair<int, Bytes>>& data) {
     stash_.clear();
-    pos_map_.clear();
 
-    for (auto& [key, val] : data)
-        pos_map_[key] = SecureRandom::rand_below(leaf_range_);
+    // Preserve pre-assigned leaves (set via set_leaf before init).
+    for (auto& [key, val] : data) {
+        if (pos_map_.find(key) == pos_map_.end())
+            pos_map_[key] = SecureRandom::rand_below(leaf_range_);
+    }
 
     // Simple sequential fill: place each block along its assigned path.
     for (auto& [key, val] : data) {
@@ -186,6 +188,38 @@ void EnclaveOram::evict_path(int /*leaf*/, const std::vector<int>& path_nodes) {
         throw std::runtime_error(
             "EnclaveOram: stash overflow (" + std::to_string(stash_.size()) +
             " > " + std::to_string(stash_max_) + ")");
+}
+
+// ── Low-level interface for multi-node operations ───────────────────────────
+
+void EnclaveOram::read_path_to_stash(int leaf) {
+    read_path(leaf);   // moves all blocks from the path into stash_
+}
+
+Block EnclaveOram::extract_from_stash(int key) {
+    for (auto it = stash_.begin(); it != stash_.end(); ++it) {
+        if (it->key == key) {
+            Block b{it->key, it->leaf, std::move(it->value)};
+            stash_.erase(it);
+            return b;
+        }
+    }
+    return Block{};  // not found
+}
+
+void EnclaveOram::add_to_stash(int key, int leaf, const Bytes& value) {
+    stash_.push_back({key, leaf, pad_bytes(value, value_size_)});
+}
+
+void EnclaveOram::evict_one_path(int leaf) {
+    std::vector<int> path_nodes;
+    int node = leaf_to_node(leaf);
+    while (node >= 0) {
+        path_nodes.push_back(node);
+        if (node == 0) break;
+        node = parent(node);
+    }
+    evict_path(leaf, path_nodes);
 }
 
 // ── Path geometry ───────────────────────────────────────────────────────────
