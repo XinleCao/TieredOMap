@@ -5,12 +5,17 @@
 
 namespace tiered_omap {
 
-PathORAM::PathORAM(int num_data, int bucket_size, int stash_scale)
+PathORAM::PathORAM(int num_data, int bucket_size, int stash_scale,
+                   StorageCreator storage_creator)
     : num_data_(num_data),
       bucket_size_(bucket_size),
-      storage_(num_data, bucket_size),
+      storage_creator_(std::move(storage_creator)),
       aes_key_(generate_aes_key()) {
-    int lvl = storage_.level();
+    if (storage_creator_)
+        storage_ = storage_creator_(num_data, bucket_size);
+    else
+        storage_ = std::make_unique<BinaryTreeStorage>(num_data, bucket_size);
+    int lvl = storage_->level();
     stash_max_size_ = stash_scale * std::max(lvl - 1, 1);
 }
 
@@ -18,30 +23,24 @@ void PathORAM::init(const std::unordered_map<int, Bytes>& data) {
     block_size_bytes_ = 0;
     stash_.clear();
 
-    // Assign random leaves for all keys not yet in pos_map.
     for (auto& [key, value] : data) {
         if (pos_map_.find(key) == pos_map_.end())
-            pos_map_[key] = SecureRandom::rand_below(storage_.leaf_range());
+            pos_map_[key] = SecureRandom::rand_below(storage_->leaf_range());
         if (static_cast<int>(value.size()) > block_size_bytes_)
             block_size_bytes_ = static_cast<int>(value.size());
     }
 
-    storage_ = BinaryTreeStorage(num_data_, bucket_size_);
+    storage_->reset(num_data_, bucket_size_);
+
+    std::vector<Block> blocks;
+    blocks.reserve(data.size());
     for (auto& [key, value] : data) {
         Bytes enc_val = value.empty() ? value : aes_encrypt(aes_key_, value);
-        Block block{key, pos_map_.at(key), enc_val};
-        storage_.fill_data_to_leaf(block);
+        blocks.push_back({key, pos_map_.at(key), enc_val});
     }
 
-    // Collect blocks that didn't fit into the tree.
-    std::unordered_set<int> placed_keys;
-    for (int leaf = 0; leaf < storage_.leaf_range(); ++leaf) {
-        auto path = storage_.read_path(leaf);
-        for (auto& [node, bucket] : path)
-            for (auto& b : bucket)
-                if (!b.is_dummy())
-                    placed_keys.insert(b.key);
-    }
+    auto placed_keys = storage_->bulk_load(blocks);
+
     for (auto& [key, value] : data) {
         if (placed_keys.find(key) == placed_keys.end())
             stash_.push_back({key, pos_map_.at(key), value});
@@ -55,10 +54,8 @@ Bytes PathORAM::access(int key, const Bytes* new_value) {
     int new_leaf = random_leaf();
     pos_map_[key] = new_leaf;
 
-    // Read path.
     read_path_to_stash(old_leaf);
 
-    // Find the target block in stash and retrieve/update.
     Bytes result;
     Block* target = find_in_stash(key);
     if (!target)
@@ -69,12 +66,11 @@ Bytes PathORAM::access(int key, const Bytes* new_value) {
         target->value = *new_value;
     target->leaf = new_leaf;
 
-    // Evict and write back.
     evict_and_write_path(old_leaf);
     inject_round_delay();
 
     last_bw_.rounds = 1;
-    int path_blocks = storage_.level() * bucket_size_;
+    int path_blocks = storage_->level() * bucket_size_;
     last_bw_.bytes_downloaded = path_blocks * (block_size_bytes_ + 8);
     last_bw_.bytes_uploaded = last_bw_.bytes_downloaded;
     total_bw_ += last_bw_;
@@ -90,7 +86,7 @@ void PathORAM::dummy_access() {
 
     last_bw_.reset();
     last_bw_.rounds = 1;
-    int path_blocks = storage_.level() * bucket_size_;
+    int path_blocks = storage_->level() * bucket_size_;
     last_bw_.bytes_downloaded = path_blocks * (block_size_bytes_ + 8);
     last_bw_.bytes_uploaded = last_bw_.bytes_downloaded;
     total_bw_ += last_bw_;
@@ -111,20 +107,13 @@ void PathORAM::decrypt_bucket(std::vector<Block>& bucket) {
 }
 
 void PathORAM::read_path_to_stash(int leaf) {
-    auto path_data = storage_.read_path(leaf);
-
-    std::unordered_set<int> stash_ids;
-    for (auto& b : stash_)
-        if (!b.is_dummy()) stash_ids.insert(b.key);
+    auto path_data = storage_->read_path(leaf);
 
     for (auto& [node, bucket] : path_data) {
         decrypt_bucket(bucket);
-        for (auto& block : bucket) {
-            if (!block.is_dummy() && stash_ids.find(block.key) == stash_ids.end()) {
-                stash_ids.insert(block.key);
+        for (auto& block : bucket)
+            if (!block.is_dummy())
                 stash_.push_back(std::move(block));
-            }
-        }
     }
 }
 
@@ -138,7 +127,7 @@ void PathORAM::evict_and_write_paths(const std::vector<int>& leaves) {
 
 void PathORAM::evict_stash(const std::vector<int>& leaves) {
     auto indices = BinaryTreeStorage::get_merged_path_indices(
-        storage_.level(), leaves);
+        storage_->level(), leaves);
 
     std::unordered_map<int, std::vector<Block>> path;
     for (int idx : indices)
@@ -147,7 +136,7 @@ void PathORAM::evict_stash(const std::vector<int>& leaves) {
     std::vector<Block> remaining;
     for (auto& block : stash_) {
         bool inserted = BinaryTreeStorage::fill_block_to_path(
-            block, path, leaves, storage_.level(), bucket_size_);
+            block, path, leaves, storage_->level(), bucket_size_);
         if (!inserted)
             remaining.push_back(std::move(block));
     }
@@ -162,7 +151,7 @@ void PathORAM::evict_stash(const std::vector<int>& leaves) {
     for (auto& [node, bucket] : path)
         encrypt_bucket(bucket);
 
-    storage_.write_multiple_paths(path);
+    storage_->write_multiple_paths(path);
 }
 
 Block* PathORAM::find_in_stash(int key) {
@@ -180,8 +169,30 @@ Block PathORAM::extract_from_stash(int key) {
             return b;
         }
     }
-    throw std::runtime_error("PathORAM::extract_from_stash: key " +
-                             std::to_string(key) + " not found in stash");
+    std::string diag = "PathORAM::extract_from_stash: key " +
+                        std::to_string(key) + " not found. stash=[";
+    for (auto& b : stash_)
+        diag += std::to_string(b.key) + "(leaf=" +
+                std::to_string(b.leaf) + " val_sz=" +
+                std::to_string(b.value.size()) + ") ";
+    diag += "]";
+    auto pm_it = pos_map_.find(key);
+    if (pm_it != pos_map_.end()) {
+        diag += " pos_map_leaf=" + std::to_string(pm_it->second);
+        auto path = storage_->read_path(pm_it->second);
+        bool on_path = false;
+        for (auto& [node, bucket] : path)
+            for (auto& b : bucket)
+                if (b.key == key) {
+                    on_path = true;
+                    diag += " tree_copy(leaf=" + std::to_string(b.leaf) +
+                            " val_sz=" + std::to_string(b.value.size()) + ")";
+                }
+        diag += on_path ? " DEDUP_BUG" : " NOT_ON_PATH";
+    } else {
+        diag += " NOT_IN_POSMAP";
+    }
+    throw std::runtime_error(diag);
 }
 
 void PathORAM::add_to_stash(Block block) {
@@ -199,7 +210,7 @@ void PathORAM::set_leaf(int key, int leaf) {
 }
 
 int PathORAM::random_leaf() const {
-    return SecureRandom::rand_below(storage_.leaf_range());
+    return SecureRandom::rand_below(storage_->leaf_range());
 }
 
 }  // namespace tiered_omap

@@ -25,11 +25,11 @@ struct AVLNodeData {
 
 class AVLOmap : public OmapInterface {
 public:
-    explicit AVLOmap(int capacity, int bucket_size = 4);
+    explicit AVLOmap(int capacity, int bucket_size = 4,
+                     StorageCreator storage_creator = nullptr);
 
-    // Split-ORAM constructor: top split_depth AVL levels → upper_oram(upper_cap),
-    // remaining levels → oram_(capacity).
-    AVLOmap(int capacity, int bucket_size, int split_depth, int upper_capacity);
+    AVLOmap(int capacity, int bucket_size, int split_depth, int upper_capacity,
+            StorageCreator storage_creator = nullptr);
 
     void init(const std::vector<std::pair<int, Bytes>>& data) override;
 
@@ -94,8 +94,9 @@ private:
     int root_leaf_ = INVALID_LEAF;
 
     int split_depth_ = 0;
+    StorageCreator storage_creator_;
     PathORAM upper_oram_;
-    PathORAM oram_;              // lower ORAM (or sole ORAM when no split)
+    PathORAM oram_;
 
     std::vector<LocalNode> local_;
     bool ods_mode_ = false;

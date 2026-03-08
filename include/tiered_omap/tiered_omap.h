@@ -2,7 +2,9 @@
 
 #include "tiered_omap/common.h"
 #include "tiered_omap/maintenance.h"
+#include "tiered_omap/network/storage_interface.h"
 #include "tiered_omap/omap/omap_interface.h"
+#include <deque>
 #include <memory>
 #include <unordered_set>
 #include <vector>
@@ -30,6 +32,7 @@ struct TieredOMapConfig {
     OmapBackend backend = OmapBackend::AVL;
     int bplus_order = 8;
     MaintenanceConfig maintenance;
+    StorageCreator storage_creator;
 };
 
 struct AccessResult {
@@ -70,6 +73,12 @@ public:
 private:
     void do_maintenance_step();
     void do_promotion_standalone();
+    void do_da_maintenance_step();
+
+    bool is_da_backend() const {
+        return config_.backend == OmapBackend::DaAvl
+            || config_.backend == OmapBackend::DaBplus;
+    }
 
     TieredOMapConfig config_;
     std::unique_ptr<OmapInterface> hot_omap_;
@@ -79,6 +88,8 @@ private:
     std::vector<int> hot_key_list_;
     std::unique_ptr<MaintenanceManager> maint_;
     int hot_capacity_ = 0;
+
+    std::deque<int> da_pending_demotions_;
 };
 
 }  // namespace tiered_omap

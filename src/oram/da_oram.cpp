@@ -7,13 +7,17 @@
 namespace tiered_omap {
 
 DAOram::DAOram(int num_data, int bucket_size, int stash_scale,
-               int num_ic, int ic_max)
+               int num_ic, int ic_max, StorageCreator storage_creator)
     : num_data_(num_data),
       bucket_size_(bucket_size),
       num_ic_(num_ic),
       ic_max_(ic_max),
-      storage_(num_data, bucket_size) {
-    int lvl = storage_.level();
+      storage_creator_(std::move(storage_creator)) {
+    if (storage_creator_)
+        storage_ = storage_creator_(num_data, bucket_size);
+    else
+        storage_ = std::make_unique<BinaryTreeStorage>(num_data, bucket_size);
+    int lvl = storage_->level();
     stash_max_size_ = stash_scale * std::max(lvl - 1, 1);
 
     int num_groups = (num_data + num_ic - 1) / num_ic;
@@ -23,13 +27,12 @@ DAOram::DAOram(int num_data, int bucket_size, int stash_scale,
 }
 
 int DAOram::prf_leaf(int data_key, uint64_t gc, uint8_t ic) const {
-    // Deterministic hash: H(seed, data_key, gc, ic) mod leaf_range.
     std::hash<uint64_t> h;
     uint64_t v = prf_seed_;
     v ^= h(static_cast<uint64_t>(data_key)) + 0x9e3779b9 + (v << 6) + (v >> 2);
     v ^= h(gc) + 0x9e3779b9 + (v << 6) + (v >> 2);
     v ^= h(static_cast<uint64_t>(ic)) + 0x9e3779b9 + (v << 6) + (v >> 2);
-    return static_cast<int>(v % static_cast<uint64_t>(storage_.leaf_range()));
+    return static_cast<int>(v % static_cast<uint64_t>(storage_->leaf_range()));
 }
 
 // ─── Init ───────────────────────────────────────────────────────────────────
@@ -43,22 +46,17 @@ void DAOram::init(const std::unordered_map<int, Bytes>& data) {
             block_size_bytes_ = static_cast<int>(value.size());
     }
 
-    // Initial leaf for each key: PRF(key, gc=0, ic=0).
-    storage_ = BinaryTreeStorage(num_data_, bucket_size_);
+    storage_->reset(num_data_, bucket_size_);
+
+    std::vector<Block> blocks;
+    blocks.reserve(data.size());
     for (auto& [key, value] : data) {
         int leaf = prf_leaf(key, 0, 0);
-        Block block{key, leaf, value};
-        storage_.fill_data_to_leaf(block);
+        blocks.push_back({key, leaf, value});
     }
 
-    // Collect overflow into stash.
-    std::unordered_set<int> placed;
-    for (int lf = 0; lf < storage_.leaf_range(); ++lf) {
-        auto path = storage_.read_path(lf);
-        for (auto& [node, bucket] : path)
-            for (auto& b : bucket)
-                if (!b.is_dummy()) placed.insert(b.key);
-    }
+    auto placed = storage_->bulk_load(blocks);
+
     for (auto& [key, value] : data) {
         if (placed.find(key) == placed.end()) {
             int leaf = prf_leaf(key, 0, 0);
@@ -81,15 +79,11 @@ std::pair<int, int> DAOram::update_counter(int data_key) {
     uint8_t next_ic;
 
     if (cb.backup[offset] == 1) {
-        // Backup reset: this entry's GC was incremented by a previous overflow
-        // of another entry in the same group. We use gc-1 for the current leaf
-        // and gc for the new leaf.
         next_ic = 0;
         next_gc = gc;
-        gc = gc - 1;  // current leaf uses the OLD gc
+        gc = gc - 1;
         cb.backup[offset] = 0;
     } else if (ic + 1 >= ic_max_) {
-        // IC overflow: GC increments, set backup for all OTHER entries.
         next_ic = 0;
         next_gc = gc + 1;
         cb.gc = next_gc;
@@ -97,7 +91,6 @@ std::pair<int, int> DAOram::update_counter(int data_key) {
             if (i != offset) cb.backup[i] = 1;
         }
     } else {
-        // Normal increment.
         next_ic = ic + 1;
         next_gc = gc;
     }
@@ -116,18 +109,15 @@ std::tuple<int, int, int> DAOram::perform_reset(int group_key) {
     for (int i = 0; i < num_ic_; ++i) {
         if (cb.backup[i] == 1) {
             int data_key = group_key * num_ic_ + i;
-            if (data_key >= num_data_) continue;  // out-of-range padding
+            if (data_key >= num_data_) continue;
 
-            // This entry needs reset: compute its current and new leaf.
             uint64_t gc = cb.gc;
             uint8_t ic = cb.ic[i];
 
-            // Before reset: leaf = PRF(key, gc-1, ic). After: PRF(key, gc, 0).
             uint64_t old_gc = gc - 1;
             int cur_leaf = prf_leaf(data_key, old_gc, ic);
             int new_leaf = prf_leaf(data_key, gc, 0);
 
-            // Apply the reset.
             cb.ic[i] = 0;
             cb.backup[i] = 0;
 
@@ -135,8 +125,7 @@ std::tuple<int, int, int> DAOram::perform_reset(int group_key) {
         }
     }
 
-    // No reset needed; return dummy values.
-    return {-1, SecureRandom::rand_below(storage_.leaf_range()), -1};
+    return {-1, SecureRandom::rand_below(storage_->leaf_range()), -1};
 }
 
 // ─── Access ─────────────────────────────────────────────────────────────────
@@ -144,22 +133,18 @@ std::tuple<int, int, int> DAOram::perform_reset(int group_key) {
 Bytes DAOram::access(int key, const Bytes* new_value) {
     last_bw_.reset();
 
-    // Step 1: Update counters to get current and new leaf for data key.
     auto [cur_leaf, new_leaf] = update_counter(key);
 
-    // Step 2: Check if a reset is needed in the same group.
     int group = key / num_ic_;
     auto [r_key, r_cur_leaf, r_new_leaf] = perform_reset(group);
 
-    // Step 3: Read both paths (merged to avoid duplicate blocks at shared nodes).
     {
-        auto merged = storage_.read_multiple_paths({cur_leaf, r_cur_leaf});
+        auto merged = storage_->read_multiple_paths({cur_leaf, r_cur_leaf});
         for (auto& [node, bucket] : merged)
             for (auto& block : bucket)
                 if (!block.is_dummy()) stash_.push_back(block);
     }
 
-    // Step 4: Process the data block.
     Block* target = find_in_stash(key);
     if (!target)
         throw std::runtime_error("DAOram::access: key " +
@@ -168,18 +153,15 @@ Bytes DAOram::access(int key, const Bytes* new_value) {
     if (new_value) target->value = *new_value;
     target->leaf = new_leaf;
 
-    // Step 5: Process the reset block (update its leaf).
     if (r_key >= 0) {
         Block* r_block = find_in_stash(r_key);
         if (r_block) r_block->leaf = r_new_leaf;
     }
 
-    // Step 6: Evict to both paths and write back.
     evict_and_write_paths({cur_leaf, r_cur_leaf});
 
-    // Bandwidth accounting: two paths read + two paths written.
     last_bw_.rounds = 1;
-    int path_blocks = storage_.level() * bucket_size_;
+    int path_blocks = storage_->level() * bucket_size_;
     last_bw_.bytes_downloaded = 2 * path_blocks * (block_size_bytes_ + 8);
     last_bw_.bytes_uploaded = last_bw_.bytes_downloaded;
     total_bw_ += last_bw_;
@@ -188,15 +170,20 @@ Bytes DAOram::access(int key, const Bytes* new_value) {
 }
 
 void DAOram::dummy_access() {
-    int leaf1 = SecureRandom::rand_below(storage_.leaf_range());
-    int leaf2 = SecureRandom::rand_below(storage_.leaf_range());
-    read_path_to_stash(leaf1);
-    read_path_to_stash(leaf2);
+    int leaf1 = SecureRandom::rand_below(storage_->leaf_range());
+    int leaf2 = SecureRandom::rand_below(storage_->leaf_range());
+
+    {
+        auto merged = storage_->read_multiple_paths({leaf1, leaf2});
+        for (auto& [node, bucket] : merged)
+            for (auto& block : bucket)
+                if (!block.is_dummy()) stash_.push_back(block);
+    }
     evict_and_write_paths({leaf1, leaf2});
 
     last_bw_.reset();
     last_bw_.rounds = 1;
-    int path_blocks = storage_.level() * bucket_size_;
+    int path_blocks = storage_->level() * bucket_size_;
     last_bw_.bytes_downloaded = 2 * path_blocks * (block_size_bytes_ + 8);
     last_bw_.bytes_uploaded = last_bw_.bytes_downloaded;
     total_bw_ += last_bw_;
@@ -212,7 +199,7 @@ Bytes DAOram::access_without_eviction(int key) {
     auto [r_key, r_cur_leaf, r_new_leaf] = perform_reset(group);
 
     {
-        auto merged = storage_.read_multiple_paths({cur_leaf, r_cur_leaf});
+        auto merged = storage_->read_multiple_paths({cur_leaf, r_cur_leaf});
         for (auto& [node, bucket] : merged)
             for (auto& block : bucket)
                 if (!block.is_dummy()) stash_.push_back(block);
@@ -233,7 +220,7 @@ Bytes DAOram::access_without_eviction(int key) {
     pending_leaves_ = {cur_leaf, r_cur_leaf};
 
     last_bw_.rounds = 1;
-    int path_blocks = storage_.level() * bucket_size_;
+    int path_blocks = storage_->level() * bucket_size_;
     last_bw_.bytes_downloaded = 2 * path_blocks * (block_size_bytes_ + 8);
     last_bw_.bytes_uploaded = 0;
     total_bw_ += last_bw_;
@@ -250,7 +237,7 @@ void DAOram::complete_eviction(int key, const Bytes& new_value) {
     evict_and_write_paths(pending_leaves_);
 
     last_bw_.rounds = 1;
-    int path_blocks = storage_.level() * bucket_size_;
+    int path_blocks = storage_->level() * bucket_size_;
     last_bw_.bytes_downloaded = 0;
     last_bw_.bytes_uploaded = 2 * path_blocks * (block_size_bytes_ + 8);
     total_bw_ += last_bw_;
@@ -261,7 +248,7 @@ void DAOram::complete_eviction(int key, const Bytes& new_value) {
 // ─── Low-level ORAM operations ──────────────────────────────────────────────
 
 void DAOram::read_path_to_stash(int leaf) {
-    auto path_data = storage_.read_path(leaf);
+    auto path_data = storage_->read_path(leaf);
     for (auto& [node, bucket] : path_data)
         for (auto& block : bucket)
             if (!block.is_dummy()) stash_.push_back(std::move(block));
@@ -277,7 +264,7 @@ void DAOram::evict_and_write_paths(const std::vector<int>& leaves) {
 
 void DAOram::evict_stash(const std::vector<int>& leaves) {
     auto indices = BinaryTreeStorage::get_merged_path_indices(
-        storage_.level(), leaves);
+        storage_->level(), leaves);
 
     std::unordered_map<int, std::vector<Block>> path;
     for (int idx : indices) path[idx] = {};
@@ -285,7 +272,7 @@ void DAOram::evict_stash(const std::vector<int>& leaves) {
     std::vector<Block> remaining;
     for (auto& block : stash_) {
         bool inserted = BinaryTreeStorage::fill_block_to_path(
-            block, path, leaves, storage_.level(), bucket_size_);
+            block, path, leaves, storage_->level(), bucket_size_);
         if (!inserted) remaining.push_back(std::move(block));
     }
     stash_ = std::move(remaining);
@@ -296,7 +283,7 @@ void DAOram::evict_stash(const std::vector<int>& leaves) {
             " > " + std::to_string(stash_max_size_) + ")");
     }
 
-    storage_.write_multiple_paths(path);
+    storage_->write_multiple_paths(path);
 }
 
 Block* DAOram::find_in_stash(int key) {
@@ -329,13 +316,11 @@ int DAOram::get_leaf(int key) const {
 }
 
 void DAOram::set_leaf(int key, int /*leaf*/) {
-    // In DAORAM, leaves are derived from counters via PRF.
-    // set_leaf is a no-op; the leaf is implicitly determined by the counter state.
     (void)key;
 }
 
 int DAOram::random_leaf() const {
-    return SecureRandom::rand_below(storage_.leaf_range());
+    return SecureRandom::rand_below(storage_->leaf_range());
 }
 
 }  // namespace tiered_omap

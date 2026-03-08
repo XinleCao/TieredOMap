@@ -22,9 +22,8 @@ struct BPlusNode {
 
 class BPlusOmap : public OmapInterface {
 public:
-    // capacity = max number of key-value pairs.
-    // order = B+ tree branching factor (max children per internal node).
-    BPlusOmap(int capacity, int order = 8, int bucket_size = 4);
+    BPlusOmap(int capacity, int order = 8, int bucket_size = 4,
+              StorageCreator storage_creator = nullptr);
 
     void init(const std::vector<std::pair<int, Bytes>>& data) override;
 
@@ -99,6 +98,7 @@ private:
 
     void finalize_bw();
 
+    StorageCreator storage_creator_;
     PathORAM oram_;
     std::vector<LocalNode> local_;
     std::vector<CachedSibling> sibling_cache_;

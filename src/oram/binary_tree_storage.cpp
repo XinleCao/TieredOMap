@@ -11,6 +11,28 @@ BinaryTreeStorage::BinaryTreeStorage(int num_data, int bucket_size)
     storage_.resize(total_nodes_);
 }
 
+void BinaryTreeStorage::reset(int num_data, int bucket_size) {
+    bucket_size_ = bucket_size;
+    level_ = ceil_log2(num_data) + 1;
+    leaf_range_ = 1 << (level_ - 1);
+    total_nodes_ = (1 << level_) - 1;
+    storage_.clear();
+    storage_.resize(total_nodes_);
+}
+
+std::unordered_set<int>
+BinaryTreeStorage::bulk_load(const std::vector<Block>& blocks) {
+    for (auto& block : blocks)
+        fill_data_to_leaf(block);
+
+    std::unordered_set<int> placed;
+    for (auto& bucket : storage_)
+        for (auto& block : bucket)
+            if (!block.is_dummy())
+                placed.insert(block.key);
+    return placed;
+}
+
 std::vector<int> BinaryTreeStorage::get_path_indices(int leaf) const {
     std::vector<int> path;
     path.reserve(level_);

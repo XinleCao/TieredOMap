@@ -73,9 +73,11 @@ BPlusNode BPlusNode::decode(const Bytes& raw) {
 
 // ─── BPlusOmap ──────────────────────────────────────────────────────────────
 
-BPlusOmap::BPlusOmap(int capacity, int order, int bucket_size)
+BPlusOmap::BPlusOmap(int capacity, int order, int bucket_size,
+                     StorageCreator storage_creator)
     : order_(order),
-      oram_(capacity, bucket_size) {
+      storage_creator_(std::move(storage_creator)),
+      oram_(capacity, bucket_size, 7, storage_creator_) {
     int half = std::max(static_cast<int>(std::ceil(order / 2.0)), 2);
     max_height_ = std::max(1,
         static_cast<int>(std::ceil(std::log(std::max(capacity, 2))
@@ -149,7 +151,8 @@ void BPlusOmap::init(const std::vector<std::pair<int, Bytes>>& data) {
     for (auto& [k, v] : oram_data)
         nodes[k] = BPlusNode::decode(v);
 
-    oram_ = PathORAM(std::max(next_block_id_, 1), oram_.bucket_size());
+    oram_ = PathORAM(std::max(next_block_id_, 1), oram_.bucket_size(),
+                     7, storage_creator_);
     for (auto& [k, _] : nodes)
         oram_.set_leaf(k, oram_.random_leaf());
 

@@ -15,6 +15,9 @@ add_library(tiered_omap STATIC
     src/omap/bplus_omap.cpp
     src/omap/da_ost_omap.cpp
     src/tiered_omap.cpp
+    src/network/tcp_channel.cpp
+    src/network/network_storage.cpp
+    src/network/storage_server.cpp
 )
 
 target_include_directories(tiered_omap PUBLIC
@@ -39,9 +42,12 @@ add_executable(test_da_oram      tests/test_da_oram.cpp)
 add_executable(test_avl_omap     tests/test_avl_omap.cpp)
 add_executable(test_bplus_omap   tests/test_bplus_omap.cpp)
 add_executable(test_da_ost_omap  tests/test_da_ost_omap.cpp)
+add_executable(test_da_ost_maint tests/test_da_ost_maint.cpp)
 add_executable(test_tiered_omap  tests/test_tiered_omap.cpp)
 
-foreach(tgt test_path_oram test_da_oram test_avl_omap test_bplus_omap test_da_ost_omap test_tiered_omap)
+add_executable(test_network      tests/test_network.cpp)
+
+foreach(tgt test_path_oram test_da_oram test_avl_omap test_bplus_omap test_da_ost_omap test_da_ost_maint test_tiered_omap test_network)
     target_link_libraries(${tgt} PRIVATE tiered_omap GTest::gtest_main)
     add_test(NAME ${tgt} COMMAND ${tgt})
 endforeach()
@@ -65,3 +71,11 @@ target_link_libraries(bench_rounds PRIVATE tiered_omap)
 
 add_executable(bench_large benchmark/bench_large.cpp)
 target_link_libraries(bench_large PRIVATE tiered_omap)
+
+add_executable(bench_paper benchmark/bench_paper.cpp)
+target_link_libraries(bench_paper PRIVATE tiered_omap)
+
+# ─── ORAM Server ─────────────────────────────────────────────────────────────
+
+add_executable(oram_server tools/oram_server.cpp)
+target_link_libraries(oram_server PRIVATE tiered_omap)

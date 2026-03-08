@@ -43,29 +43,30 @@ void TieredOMap::init(
     int cold_cap = use_epoch ? std::max(N_cold, config_.total_keys) : std::max(N_cold, 1);
     hot_capacity_ = hot_cap;
 
+    auto& sc = config_.storage_creator;
     switch (config_.backend) {
     case OmapBackend::BPlus:
-        hot_omap_ = std::make_unique<BPlusOmap>(hot_cap, config_.bplus_order, bs);
-        cold_omap_ = std::make_unique<BPlusOmap>(cold_cap, config_.bplus_order, bs);
+        hot_omap_ = std::make_unique<BPlusOmap>(hot_cap, config_.bplus_order, bs, sc);
+        cold_omap_ = std::make_unique<BPlusOmap>(cold_cap, config_.bplus_order, bs, sc);
         break;
     case OmapBackend::DaAvl:
-        hot_omap_ = std::make_unique<DaOstOmap>(hot_cap, OdsTreeType::AVL, 0, bs);
-        cold_omap_ = std::make_unique<DaOstOmap>(cold_cap, OdsTreeType::AVL, 0, bs);
+        hot_omap_ = std::make_unique<DaOstOmap>(hot_cap, OdsTreeType::AVL, 0, bs, 8, sc);
+        cold_omap_ = std::make_unique<DaOstOmap>(cold_cap, OdsTreeType::AVL, 0, bs, 8, sc);
         break;
     case OmapBackend::DaBplus:
         hot_omap_ = std::make_unique<DaOstOmap>(
-            hot_cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order);
+            hot_cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order, sc);
         cold_omap_ = std::make_unique<DaOstOmap>(
-            cold_cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order);
+            cold_cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order, sc);
         break;
     default:  // AVL
-        hot_omap_ = std::make_unique<AVLOmap>(hot_cap, bs);
+        hot_omap_ = std::make_unique<AVLOmap>(hot_cap, bs, sc);
         if (config_.use_split_oram && n > 0) {
             int split_depth = ceil_log2(std::max(n, 2));
             cold_omap_ = std::make_unique<AVLOmap>(
-                cold_cap, bs, split_depth, std::max(n, 1));
+                cold_cap, bs, split_depth, std::max(n, 1), sc);
         } else {
-            cold_omap_ = std::make_unique<AVLOmap>(cold_cap, bs);
+            cold_omap_ = std::make_unique<AVLOmap>(cold_cap, bs, sc);
         }
         break;
     }
@@ -78,16 +79,47 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
     bool is_hot_logical = hot_keys_.count(key) > 0;
     bool is_hot_physical = phys_hot_keys_.count(key) > 0;
     bool use_epoch = maint_ != nullptr;
-    bool piggyback_on = use_epoch && config_.maintenance.piggyback
-                        && config_.backend == OmapBackend::BPlus;
+    bool bplus_piggyback = use_epoch && config_.maintenance.piggyback
+                           && config_.backend == OmapBackend::BPlus;
+    bool da_piggyback = use_epoch && config_.maintenance.piggyback
+                        && is_da_backend();
 
     result.found_in_hot = is_hot_logical;
 
     bool maint_due = use_epoch && maint_->should_maintain_next();
-    bool pig_active = piggyback_on && maint_due && is_hot_physical
+    bool pig_active = bplus_piggyback && maint_due && is_hot_physical
                       && !hot_key_list_.empty();
 
-    if (use_epoch) {
+    if (da_piggyback) {
+        OmapInterface* target = is_hot_physical ? hot_omap_.get()
+                                                : cold_omap_.get();
+        OmapInterface* other  = is_hot_physical ? cold_omap_.get()
+                                                : hot_omap_.get();
+
+        Bytes raw = target->search(key);
+        auto [val, meta] = decode_epoch(raw);
+        bool promote_flag = false;
+        meta = maint_->on_access(key, is_hot_logical, meta, promote_flag);
+        Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
+        result.value = new_value ? *new_value : val;
+
+        target->search(key, &wb);
+        result.hot_bw = hot_omap_->last_stats();
+        other->dummy_access();
+
+        auto* da_hot = static_cast<DaOstOmap*>(hot_omap_.get());
+        auto sr = da_hot->piggyback_scan_step();
+
+        if (sr.key != INVALID_KEY && !sr.value.empty()) {
+            auto [sv, sm] = decode_epoch(sr.value);
+            if (maint_->should_demote(sm))
+                da_pending_demotions_.push_back(sr.key);
+        }
+
+        if (maint_->should_maintain())
+            do_da_maintenance_step();
+
+    } else if (use_epoch) {
         OmapInterface* target = is_hot_physical ? hot_omap_.get()
                                                 : cold_omap_.get();
         OmapInterface* other  = is_hot_physical ? cold_omap_.get()
@@ -181,7 +213,7 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
 
     // Standalone maintenance when piggyback is off.
-    if (maint_ && !piggyback_on && maint_->should_maintain())
+    if (maint_ && !bplus_piggyback && !da_piggyback && maint_->should_maintain())
         do_maintenance_step();
 
     // Piggyback mode: promotions still need standalone handling.
@@ -290,6 +322,53 @@ void TieredOMap::do_promotion_standalone() {
         auto it = std::lower_bound(
             hot_key_list_.begin(), hot_key_list_.end(), promo_key);
         hot_key_list_.insert(it, promo_key);
+    }
+}
+
+void TieredOMap::do_da_maintenance_step() {
+    // Process one pending demotion.
+    int dk = INVALID_KEY;
+    if (!da_pending_demotions_.empty()) {
+        dk = da_pending_demotions_.front();
+        da_pending_demotions_.pop_front();
+    }
+
+    bool can_demote = (dk != INVALID_KEY) && hot_keys_.count(dk);
+    if (can_demote) {
+        Bytes raw = hot_omap_->search(dk);
+        hot_omap_->remove(dk);
+        cold_omap_->insert(dk, raw);
+        hot_keys_.erase(dk);
+        phys_hot_keys_.erase(dk);
+        auto it = std::lower_bound(
+            hot_key_list_.begin(), hot_key_list_.end(), dk);
+        if (it != hot_key_list_.end() && *it == dk)
+            hot_key_list_.erase(it);
+    } else {
+        hot_omap_->dummy_access();
+        hot_omap_->dummy_access();
+        cold_omap_->dummy_access();
+    }
+
+    // Promotion.
+    int promo_key = INVALID_KEY;
+    bool has_promo = maint_->pop_promotion(promo_key);
+    bool do_promote = has_promo
+                      && !hot_keys_.count(promo_key)
+                      && static_cast<int>(hot_keys_.size()) < hot_capacity_;
+    if (do_promote) {
+        Bytes cold_raw = cold_omap_->search(promo_key);
+        cold_omap_->remove(promo_key);
+        hot_omap_->insert(promo_key, cold_raw);
+        hot_keys_.insert(promo_key);
+        phys_hot_keys_.insert(promo_key);
+        auto it = std::lower_bound(
+            hot_key_list_.begin(), hot_key_list_.end(), promo_key);
+        hot_key_list_.insert(it, promo_key);
+    } else {
+        cold_omap_->dummy_access();
+        cold_omap_->dummy_access();
+        hot_omap_->dummy_access();
     }
 }
 

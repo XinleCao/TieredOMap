@@ -31,18 +31,21 @@ AVLNodeData AVLNodeData::decode(const Bytes& raw) {
 
 // ─── Constructors ────────────────────────────────────────────────────────────
 
-AVLOmap::AVLOmap(int capacity, int bucket_size)
+AVLOmap::AVLOmap(int capacity, int bucket_size, StorageCreator storage_creator)
     : capacity_(capacity),
-      oram_(capacity, bucket_size) {
+      storage_creator_(std::move(storage_creator)),
+      oram_(capacity, bucket_size, 7, storage_creator_) {
     max_height_ = std::max(1,
         static_cast<int>(std::ceil(1.44 * std::log2(std::max(capacity, 2)))));
 }
 
-AVLOmap::AVLOmap(int capacity, int bucket_size, int split_depth, int upper_capacity)
+AVLOmap::AVLOmap(int capacity, int bucket_size, int split_depth,
+                 int upper_capacity, StorageCreator storage_creator)
     : capacity_(capacity),
       split_depth_(split_depth),
-      upper_oram_(std::max(upper_capacity, 1), bucket_size),
-      oram_(capacity, bucket_size) {
+      storage_creator_(std::move(storage_creator)),
+      upper_oram_(std::max(upper_capacity, 1), bucket_size, 7, storage_creator_),
+      oram_(capacity, bucket_size, 7, storage_creator_) {
     max_height_ = std::max(1,
         static_cast<int>(std::ceil(1.44 * std::log2(std::max(capacity, 2)))));
     if (split_depth_ > max_height_)
@@ -116,8 +119,8 @@ void AVLOmap::init(const std::vector<std::pair<int, Bytes>>& data) {
     if (split_depth_ > 0) {
         // Split mode: assign nodes to upper or lower ORAM based on depth.
         upper_oram_ = PathORAM(std::max(upper_oram_.num_data(), 1),
-                               upper_oram_.bucket_size());
-        oram_ = PathORAM(capacity_, oram_.bucket_size());
+                               upper_oram_.bucket_size(), 7, storage_creator_);
+        oram_ = PathORAM(capacity_, oram_.bucket_size(), 7, storage_creator_);
 
         std::function<void(int, int)> assign_leaves = [&](int key, int depth) {
             if (key == INVALID_KEY) return;
@@ -166,7 +169,7 @@ void AVLOmap::init(const std::vector<std::pair<int, Bytes>>& data) {
         oram_.init(lower_data);
     } else {
         // Non-split mode: single ORAM.
-        oram_ = PathORAM(capacity_, oram_.bucket_size());
+        oram_ = PathORAM(capacity_, oram_.bucket_size(), 7, storage_creator_);
         for (auto& [k, _] : nodes)
             oram_.set_leaf(k, oram_.random_leaf());
 
