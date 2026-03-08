@@ -1,0 +1,17 @@
+logN,backend,type,avg_bw_KB,avg_rounds
+12,AVL,standalone,197.44,54.0
+12,AVL,tiered,325.69,51.0
+12,BPlus,standalone,126.33,14.0
+12,BPlus,tiered,203.44,14.0
+12,DaAvl,standalone,101.97,28.0
+12,DaAvl,tiered,188.25,28.0
+12,DaBplus,standalone,48.95,19.0
+12,DaBplus,tiered,112.31,19.0
+14,AVL,standalone,265.78,63.0
+14,AVL,tiered,405.00,63.0
+14,BPlus,standalone,170.62,16.0
+14,BPlus,tiered,259.22,16.0
+14,DaAvl,standalone,117.66,28.0
+14,DaAvl,tiered,203.94,28.0
+14,DaBplus,standalone,56.48,19.0
+14,DaBplus,tiered,123.22,19.0

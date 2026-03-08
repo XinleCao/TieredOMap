@@ -623,6 +623,78 @@ static void exp_write(const Cfg& cfg) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Exp 9: Workload drift — hot items shift mid-run
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp 10: YCSB workload distributions (Zipfian / Uniform / Latest)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_workload(const Cfg& cfg) {
+    std::cout << "\n=== Exp: YCSB Workload Distributions ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/workload_dist.csv");
+    csv << "distribution,backend,avg_bw_kb,avg_answer_rnd,hit_pct\n";
+
+    int N = 1 << 16;
+    int n = cfg.n;
+    auto data = make_data(N);
+
+    // Optimal hot set per distribution:
+    //   Zipfian  → top-n popular keys [0, n)
+    //   Uniform  → any n keys (no natural hot set); use [0, n)
+    //   Latest   → most recent n keys [N-n, N)
+    auto hk_zipf = make_hot_keys(n);
+    std::vector<int> hk_latest;
+    for (int i = N - n; i < N; ++i) hk_latest.push_back(i);
+
+    struct DistSpec { const char* name; int id; };
+    static const DistSpec DISTS[] = {
+        {"Zipfian", 0}, {"Uniform", 1}, {"Latest", 2},
+    };
+
+    for (const auto& ds : DISTS) {
+        const auto& hot_keys = (ds.id == 2) ? hk_latest : hk_zipf;
+        for (auto& [label, be] : ALL_BACKENDS) {
+            TieredOMapConfig tc;
+            tc.total_keys = N; tc.hot_set_size = n;
+            tc.mode = SecurityMode::FullOblivious;
+            tc.backend = be;
+            tc.storage_creator = cfg.storage_creator;
+            TieredOMap tm(tc); tm.init(data, hot_keys);
+
+            ZipfSampler     z_zipf(N, cfg.s, 42);
+            UniformSampler  z_unif(N, 42);
+            LatestSampler   z_latest(N, 0.99, 42);
+
+            int dist_id = ds.id;
+            auto gen = [&]() -> int {
+                switch (dist_id) {
+                case 0: return z_zipf.sample();
+                case 1: return z_unif.sample();
+                default: return z_latest.sample();
+                }
+            };
+
+            for (int i = 0; i < cfg.warmup; ++i) tm.access(gen());
+            double bw = 0, ans = 0; int hot = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto r = tm.access(gen());
+                bw += r.total_bw.bytes_downloaded + r.total_bw.bytes_uploaded;
+                ans += r.rounds_to_answer;
+                if (r.found_in_hot) ++hot;
+            }
+            bw /= cfg.Q * 1024.0;
+            ans /= cfg.Q;
+            double hit = 100.0 * hot / cfg.Q;
+            csv << ds.name << "," << label << "," << std::fixed
+                << std::setprecision(1) << bw << "," << ans << ","
+                << hit << "\n";
+            std::cout << "  " << ds.name << " " << label << ": "
+                      << bw << "KB " << ans << "rnd hit=" << hit << "%\n";
+        }
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/workload_dist.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 static void exp_drift(const Cfg& cfg) {
     std::cout << "\n=== Exp: Workload Drift ===\n";
@@ -735,6 +807,7 @@ int main(int argc, char** argv) {
     if (all || cfg.exp == "backend_cmp") exp_backend_cmp(cfg);
     if (all || cfg.exp == "modes")       exp_modes(cfg);
     if (all || cfg.exp == "write")       exp_write(cfg);
+    if (all || cfg.exp == "workload")    exp_workload(cfg);
     if (all || cfg.exp == "drift")       exp_drift(cfg);
 
     std::cout << "\nAll done. CSV files in: " << cfg.outdir << "/\n";

@@ -32,6 +32,30 @@ private:
     std::vector<double> cdf_;
 };
 
+class UniformSampler {
+public:
+    UniformSampler(int n, uint64_t seed = 42) : dist_(0, n - 1), rng_(seed) {}
+    int sample() { return dist_(rng_); }
+
+private:
+    std::uniform_int_distribution<int> dist_;
+    std::mt19937_64 rng_;
+};
+
+// YCSB "latest" distribution: recently inserted keys (high key ids) are
+// accessed with Zipfian-like probability.  Rank 0 = newest key = key N-1.
+class LatestSampler {
+public:
+    LatestSampler(int n, double alpha = 0.99, uint64_t seed = 42)
+        : n_(n), zipf_(n, alpha, seed) {}
+
+    int sample() { return n_ - 1 - zipf_.sample(); }
+
+private:
+    int n_;
+    ZipfSampler zipf_;
+};
+
 class ShiftingZipfSampler {
 public:
     ShiftingZipfSampler(int n, double alpha, int shift_offset, uint64_t seed = 42)

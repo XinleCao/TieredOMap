@@ -52,39 +52,43 @@ echo " Output: $OUTDIR/"
 echo "============================================"
 
 echo ""
-echo "[1/9] Exp: Backend comparison (standalone OMAP)..."
+echo "[1/10] Exp: Backend comparison (standalone OMAP)..."
 $BENCH --exp=backend_cmp --Q=$Q --max_logN=$MAX_LOGN --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[2/9] Exp: Bandwidth & rounds vs N..."
+echo "[2/10] Exp: Bandwidth & rounds vs N..."
 $BENCH --exp=bandwidth --Q=$Q --max_logN=$MAX_LOGN --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[3/9] Exp: Skewness effect..."
+echo "[3/10] Exp: Skewness effect..."
 $BENCH --exp=skewness --Q=$Q --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[4/9] Exp: Hot-set size effect..."
+echo "[4/10] Exp: Hot-set size effect..."
 $BENCH --exp=hotsize --Q=$Q --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[5/9] Exp: Latency (analytical rounds × RTT)..."
+echo "[5/10] Exp: Latency (analytical rounds × RTT)..."
 $BENCH --exp=latency --Q=$Q --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[6/9] Exp: Security mode comparison (FO vs TM vs TM+Split)..."
+echo "[6/10] Exp: Security mode comparison (FO vs TM vs TM+Split)..."
 $BENCH --exp=modes --Q=$Q --max_logN=$MAX_LOGN --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[7/9] Exp: Write overhead (search vs update vs insert)..."
+echo "[7/10] Exp: Write overhead (search vs update vs insert)..."
 $BENCH --exp=write --Q=$Q --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[8/9] Exp: Dynamic hot-set maintenance..."
+echo "[8/10] Exp: Dynamic hot-set maintenance..."
 $BENCH --exp=dynamic --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[9/9] Exp: Workload drift..."
+echo "[9/10] Exp: YCSB workload distributions..."
+$BENCH --exp=workload --Q=$Q --outdir=$OUTDIR $NET_ARGS
+
+echo ""
+echo "[10/10] Exp: Workload drift..."
 $BENCH --exp=drift --outdir=$OUTDIR $NET_ARGS
 
 echo ""
