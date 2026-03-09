@@ -44,6 +44,7 @@ struct Cfg {
     double s = 1.0;
     int n = 1024;
     int max_logN = 20;
+    int value_size = 256;
     std::string outdir = "results";
     std::string host;     // empty = local storage
     int port = 12345;
@@ -66,6 +67,7 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--n") c.n = std::stoi(v);
         else if (k == "--max_logN") c.max_logN = std::stoi(v);
         else if (k == "--outdir") c.outdir = v;
+        else if (k == "--value_size") c.value_size = std::stoi(v);
         else if (k == "--host") c.host = v;
         else if (k == "--port") c.port = std::stoi(v);
     }
@@ -89,10 +91,14 @@ static void ensure_dir(const std::string& dir) {
     mkdir(dir.c_str(), 0755);
 }
 
-static std::vector<std::pair<int, Bytes>> make_data(int N) {
+static std::vector<std::pair<int, Bytes>> make_data(int N, int value_size = 256) {
     std::vector<std::pair<int, Bytes>> d;
     d.reserve(N);
-    for (int i = 0; i < N; ++i) d.emplace_back(i, int_to_bytes(i));
+    for (int i = 0; i < N; ++i) {
+        Bytes v(value_size, 0);
+        std::memcpy(v.data(), &i, std::min(sizeof(int), static_cast<size_t>(value_size)));
+        d.emplace_back(i, std::move(v));
+    }
     return d;
 }
 
@@ -151,7 +157,7 @@ static void exp_bandwidth(const Cfg& cfg) {
     for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
         int N = 1 << logN;
         int n = std::min(cfg.n, N / 2);
-        auto data = make_data(N);
+        auto data = make_data(N, cfg.value_size);
         auto hk = make_hot_keys(n);
 
         for (auto& [label, be] : ALL_BACKENDS) {
@@ -224,7 +230,7 @@ static void exp_skewness(const Cfg& cfg) {
 
     int N = 1 << 16;
     int n = cfg.n;
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
     auto hk = make_hot_keys(n);
 
     for (double s : {0.5, 0.7, 0.9, 1.0, 1.1, 1.3, 1.5}) {
@@ -266,7 +272,7 @@ static void exp_hotsize(const Cfg& cfg) {
     csv << "log_n,backend,avg_answer_rnd,avg_total_bw_KB\n";
 
     int N = 1 << 16;
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
 
     for (int log_n : {4, 6, 8, 10, 12}) {
         int n = 1 << log_n;
@@ -311,7 +317,7 @@ static void exp_latency(const Cfg& cfg) {
 
     int N = 1 << 16;
     int n = cfg.n;
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
     auto hk = make_hot_keys(n);
 
     // Measure rounds without sleep, then compute latency = rounds × RTT
@@ -388,7 +394,7 @@ static void exp_dynamic(const Cfg& cfg) {
     int total = 3000;
     int window = 100;
 
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
     auto hk = make_hot_keys(n);
 
     static const BackendSpec DYN_BACKENDS[] = {
@@ -447,7 +453,7 @@ static void exp_backend_cmp(const Cfg& cfg) {
 
     for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
         int N = 1 << logN;
-        auto data = make_data(N);
+        auto data = make_data(N, cfg.value_size);
         for (auto& [label, be] : ALL_BACKENDS) {
             auto omap = make_standalone(be, N, 4, cfg.storage_creator);
             omap->init(data);
@@ -501,7 +507,7 @@ static void exp_modes(const Cfg& cfg) {
     for (int logN = 14; logN <= cfg.max_logN; logN += 2) {
         int N = 1 << logN;
         int n = std::min(cfg.n, N / 2);
-        auto data = make_data(N);
+        auto data = make_data(N, cfg.value_size);
         auto hk = make_hot_keys(n);
 
         for (auto& [be_label, be] : ALL_BACKENDS) {
@@ -552,7 +558,7 @@ static void exp_write(const Cfg& cfg) {
     csv << "backend,op,avg_bw_KB,avg_rounds\n";
 
     int N = 1 << 16;
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
 
     for (auto& [label, be] : ALL_BACKENDS) {
         // Search
@@ -579,7 +585,9 @@ static void exp_write(const Cfg& cfg) {
             auto omap = make_standalone(be, N, 4, cfg.storage_creator);
             omap->init(data);
             ZipfSampler z(N, cfg.s, 42);
-            Bytes val = int_to_bytes(999);
+            Bytes val(cfg.value_size, 0);
+            int marker = 999;
+            std::memcpy(val.data(), &marker, std::min(sizeof(int), static_cast<size_t>(cfg.value_size)));
             for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample(), &val);
             double bw = 0, rnd = 0;
             for (int i = 0; i < cfg.Q; ++i) {
@@ -600,12 +608,16 @@ static void exp_write(const Cfg& cfg) {
                                           cfg.storage_creator);
             omap->init(data);
             double bw = 0, rnd = 0;
+            auto make_val = [&](int id) {
+                Bytes v(cfg.value_size, 0);
+                std::memcpy(v.data(), &id, std::min(sizeof(int), static_cast<size_t>(cfg.value_size)));
+                return v;
+            };
             for (int i = 0; i < cfg.warmup; ++i) {
-                omap->insert(N + i, int_to_bytes(N + i));
+                omap->insert(N + i, make_val(N + i));
             }
             for (int i = 0; i < cfg.Q; ++i) {
-                omap->insert(N + cfg.warmup + i,
-                             int_to_bytes(N + cfg.warmup + i));
+                omap->insert(N + cfg.warmup + i, make_val(N + cfg.warmup + i));
                 bw += omap->last_stats().total_bytes();
                 rnd += omap->last_stats().rounds;
             }
@@ -634,7 +646,7 @@ static void exp_workload(const Cfg& cfg) {
 
     int N = 1 << 16;
     int n = cfg.n;
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
 
     // Optimal hot set per distribution:
     //   Zipfian  → top-n popular keys [0, n)
@@ -708,7 +720,7 @@ static void exp_drift(const Cfg& cfg) {
     int shift_at = 2000;
     int window = 100;
 
-    auto data = make_data(N);
+    auto data = make_data(N, cfg.value_size);
     auto hk = make_hot_keys(n);
 
     static const BackendSpec DRIFT_BACKENDS[] = {
@@ -786,6 +798,196 @@ static void exp_drift(const Cfg& cfg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp: Throughput (ops/sec) vs N — all backends, standalone vs tiered
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_throughput(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Throughput (ops/sec) vs N ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/throughput.csv");
+    csv << "logN,backend,type,ops_per_sec,avg_us_per_op\n";
+
+    for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
+        int N = 1 << logN;
+        int n = std::min(cfg.n, N / 2);
+        auto data = make_data(N, cfg.value_size);
+        auto hk = make_hot_keys(n);
+
+        for (auto& [label, be] : ALL_BACKENDS) {
+            // Standalone
+            {
+                auto omap = make_standalone(be, N, 4, cfg.storage_creator);
+                omap->init(data);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+                auto t0 = Clock::now();
+                for (int i = 0; i < cfg.Q; ++i) omap->search(z.sample());
+                double elapsed_us = std::chrono::duration<double, std::micro>(
+                    Clock::now() - t0).count();
+                double us_per_op = elapsed_us / cfg.Q;
+                double ops_sec = 1e6 / us_per_op;
+                csv << logN << "," << label << ",standalone,"
+                    << std::fixed << std::setprecision(1) << ops_sec << ","
+                    << std::setprecision(0) << us_per_op << "\n";
+                std::cout << "  logN=" << logN << " " << label
+                          << " standalone: " << (int)ops_sec << " ops/s ("
+                          << (int)us_per_op << " us)\n";
+            }
+
+            // Tiered (TierMembership + split)
+            {
+                TieredOMapConfig tc;
+                tc.total_keys = N; tc.hot_set_size = n;
+                tc.mode = SecurityMode::TierMembership;
+                tc.use_split_oram = true;
+                tc.backend = be;
+                tc.storage_creator = cfg.storage_creator;
+                TieredOMap tm(tc); tm.init(data, hk);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) tm.access(z.sample());
+                auto t0 = Clock::now();
+                for (int i = 0; i < cfg.Q; ++i) tm.access(z.sample());
+                double elapsed_us = std::chrono::duration<double, std::micro>(
+                    Clock::now() - t0).count();
+                double us_per_op = elapsed_us / cfg.Q;
+                double ops_sec = 1e6 / us_per_op;
+                csv << logN << "," << label << ",tiered_tm,"
+                    << std::fixed << std::setprecision(1) << ops_sec << ","
+                    << std::setprecision(0) << us_per_op << "\n";
+                std::cout << "  logN=" << logN << " " << label
+                          << " tiered_tm: " << (int)ops_sec << " ops/s ("
+                          << (int)us_per_op << " us)\n";
+            }
+        }
+        std::cout << "\n";
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/throughput.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exp: Backend comparison — same N, all backends, within tiered framework
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_tiered_backend(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Tiered Backend Comparison ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/tiered_backend.csv");
+    csv << "logN,backend,avg_bw_KB,avg_rounds,avg_answer_rnd,hit_pct,avg_us\n";
+
+    for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
+        int N = 1 << logN;
+        int n = std::min(cfg.n, N / 2);
+        auto data = make_data(N, cfg.value_size);
+        auto hk = make_hot_keys(n);
+
+        for (auto& [label, be] : ALL_BACKENDS) {
+            TieredOMapConfig tc;
+            tc.total_keys = N; tc.hot_set_size = n;
+            tc.mode = SecurityMode::TierMembership;
+            tc.use_split_oram = true;
+            tc.backend = be;
+            tc.storage_creator = cfg.storage_creator;
+            TieredOMap tm(tc); tm.init(data, hk);
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) tm.access(z.sample());
+            double bw = 0, rnd = 0, ans = 0, us = 0;
+            int hot = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto t0 = Clock::now();
+                auto r = tm.access(z.sample());
+                us += std::chrono::duration<double, std::micro>(
+                    Clock::now() - t0).count();
+                bw += r.total_bw.total_bytes();
+                rnd += r.total_bw.rounds;
+                ans += r.rounds_to_answer;
+                if (r.found_in_hot) ++hot;
+            }
+            bw /= cfg.Q; rnd /= cfg.Q; ans /= cfg.Q; us /= cfg.Q;
+            double hit = 100.0 * hot / cfg.Q;
+            csv << logN << "," << label << "," << std::fixed
+                << std::setprecision(2) << bw / 1024 << ","
+                << std::setprecision(1) << rnd << "," << ans << ","
+                << hit << "," << std::setprecision(0) << us << "\n";
+            std::cout << "  logN=" << logN << " " << label << ": "
+                      << (int)(bw/1024) << "KB " << (int)rnd << "rnd ans="
+                      << std::fixed << std::setprecision(1) << ans
+                      << " hit=" << hit << "% " << (int)us << "us\n";
+        }
+        std::cout << "\n";
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/tiered_backend.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exp: Value-size sensitivity
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_valuesize(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Value-Size Sensitivity ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/valuesize.csv");
+    csv << "value_bytes,type,avg_bw_KB,avg_rounds,avg_answer_rnd\n";
+
+    int N = 1 << 16;
+    int n = cfg.n;
+
+    for (int vs : {64, 256, 1024, 4096}) {
+        auto data = make_data(N, vs);
+        auto hk = make_hot_keys(n);
+
+        // Standalone baseline (AVL)
+        {
+            AVLOmap bl(N);
+            bl.init(data);
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) bl.search(z.sample());
+            double bw = 0, rnd = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                bl.search(z.sample());
+                bw += bl.last_stats().total_bytes();
+                rnd += bl.last_stats().rounds;
+            }
+            bw /= cfg.Q; rnd /= cfg.Q;
+            csv << vs << ",standalone,"
+                << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                << std::setprecision(1) << rnd << ",\n";
+            std::cout << "  val=" << vs << "B standalone: "
+                      << (int)(bw/1024) << "KB " << (int)rnd << "rnd\n";
+        }
+
+        // Tiered (TM + split)
+        {
+            TieredOMapConfig tc;
+            tc.total_keys = N; tc.hot_set_size = n;
+            tc.mode = SecurityMode::TierMembership;
+            tc.use_split_oram = true;
+            tc.storage_creator = cfg.storage_creator;
+            TieredOMap tm(tc); tm.init(data, hk);
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) tm.access(z.sample());
+            double bw = 0, rnd = 0, ans = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto r = tm.access(z.sample());
+                bw += r.total_bw.total_bytes();
+                rnd += r.total_bw.rounds;
+                ans += r.rounds_to_answer;
+            }
+            bw /= cfg.Q; rnd /= cfg.Q; ans /= cfg.Q;
+            csv << vs << ",tiered_tm,"
+                << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                << std::setprecision(1) << rnd << "," << ans << "\n";
+            std::cout << "  val=" << vs << "B tiered: "
+                      << (int)(bw/1024) << "KB " << (int)rnd << "rnd ans="
+                      << std::setprecision(1) << ans << "\n";
+        }
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/valuesize.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -796,7 +998,8 @@ int main(int argc, char** argv) {
     std::cout << "TieredOMap Paper Experiments\n"
               << "  exp=" << cfg.exp << "  Q=" << cfg.Q
               << "  s=" << cfg.s << "  n=" << cfg.n
-              << "  max_logN=" << cfg.max_logN << "\n";
+              << "  max_logN=" << cfg.max_logN
+              << "  value_size=" << cfg.value_size << "\n";
 
     bool all = (cfg.exp == "all");
     if (all || cfg.exp == "bandwidth")   exp_bandwidth(cfg);
@@ -807,8 +1010,11 @@ int main(int argc, char** argv) {
     if (all || cfg.exp == "backend_cmp") exp_backend_cmp(cfg);
     if (all || cfg.exp == "modes")       exp_modes(cfg);
     if (all || cfg.exp == "write")       exp_write(cfg);
-    if (all || cfg.exp == "workload")    exp_workload(cfg);
-    if (all || cfg.exp == "drift")       exp_drift(cfg);
+    if (all || cfg.exp == "workload")       exp_workload(cfg);
+    if (all || cfg.exp == "drift")          exp_drift(cfg);
+    if (all || cfg.exp == "throughput")     exp_throughput(cfg);
+    if (all || cfg.exp == "tiered_backend") exp_tiered_backend(cfg);
+    if (all || cfg.exp == "valuesize")      exp_valuesize(cfg);
 
     std::cout << "\nAll done. CSV files in: " << cfg.outdir << "/\n";
     return 0;

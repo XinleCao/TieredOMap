@@ -26,6 +26,7 @@ struct Config {
     bool csv = false;
     std::string outdir = "results";
     double write_ratio = 0.2;
+    int value_size = 256;
 };
 
 Config parse_args(int argc, char** argv) {
@@ -46,6 +47,7 @@ Config parse_args(int argc, char** argv) {
         else if (key == "--csv") c.csv = (val == "1" || val == "true");
         else if (key == "--outdir") c.outdir = val;
         else if (key == "--write_ratio") c.write_ratio = std::stod(val);
+        else if (key == "--value_size") c.value_size = std::stoi(val);
     }
     return c;
 }
@@ -59,10 +61,14 @@ struct RunResult {
     double hot_hit_pct = 0;
 };
 
-std::vector<std::pair<int, Bytes>> make_data(int N) {
+std::vector<std::pair<int, Bytes>> make_data(int N, int value_size = 256) {
     std::vector<std::pair<int, Bytes>> data;
     data.reserve(N);
-    for (int i = 0; i < N; ++i) data.emplace_back(i, int_to_bytes(i));
+    for (int i = 0; i < N; ++i) {
+        Bytes v(value_size, 0);
+        std::memcpy(v.data(), &i, std::min(sizeof(int), static_cast<size_t>(value_size)));
+        data.emplace_back(i, std::move(v));
+    }
     return data;
 }
 
@@ -73,7 +79,8 @@ std::vector<int> make_hot_keys(int n) {
 }
 
 RunResult run_zipf(TieredOMap& tm, int N, int n, double alpha, int Q,
-                   double write_ratio, uint64_t seed = 123) {
+                   double write_ratio, int value_size = 256,
+                   uint64_t seed = 123) {
     ZipfSampler z(N, alpha, seed);
     std::mt19937_64 rng(seed + 1);
     std::uniform_real_distribution<> urd(0, 1);
@@ -85,7 +92,10 @@ RunResult run_zipf(TieredOMap& tm, int N, int n, double alpha, int Q,
         Bytes wval;
         const Bytes* wptr = nullptr;
         if (urd(rng) < write_ratio) {
-            wval = int_to_bytes(k + 1000000);
+            wval.assign(value_size, 0);
+            int marker = k + 1000000;
+            std::memcpy(wval.data(), &marker,
+                        std::min(sizeof(int), static_cast<size_t>(value_size)));
             wptr = &wval;
         }
         auto r = tm.access(k, wptr);
@@ -99,7 +109,8 @@ RunResult run_zipf(TieredOMap& tm, int N, int n, double alpha, int Q,
 }
 
 RunResult run_baseline_zipf(AVLOmap& bl, int N, double alpha, int Q,
-                            double write_ratio, uint64_t seed = 123) {
+                            double write_ratio, int value_size = 256,
+                            uint64_t seed = 123) {
     ZipfSampler z(N, alpha, seed);
     std::mt19937_64 rng(seed + 1);
     std::uniform_real_distribution<> urd(0, 1);
@@ -110,7 +121,10 @@ RunResult run_baseline_zipf(AVLOmap& bl, int N, double alpha, int Q,
         Bytes wval;
         const Bytes* wptr = nullptr;
         if (urd(rng) < write_ratio) {
-            wval = int_to_bytes(k + 1000000);
+            wval.assign(value_size, 0);
+            int marker = k + 1000000;
+            std::memcpy(wval.data(), &marker,
+                        std::min(sizeof(int), static_cast<size_t>(value_size)));
             wptr = &wval;
         }
         bl.search(k, wptr);
@@ -407,7 +421,10 @@ void exp_write(const Config& cfg) {
         ZipfSampler z2(N, s, 456);
         for (int q = 0; q < Q; ++q) {
             int k = z2.sample();
-            Bytes wval = int_to_bytes(k + 1000000);
+            Bytes wval(cfg.value_size, 0);
+            int marker = k + 1000000;
+            std::memcpy(wval.data(), &marker,
+                        std::min(sizeof(int), static_cast<size_t>(cfg.value_size)));
             auto res = inst2->access(k, &wval);
             w_bw += res.total_bw.total_bytes();
             ++w_cnt;
