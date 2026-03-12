@@ -13,6 +13,7 @@ class StorageInterface {
 public:
     virtual ~StorageInterface() = default;
 
+    virtual int store_id() const { return -1; }
     virtual int level() const = 0;
     virtual int leaf_range() const = 0;
     virtual int bucket_size() const = 0;

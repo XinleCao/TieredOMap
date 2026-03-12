@@ -16,6 +16,18 @@ NetworkStorage::NetworkStorage(std::shared_ptr<TcpChannel> channel,
     bucket_size_ = bucket_size;
 }
 
+std::unique_ptr<NetworkStorage> NetworkStorage::from_existing(
+    std::shared_ptr<TcpChannel> channel, int store_id,
+    int level, int leaf_range, int bucket_size) {
+    auto ns = std::unique_ptr<NetworkStorage>(new NetworkStorage());
+    ns->channel_ = std::move(channel);
+    ns->store_id_ = store_id;
+    ns->level_ = level;
+    ns->leaf_range_ = leaf_range;
+    ns->bucket_size_ = bucket_size;
+    return ns;
+}
+
 NetworkStorage::~NetworkStorage() {
     if (channel_ && channel_->is_open() && store_id_ >= 0) {
         try {
@@ -99,6 +111,37 @@ void NetworkStorage::write_multiple_paths(
     ser_int(req, store_id_);
     ser_path(req, buckets);
     channel_->request(MsgType::WRITE_MULTI, req);
+}
+
+// ─── Batch helpers ──────────────────────────────────────────────────────────
+
+std::vector<PathData> batch_read_paths(
+    TcpChannel& ch, const std::vector<BatchReadReq>& reqs) {
+    Bytes payload;
+    ser_int(payload, static_cast<int>(reqs.size()));
+    for (auto& r : reqs) {
+        ser_int(payload, r.store_id);
+        ser_int(payload, r.leaf);
+    }
+    auto resp = ch.request(MsgType::BATCH_READ, payload);
+    const uint8_t* p = resp.data();
+    int n = deser_int(p);
+    std::vector<PathData> results;
+    results.reserve(n);
+    for (int i = 0; i < n; ++i)
+        results.push_back(deser_path(p));
+    return results;
+}
+
+void batch_write_paths(
+    TcpChannel& ch, const std::vector<BatchWriteReq>& reqs) {
+    Bytes payload;
+    ser_int(payload, static_cast<int>(reqs.size()));
+    for (auto& r : reqs) {
+        ser_int(payload, r.store_id);
+        ser_path(payload, r.data);
+    }
+    ch.request(MsgType::BATCH_WRITE, payload);
 }
 
 }  // namespace tiered_omap

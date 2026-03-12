@@ -12,11 +12,18 @@ public:
     // Creates a new storage on the remote server.
     NetworkStorage(std::shared_ptr<TcpChannel> channel,
                    int num_data, int bucket_size);
+
+    // Connects to an already-existing server-side store (no CREATE).
+    static std::unique_ptr<NetworkStorage> from_existing(
+        std::shared_ptr<TcpChannel> channel, int store_id,
+        int level, int leaf_range, int bucket_size);
+
     ~NetworkStorage() override;
 
     NetworkStorage(NetworkStorage&&) noexcept = default;
     NetworkStorage& operator=(NetworkStorage&&) noexcept = default;
 
+    int store_id() const override { return store_id_; }
     int level() const override { return level_; }
     int leaf_range() const override { return leaf_range_; }
     int bucket_size() const override { return bucket_size_; }
@@ -40,9 +47,8 @@ public:
     void write_multiple_paths(
         const std::unordered_map<int, std::vector<Block>>& buckets) override;
 
-    int store_id() const { return store_id_; }
-
 private:
+    NetworkStorage() = default;
     std::shared_ptr<TcpChannel> channel_;
     int store_id_ = -1;
     int level_ = 0;
@@ -57,5 +63,23 @@ inline StorageCreator make_network_creator(std::shared_ptr<TcpChannel> channel) 
         return std::make_unique<NetworkStorage>(ch, n, bs);
     };
 }
+
+using PathData = std::unordered_map<int, std::vector<Block>>;
+
+struct BatchReadReq {
+    int store_id;
+    int leaf;
+};
+
+struct BatchWriteReq {
+    int store_id;
+    PathData data;
+};
+
+std::vector<PathData> batch_read_paths(
+    TcpChannel& ch, const std::vector<BatchReadReq>& reqs);
+
+void batch_write_paths(
+    TcpChannel& ch, const std::vector<BatchWriteReq>& reqs);
 
 }  // namespace tiered_omap

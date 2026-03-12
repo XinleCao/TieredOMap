@@ -8,6 +8,7 @@
 
 namespace tiered_omap {
 
+class TcpChannel;
 enum class OdsTreeType { AVL, BPlus };
 
 class DaOstOmap : public OmapInterface {
@@ -24,6 +25,7 @@ public:
     void insert(int key, const Bytes& value) override;
     void remove(int key) override;
     void dummy_access() override;
+    void partial_dummy_access() override;
 
     void set_round_delay_us(int us) override;
 
@@ -31,18 +33,39 @@ public:
     const BandwidthStats& total_stats() const override { return total_bw_; }
     void reset_stats() override { last_bw_.reset(); total_bw_.reset(); }
 
+    bool supports_interleaved() const override { return true; }
+    void begin_step_search(int key, const Bytes* update = nullptr) override;
+    void begin_step_dummy() override;
+    void begin_step_partial_dummy() override;
+    OramStepRound step_next_round() override;
+    void step_apply_reads(const std::vector<PathData>& results) override;
+    void step_process() override;
+    std::vector<StepWriteReq> step_prepare_writes() override;
+    bool step_done() const override;
+    Bytes step_finish() override;
+
     int num_positions() const { return num_positions_; }
     int tree_height_bound() const { return tree_height_bound_; }
     int ods_budget() const { return ods_budget_; }
     OdsTreeType tree_type() const { return tree_type_; }
+    int bucket_size_val() const { return bucket_size_; }
+    int bplus_order_val() const { return bplus_order_; }
+    uint64_t hash_seed() const { return hash_seed_; }
+    DAOram& daoram() { return daoram_; }
+    AVLOmap& avl_ods() { return avl_ods_; }
+    BPlusOmap& bplus_ods() { return bplus_ods_; }
+    const std::unordered_map<int, std::pair<int,int>>& root_cache() const { return root_cache_; }
+
+    Bytes export_state() const;
+    static std::unique_ptr<DaOstOmap> from_state(
+        const uint8_t*& p, std::shared_ptr<TcpChannel> channel);
 
     // Two-pointer piggyback scan: scans one DAORAM position per call.
     // Returns the root key and its stored value if the position is non-empty.
-    struct ScanResult {
-        int key = INVALID_KEY;
-        Bytes value;
-    };
     ScanResult piggyback_scan_step();
+
+    void begin_step_scan() override;
+    ScanResult step_finish_scan() override;
     void reset_scan() { scan_pos_ = 0; }
     int scan_period() const { return num_positions_; }
 
@@ -79,6 +102,33 @@ private:
     std::unordered_map<int, std::pair<int,int>> root_cache_;
 
     int scan_pos_ = 0;
+
+    enum class StepPhase { DAORAM, ODS, ODS_PAD, SCAN_DAORAM, SCAN_ODS, SCAN_ODS_PAD, DONE };
+    struct StepState {
+        StepPhase phase = StepPhase::DONE;
+        StepPhase round_phase = StepPhase::DONE;
+        bool is_dummy = false;
+        bool is_partial_dummy = false;
+        bool is_scan = false;
+        int key = INVALID_KEY;
+        const Bytes* update = nullptr;
+        int pos = -1;
+
+        int ods_ops = 0;
+        int pad_remaining = 0;
+        int pad_round_leaf = INVALID_LEAF;
+
+        int scan_pos = -1;
+        int scan_root_key = INVALID_KEY;
+        int scan_root_leaf = INVALID_LEAF;
+        Bytes scan_result;
+
+        Bytes result;
+    };
+    StepState ss_;
+
+    OmapInterface& ods_omap();
+    PathORAM& ods_oram();
 
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;

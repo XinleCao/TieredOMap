@@ -1,0 +1,7 @@
+logN,mode,avg_bw_KB,avg_rounds,avg_answer_rnd,hit_pct
+16,Single,2754.00,72.0,72.0,
+16,TM_split,306.25,54.9,54.9,67.0
+16,FO_split,501.66,73.0,54.9,67.0
+20,Single,4110.75,87.0,87.0,
+20,TM_split,424.96,65.2,65.2,54.2
+20,FO_split,668.25,88.0,65.2,54.2

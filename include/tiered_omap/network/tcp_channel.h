@@ -16,6 +16,9 @@ enum class MsgType : uint8_t {
     READ_MULTI  = 0x07,
     WRITE_MULTI = 0x08,
     DESTROY     = 0x09,
+    SETUP_BENCH = 0x10,
+    BATCH_READ  = 0x11,
+    BATCH_WRITE = 0x12,
 
     OK          = 0x80,
     ERROR       = 0x81,

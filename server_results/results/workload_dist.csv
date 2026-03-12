@@ -1,0 +1,13 @@
+distribution,backend,avg_bw_kb,avg_answer_rnd,hit_pct
+Zipfian,AVL,3867.8,53.2,69.5
+Zipfian,BPlus,5495.8,13.8,69.5
+Zipfian,DaAvl,1755.2,29.3,69.5
+Zipfian,DaBplus,1776.1,20.3,69.5
+Uniform,AVL,3867.8,71.9,0.5
+Uniform,BPlus,5495.8,18.0,0.5
+Uniform,DaAvl,1755.2,30.0,0.5
+Uniform,DaBplus,1776.1,21.0,0.5
+Latest,AVL,3867.8,54.0,66.5
+Latest,BPlus,5495.8,14.0,66.5
+Latest,DaAvl,1755.2,29.3,66.5
+Latest,DaBplus,1776.1,20.3,66.5

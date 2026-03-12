@@ -1,0 +1,13 @@
+backend,type,avg_latency_ms,avg_answer_ms,avg_rounds,avg_answer_rnd,hit_pct
+AVL,standalone,3823.2,,72.0,,
+AVL,tiered,3725.1,2878.1,72.4,56.0,63.0
+AVL,expected,3191.5,,,,
+BPlus,standalone,904.1,,18.0,,
+BPlus,tiered,710.5,710.5,13.2,13.2,63.0
+BPlus,expected,710.5,,,,
+DaAvl,standalone,1783.2,,30.0,,
+DaAvl,tiered,1616.0,1616.0,30.4,30.4,63.0
+DaAvl,expected,1616.0,,,,
+DaBplus,standalone,1118.3,,21.0,,
+DaBplus,tiered,1116.9,1116.9,21.4,21.4,63.0
+DaBplus,expected,1116.9,,,,

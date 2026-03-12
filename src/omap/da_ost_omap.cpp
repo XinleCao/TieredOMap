@@ -1,4 +1,6 @@
 #include "tiered_omap/omap/da_ost_omap.h"
+#include "tiered_omap/network/network_storage.h"
+#include "tiered_omap/network/tcp_channel.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -30,7 +32,7 @@ DaOstOmap::DaOstOmap(int capacity, OdsTreeType tree_type,
       bplus_order_(bplus_order),
       storage_creator_(std::move(storage_creator)),
       daoram_(num_positions_ > 0 ? num_positions_ : capacity,
-              bucket_size, 20, 64, 64, storage_creator_),
+              bucket_size, 20, 64, 64, 10, storage_creator_),
       avl_ods_(capacity, bucket_size, storage_creator_),
       bplus_ods_(capacity, bplus_order, bucket_size, storage_creator_) {
 
@@ -91,7 +93,8 @@ void DaOstOmap::pad_ods(int actual_ops) {
 }
 
 void DaOstOmap::finalize_bw(int /*ods_ops*/) {
-    int total_ops = ods_budget_ + 1;
+    int da_rounds = daoram_.num_access_rounds();
+    int total_ops = ods_budget_ + da_rounds;
     PathORAM& ods = (tree_type_ == OdsTreeType::AVL)
                         ? avl_ods_.oram() : bplus_ods_.oram();
     int da_bw = daoram_.last_stats().bytes_downloaded +
@@ -413,6 +416,309 @@ void DaOstOmap::dummy_access() {
     }
 
     finalize_bw(0);
+}
+
+void DaOstOmap::partial_dummy_access() {
+    last_bw_.reset();
+
+    daoram_.dummy_access();
+    ods_oram().dummy_access();
+
+    finalize_bw(0);
+}
+
+// ─── Step-by-step interface for interleaved access ─────────────────────────
+
+OmapInterface& DaOstOmap::ods_omap() {
+    return (tree_type_ == OdsTreeType::AVL)
+               ? static_cast<OmapInterface&>(avl_ods_)
+               : static_cast<OmapInterface&>(bplus_ods_);
+}
+
+PathORAM& DaOstOmap::ods_oram() {
+    return (tree_type_ == OdsTreeType::AVL)
+               ? avl_ods_.oram() : bplus_ods_.oram();
+}
+
+void DaOstOmap::begin_step_search(int key, const Bytes* update) {
+    last_bw_.reset();
+    ss_ = StepState{};
+    ss_.key = key;
+    ss_.update = update;
+    ss_.pos = hash_to_position(key);
+    auto [rk, rl] = root_cache_[ss_.pos];
+
+    daoram_.begin_step_access(ss_.pos);
+
+    if (tree_type_ == OdsTreeType::AVL) {
+        avl_ods_.set_root(rk, rl);
+        avl_ods_.begin_step_search(key, update);
+    } else {
+        bplus_ods_.set_root(rk, rl);
+        bplus_ods_.begin_step_search(key, update);
+    }
+    ss_.phase = StepPhase::DAORAM;
+}
+
+void DaOstOmap::begin_step_dummy() {
+    last_bw_.reset();
+    ss_ = StepState{};
+    ss_.is_dummy = true;
+
+    daoram_.begin_step_dummy();
+
+    if (tree_type_ == OdsTreeType::AVL)
+        avl_ods_.begin_step_dummy();
+    else
+        bplus_ods_.begin_step_dummy();
+
+    ss_.phase = StepPhase::DAORAM;
+}
+
+void DaOstOmap::begin_step_partial_dummy() {
+    last_bw_.reset();
+    ss_ = StepState{};
+    ss_.is_dummy = true;
+    ss_.is_partial_dummy = true;
+
+    daoram_.begin_step_dummy();
+    ss_.phase = StepPhase::DAORAM;
+}
+
+void DaOstOmap::begin_step_scan() {
+    last_bw_.reset();
+    ss_ = StepState{};
+    ss_.is_scan = true;
+    ss_.scan_pos = scan_pos_;
+
+    auto it = root_cache_.find(ss_.scan_pos);
+    if (it != root_cache_.end()) {
+        ss_.scan_root_key = it->second.first;
+        ss_.scan_root_leaf = it->second.second;
+    }
+
+    daoram_.begin_step_access(ss_.scan_pos);
+    ss_.phase = StepPhase::SCAN_DAORAM;
+}
+
+DaOstOmap::ScanResult DaOstOmap::step_finish_scan() {
+    ScanResult sr;
+    sr.key = ss_.scan_root_key;
+    sr.value = ss_.scan_result;
+
+    scan_pos_ = (scan_pos_ + 1) % num_positions_;
+    finalize_bw(0);
+    return sr;
+}
+
+OramStepRound DaOstOmap::step_next_round() {
+    OramStepRound r;
+    if (ss_.phase == StepPhase::DONE) return r;
+
+    ss_.round_phase = ss_.phase;
+
+    if (ss_.phase == StepPhase::DAORAM || ss_.phase == StepPhase::SCAN_DAORAM) {
+        auto reads = daoram_.step_get_reads();
+        r.reads.insert(r.reads.end(), reads.begin(), reads.end());
+    } else if (ss_.phase == StepPhase::ODS || ss_.phase == StepPhase::SCAN_ODS) {
+        return ods_omap().step_next_round();
+    } else {
+        ss_.pad_round_leaf = ods_oram().random_leaf();
+        r.reads.push_back({ods_oram().get_store_id(), ss_.pad_round_leaf});
+    }
+    return r;
+}
+
+void DaOstOmap::step_apply_reads(const std::vector<PathData>& results) {
+    if (ss_.round_phase == StepPhase::DAORAM || ss_.round_phase == StepPhase::SCAN_DAORAM) {
+        daoram_.step_apply_reads(results);
+    } else if (ss_.round_phase == StepPhase::ODS || ss_.round_phase == StepPhase::SCAN_ODS) {
+        ods_omap().step_apply_reads(results);
+    } else if (ss_.round_phase == StepPhase::ODS_PAD || ss_.round_phase == StepPhase::SCAN_ODS_PAD) {
+        if (!results.empty())
+            ods_oram().apply_fetched_path(
+                std::unordered_map<int, std::vector<Block>>(results[0]));
+    }
+}
+
+void DaOstOmap::step_process() {
+    if (ss_.round_phase == StepPhase::DAORAM) {
+        daoram_.step_process();
+        if (daoram_.step_done()) {
+            daoram_.step_finish(nullptr);
+            if (ss_.is_partial_dummy) {
+                ss_.pad_remaining = 1;
+                ss_.phase = StepPhase::ODS_PAD;
+            } else {
+                ss_.phase = StepPhase::ODS;
+            }
+        }
+    } else if (ss_.round_phase == StepPhase::SCAN_DAORAM) {
+        daoram_.step_process();
+        if (daoram_.step_done()) {
+            daoram_.step_finish(nullptr);
+            if (ss_.scan_root_key != INVALID_KEY) {
+                if (tree_type_ == OdsTreeType::AVL) {
+                    avl_ods_.set_root(ss_.scan_root_key, ss_.scan_root_leaf);
+                    avl_ods_.begin_step_search(ss_.scan_root_key, nullptr);
+                } else {
+                    bplus_ods_.set_root(ss_.scan_root_key, ss_.scan_root_leaf);
+                    bplus_ods_.begin_step_search(ss_.scan_root_key, nullptr);
+                }
+                ss_.phase = StepPhase::SCAN_ODS;
+            } else {
+                ss_.pad_remaining = ods_budget_;
+                ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::SCAN_ODS_PAD
+                                                    : StepPhase::DONE;
+            }
+        }
+    } else if (ss_.round_phase == StepPhase::ODS) {
+        ods_omap().step_process();
+        if (ods_omap().step_done()) {
+            ss_.ods_ops = (tree_type_ == OdsTreeType::AVL)
+                              ? avl_ods_.last_op_count()
+                              : bplus_ods_.last_op_count();
+            ss_.pad_remaining = std::max(0, ods_budget_ - ss_.ods_ops);
+            ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::ODS_PAD
+                                                : StepPhase::DONE;
+        }
+    } else if (ss_.round_phase == StepPhase::SCAN_ODS) {
+        ods_omap().step_process();
+        if (ods_omap().step_done()) {
+            ss_.ods_ops = (tree_type_ == OdsTreeType::AVL)
+                              ? avl_ods_.last_op_count()
+                              : bplus_ods_.last_op_count();
+            ss_.pad_remaining = std::max(0, ods_budget_ - ss_.ods_ops);
+            ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::SCAN_ODS_PAD
+                                                : StepPhase::DONE;
+        }
+    } else if (ss_.round_phase == StepPhase::ODS_PAD || ss_.round_phase == StepPhase::SCAN_ODS_PAD) {
+        ss_.pad_remaining--;
+        if (ss_.pad_remaining <= 0)
+            ss_.phase = StepPhase::DONE;
+    }
+}
+
+std::vector<StepWriteReq> DaOstOmap::step_prepare_writes() {
+    if (ss_.round_phase == StepPhase::DAORAM || ss_.round_phase == StepPhase::SCAN_DAORAM) {
+        return daoram_.step_get_writes();
+    }
+    if (ss_.round_phase == StepPhase::ODS || ss_.round_phase == StepPhase::SCAN_ODS) {
+        return ods_omap().step_prepare_writes();
+    }
+    if (ss_.round_phase == StepPhase::ODS_PAD || ss_.round_phase == StepPhase::SCAN_ODS_PAD) {
+        return {{ods_oram().get_store_id(),
+                 ods_oram().prepare_eviction(ss_.pad_round_leaf)}};
+    }
+    return {};
+}
+
+bool DaOstOmap::step_done() const {
+    return ss_.phase == StepPhase::DONE;
+}
+
+Bytes DaOstOmap::step_finish() {
+    if (ss_.is_scan) {
+        if (ss_.scan_root_key != INVALID_KEY) {
+            ss_.scan_result = ods_omap().step_finish();
+            auto [nrk, nrl] = (tree_type_ == OdsTreeType::AVL)
+                                   ? avl_ods_.get_root()
+                                   : bplus_ods_.get_root();
+            root_cache_[ss_.scan_pos] = {nrk, nrl};
+        }
+        return {};
+    }
+
+    if (!ss_.is_dummy) {
+        if (tree_type_ == OdsTreeType::AVL) {
+            ss_.result = avl_ods_.step_finish();
+            auto [nrk, nrl] = avl_ods_.get_root();
+            root_cache_[ss_.pos] = {nrk, nrl};
+        } else {
+            ss_.result = bplus_ods_.step_finish();
+            auto [nrk, nrl] = bplus_ods_.get_root();
+            root_cache_[ss_.pos] = {nrk, nrl};
+        }
+    } else {
+        ods_omap().step_finish();
+    }
+
+    finalize_bw(ss_.ods_ops);
+    return ss_.result;
+}
+
+// ─── State export / import ─────────────────────────────────────────────────
+
+Bytes DaOstOmap::export_state() const {
+    Bytes buf;
+    auto si = [&](int v){ size_t p=buf.size(); buf.resize(p+4); std::memcpy(buf.data()+p,&v,4); };
+
+    si(capacity_); si(num_positions_); si(tree_height_bound_); si(ods_budget_);
+    si(static_cast<int>(tree_type_)); si(bucket_size_); si(bplus_order_);
+    {uint64_t s=hash_seed_; buf.insert(buf.end(),(uint8_t*)&s,(uint8_t*)&s+8);}
+
+    // root_cache
+    si(static_cast<int>(root_cache_.size()));
+    for (auto& [pos, kv] : root_cache_) { si(pos); si(kv.first); si(kv.second); }
+
+    // DAOram state
+    auto da_blob = daoram_.export_state(-1);
+    si(static_cast<int>(da_blob.size()));
+    buf.insert(buf.end(), da_blob.begin(), da_blob.end());
+
+    // ODS tree state (AVL or BPlus)
+    if (tree_type_ == OdsTreeType::AVL) {
+        auto ods_blob = avl_ods_.export_state();
+        si(static_cast<int>(ods_blob.size()));
+        buf.insert(buf.end(), ods_blob.begin(), ods_blob.end());
+    } else {
+        auto ods_blob = bplus_ods_.export_state();
+        si(static_cast<int>(ods_blob.size()));
+        buf.insert(buf.end(), ods_blob.begin(), ods_blob.end());
+    }
+    return buf;
+}
+
+std::unique_ptr<DaOstOmap> DaOstOmap::from_state(
+    const uint8_t*& p, std::shared_ptr<TcpChannel> channel) {
+    auto di = [&]() -> int { int v; std::memcpy(&v,p,4); p+=4; return v; };
+
+    int capacity = di(), num_positions = di(), tree_height_bound = di(),
+        ods_budget = di(), tree_type_i = di(), bucket_size = di(),
+        bplus_order = di();
+    uint64_t hash_seed;
+    std::memcpy(&hash_seed, p, 8); p += 8;
+
+    auto tree_type = static_cast<OdsTreeType>(tree_type_i);
+
+    int rc_sz = di();
+    std::unordered_map<int, std::pair<int,int>> root_cache;
+    for (int i = 0; i < rc_sz; ++i) {
+        int pos = di(), k = di(), l = di();
+        root_cache[pos] = {k, l};
+    }
+
+    int da_len = di(); (void)da_len;
+    auto daoram = DAOram::from_state_network(p, channel);
+
+    int ods_len = di(); (void)ods_len;
+
+    auto obj = std::unique_ptr<DaOstOmap>(new DaOstOmap(
+        capacity, tree_type, num_positions, bucket_size, bplus_order, nullptr));
+    obj->hash_seed_ = hash_seed;
+    obj->tree_height_bound_ = tree_height_bound;
+    obj->ods_budget_ = ods_budget;
+    obj->root_cache_ = std::move(root_cache);
+    obj->daoram_ = std::move(daoram);
+
+    if (tree_type == OdsTreeType::AVL) {
+        auto avl = AVLOmap::from_state(p, channel);
+        obj->avl_ods_ = std::move(*avl);
+    } else {
+        auto bp = BPlusOmap::from_state(p, channel);
+        obj->bplus_ods_ = std::move(*bp);
+    }
+    return obj;
 }
 
 }  // namespace tiered_omap

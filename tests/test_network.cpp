@@ -115,3 +115,43 @@ TEST_F(NetworkTest, TieredOMap_FullOblivious) {
     EXPECT_EQ(bytes_to_int(r.value), 32);
     EXPECT_FALSE(r.found_in_hot);
 }
+
+TEST_F(NetworkTest, TieredOMap_InterleavedAccess) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 64;
+    cfg.hot_set_size = 16;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::AVL;
+    cfg.storage_creator = creator_;
+
+    TieredOMap tm(cfg);
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i) data.emplace_back(i, int_to_bytes(i));
+    std::vector<int> hot_keys;
+    for (int i = 0; i < 16; ++i) hot_keys.push_back(i);
+
+    tm.init(data, hot_keys);
+    tm.set_channel(channel_);
+
+    // Hot key access
+    for (int i = 0; i < 16; ++i) {
+        auto r = tm.access(i);
+        EXPECT_EQ(bytes_to_int(r.value), i);
+        EXPECT_TRUE(r.found_in_hot);
+    }
+
+    // Cold key access
+    for (int i = 16; i < 32; ++i) {
+        auto r = tm.access(i);
+        EXPECT_EQ(bytes_to_int(r.value), i);
+        EXPECT_FALSE(r.found_in_hot);
+    }
+
+    // Verify interleaved rounds < sequential rounds
+    auto rh = tm.access(0);
+    auto hot_rounds = rh.hot_bw.rounds;
+    auto cold_rounds = rh.cold_bw.rounds;
+    auto total_rounds = rh.total_bw.rounds;
+    EXPECT_EQ(total_rounds, std::max(hot_rounds, cold_rounds));
+    EXPECT_LT(total_rounds, hot_rounds + cold_rounds);
+}

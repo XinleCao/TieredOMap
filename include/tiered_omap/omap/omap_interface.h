@@ -6,6 +6,22 @@
 
 namespace tiered_omap {
 
+using PathData = std::unordered_map<int, std::vector<Block>>;
+
+struct StepReadReq {
+    int store_id = -1;
+    int leaf = INVALID_LEAF;
+};
+
+struct StepWriteReq {
+    int store_id = -1;
+    PathData data;
+};
+
+struct OramStepRound {
+    std::vector<StepReadReq> reads;
+};
+
 class OmapInterface {
 public:
     virtual ~OmapInterface() = default;
@@ -40,6 +56,27 @@ public:
     virtual const BandwidthStats& last_stats() const = 0;
     virtual const BandwidthStats& total_stats() const = 0;
     virtual void reset_stats() = 0;
+
+    // Step-by-step interface for interleaved (batched) access.
+    // Each round: step_next_round → batch read → step_apply_reads →
+    //             step_process → step_prepare_writes → batch write.
+    virtual bool supports_interleaved() const { return false; }
+    virtual void begin_step_search(int /*key*/, const Bytes* /*update*/ = nullptr) {}
+    virtual void begin_step_dummy() {}
+    virtual void begin_step_partial_dummy() { begin_step_dummy(); }
+    virtual OramStepRound step_next_round() { return {}; }
+    virtual void step_apply_reads(const std::vector<PathData>& /*results*/) {}
+    virtual void step_process() {}
+    virtual std::vector<StepWriteReq> step_prepare_writes() { return {}; }
+    virtual bool step_done() const { return true; }
+    virtual Bytes step_finish() { return {}; }
+
+    struct ScanResult {
+        int key = INVALID_KEY;
+        Bytes value;
+    };
+    virtual void begin_step_scan() {}
+    virtual ScanResult step_finish_scan() { return {}; }
 };
 
 }  // namespace tiered_omap

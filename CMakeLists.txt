@@ -18,6 +18,7 @@ add_library(tiered_omap STATIC
     src/network/tcp_channel.cpp
     src/network/network_storage.cpp
     src/network/storage_server.cpp
+    src/bench_setup.cpp
     src/tee/packed_directory.cpp
     src/tee/enclave_oram.cpp
     src/tee/tee_avl_omap.cpp
@@ -36,27 +37,31 @@ target_compile_options(tiered_omap PRIVATE -Wall -Wextra -Wpedantic)
 find_package(OpenSSL REQUIRED)
 target_link_libraries(tiered_omap PUBLIC OpenSSL::Crypto)
 
-# ─── Google Test ─────────────────────────────────────────────────────────────
+# ─── Google Test (optional) ───────────────────────────────────────────────────
 
-find_package(GTest REQUIRED)
+find_package(GTest QUIET)
 
-enable_testing()
+if(GTest_FOUND)
+    enable_testing()
 
-add_executable(test_path_oram    tests/test_path_oram.cpp)
-add_executable(test_da_oram      tests/test_da_oram.cpp)
-add_executable(test_avl_omap     tests/test_avl_omap.cpp)
-add_executable(test_bplus_omap   tests/test_bplus_omap.cpp)
-add_executable(test_da_ost_omap  tests/test_da_ost_omap.cpp)
-add_executable(test_da_ost_maint tests/test_da_ost_maint.cpp)
-add_executable(test_tiered_omap  tests/test_tiered_omap.cpp)
+    add_executable(test_path_oram    tests/test_path_oram.cpp)
+    add_executable(test_da_oram      tests/test_da_oram.cpp)
+    add_executable(test_avl_omap     tests/test_avl_omap.cpp)
+    add_executable(test_bplus_omap   tests/test_bplus_omap.cpp)
+    add_executable(test_da_ost_omap  tests/test_da_ost_omap.cpp)
+    add_executable(test_da_ost_maint tests/test_da_ost_maint.cpp)
+    add_executable(test_tiered_omap  tests/test_tiered_omap.cpp)
 
-add_executable(test_network      tests/test_network.cpp)
-add_executable(test_tee_omap     tests/test_tee_omap.cpp)
+    add_executable(test_network      tests/test_network.cpp)
+    add_executable(test_tee_omap     tests/test_tee_omap.cpp)
 
-foreach(tgt test_path_oram test_da_oram test_avl_omap test_bplus_omap test_da_ost_omap test_da_ost_maint test_tiered_omap test_network test_tee_omap)
-    target_link_libraries(${tgt} PRIVATE tiered_omap GTest::gtest_main)
-    add_test(NAME ${tgt} COMMAND ${tgt})
-endforeach()
+    foreach(tgt test_path_oram test_da_oram test_avl_omap test_bplus_omap test_da_ost_omap test_da_ost_maint test_tiered_omap test_network test_tee_omap)
+        target_link_libraries(${tgt} PRIVATE tiered_omap GTest::gtest_main)
+        add_test(NAME ${tgt} COMMAND ${tgt})
+    endforeach()
+else()
+    message(STATUS "GTest not found — skipping test targets")
+endif()
 
 # ─── Benchmark ───────────────────────────────────────────────────────────────
 

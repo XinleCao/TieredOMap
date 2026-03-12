@@ -10,6 +10,8 @@
 
 namespace tiered_omap {
 
+class TcpChannel;
+
 class PathORAM {
 public:
     PathORAM() = default;
@@ -18,12 +20,40 @@ public:
 
     void init(const std::unordered_map<int, Bytes>& data);
 
+    Bytes export_state(int store_id) const;
+    static PathORAM from_state_network(const uint8_t*& p,
+                                       std::shared_ptr<TcpChannel> channel);
+    std::unique_ptr<StorageInterface> detach_storage() {
+        if (storage_) {
+            cached_level_ = storage_->level();
+            cached_leaf_range_ = storage_->leaf_range();
+        }
+        return std::move(storage_);
+    }
+    void attach_storage(std::unique_ptr<StorageInterface> s) {
+        storage_ = std::move(s);
+        if (storage_) {
+            cached_level_ = storage_->level();
+            cached_leaf_range_ = storage_->leaf_range();
+        }
+    }
+
     Bytes access(int key, const Bytes* new_value = nullptr);
     void dummy_access();
 
     void read_path_to_stash(int leaf);
     void evict_and_write_path(int leaf);
     void evict_and_write_paths(const std::vector<int>& leaves);
+
+    // Decomposed I/O for interleaved (batched) access.
+    void apply_fetched_path(std::unordered_map<int, std::vector<Block>> data);
+    std::unordered_map<int, std::vector<Block>> prepare_eviction(int leaf);
+
+    void read_multiple_paths_to_stash(const std::vector<int>& leaves);
+    std::unordered_map<int, std::vector<Block>>
+        prepare_eviction_paths(const std::vector<int>& leaves);
+
+    int get_store_id() const;
 
     Block* find_in_stash(int key);
     Block extract_from_stash(int key);
@@ -34,8 +64,8 @@ public:
     int random_leaf() const;
 
     int num_data() const { return num_data_; }
-    int level() const { return storage_ ? storage_->level() : 0; }
-    int leaf_range() const { return storage_ ? storage_->leaf_range() : 0; }
+    int level() const { return storage_ ? storage_->level() : cached_level_; }
+    int leaf_range() const { return storage_ ? storage_->leaf_range() : cached_leaf_range_; }
     int bucket_size() const { return bucket_size_; }
     int stash_size() const { return static_cast<int>(stash_.size()); }
     int block_size_bytes() const { return block_size_bytes_; }
@@ -71,6 +101,8 @@ private:
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;
     CryptoKey aes_key_;
+    int cached_level_ = 0;
+    int cached_leaf_range_ = 0;
     void encrypt_bucket(std::vector<Block>& bucket);
     void decrypt_bucket(std::vector<Block>& bucket);
 };

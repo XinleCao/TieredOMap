@@ -1,4 +1,6 @@
 #include "tiered_omap/omap/avl_omap.h"
+#include "tiered_omap/network/network_storage.h"
+#include "tiered_omap/network/tcp_channel.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -210,6 +212,35 @@ void AVLOmap::move_to_local(int key, int leaf, int parent_key, int depth) {
     }
 }
 
+void AVLOmap::tracked_dummy(int depth) {
+    oram_for_depth(depth).dummy_access();
+    if (split_depth_ > 0) {
+        if (depth < split_depth_) ++upper_op_count_;
+        else ++lower_op_count_;
+    } else {
+        ++op_count_;
+    }
+}
+
+void AVLOmap::pad_to_budget(int budget) {
+    if (split_depth_ > 0) {
+        int upper_budget = std::min(split_depth_, budget);
+        int upper_pad = std::max(0, upper_budget - upper_op_count_);
+        for (int i = 0; i < upper_pad; ++i) upper_oram_.dummy_access();
+        upper_op_count_ += upper_pad;
+
+        int lower_budget = budget - upper_budget;
+        int lower_pad = std::max(0, lower_budget - lower_op_count_);
+        for (int i = 0; i < lower_pad; ++i) oram_.dummy_access();
+        lower_op_count_ += lower_pad;
+    } else {
+        int total = upper_op_count_ + lower_op_count_ + op_count_;
+        int pad = std::max(0, budget - total);
+        for (int i = 0; i < pad; ++i) oram_.dummy_access();
+        op_count_ += pad;
+    }
+}
+
 void AVLOmap::flush_local_to_stash() {
     for (auto& node : local_) {
         Block block{node.key, node.leaf, node.avl.encode()};
@@ -275,17 +306,7 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
     int budget = 3 * max_height_;
 
     if (root_key_ == INVALID_KEY) {
-        if (split_depth_ > 0) {
-            int eff_split = std::min(split_depth_, budget);
-            for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
-            upper_op_count_ = eff_split;
-            int lower_count = budget - eff_split;
-            for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
-            lower_op_count_ = lower_count;
-        } else {
-            for (int i = 0; i < budget; ++i) oram_.dummy_access();
-            op_count_ = budget;
-        }
+        if (!ods_mode_) pad_to_budget(budget);
         finalize_bw();
         return {};
     }
@@ -294,14 +315,12 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
     Bytes result;
     int cur_key = root_key_;
     int cur_leaf = root_leaf_;
-    int ops = 0;
 
     for (int d = 0; d < max_height_; ++d) {
         if (cur_key == INVALID_KEY) break;
 
         int parent = local_.empty() ? INVALID_KEY : local_.back().key;
         move_to_local(cur_key, cur_leaf, parent, d);
-        ops++;
         auto& node = local_.back();
 
         if (key == cur_key) {
@@ -320,16 +339,7 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
     reassign_leaves();
     flush_local_to_stash();
 
-    if (!ods_mode_) {
-        int pad = std::max(0, budget - ops);
-        if (split_depth_ > 0) {
-            for (int i = 0; i < pad; ++i) oram_.dummy_access();
-            lower_op_count_ += pad;
-        } else {
-            for (int i = 0; i < pad; ++i) oram_.dummy_access();
-            op_count_ += pad;
-        }
-    }
+    if (!ods_mode_) pad_to_budget(budget);
     finalize_bw();
     return result;
 }
@@ -339,20 +349,7 @@ Bytes AVLOmap::search(int key, const Bytes* update) {
 void AVLOmap::dummy_access() {
     last_bw_.reset();
     reset_op_counts();
-
-    int budget = 3 * max_height_;
-
-    if (split_depth_ > 0) {
-        int eff_split = std::min(split_depth_, budget);
-        for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
-        upper_op_count_ = eff_split;
-        int lower_count = budget - eff_split;
-        for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
-        lower_op_count_ = lower_count;
-    } else {
-        for (int i = 0; i < budget; ++i) oram_.dummy_access();
-        op_count_ = budget;
-    }
+    pad_to_budget(3 * max_height_);
     finalize_bw();
 }
 
@@ -391,17 +388,7 @@ void AVLOmap::insert(int key, const Bytes& value) {
         root_oram.add_to_stash({key, leaf, nd.encode()});
         root_key_ = key;
         root_leaf_ = leaf;
-        if (split_depth_ > 0) {
-            int eff_split = std::min(split_depth_, budget);
-            for (int i = 0; i < eff_split; ++i) upper_oram_.dummy_access();
-            upper_op_count_ = eff_split;
-            int lower_count = budget - eff_split;
-            for (int i = 0; i < lower_count; ++i) oram_.dummy_access();
-            lower_op_count_ = lower_count;
-        } else {
-            for (int i = 0; i < budget; ++i) oram_.dummy_access();
-            op_count_ = budget;
-        }
+        if (!ods_mode_) pad_to_budget(budget);
         finalize_bw();
         return;
     }
@@ -409,14 +396,12 @@ void AVLOmap::insert(int key, const Bytes& value) {
     local_.clear();
     int cur_key = root_key_;
     int cur_leaf = root_leaf_;
-    int ops = 0;
 
     for (int d = 0; d < max_height_; ++d) {
         if (cur_key == INVALID_KEY) break;
 
         int parent = local_.empty() ? INVALID_KEY : local_.back().key;
         move_to_local(cur_key, cur_leaf, parent, d);
-        ops++;
         auto& node = local_.back();
 
         if (key < cur_key) {
@@ -459,16 +444,7 @@ void AVLOmap::insert(int key, const Bytes& value) {
     reassign_leaves();
     flush_local_to_stash();
 
-    if (!ods_mode_) {
-        int pad = std::max(0, budget - ops);
-        if (split_depth_ > 0) {
-            for (int i = 0; i < pad; ++i) oram_.dummy_access();
-            lower_op_count_ += pad;
-        } else {
-            for (int i = 0; i < pad; ++i) oram_.dummy_access();
-            op_count_ += pad;
-        }
-    }
+    if (!ods_mode_) pad_to_budget(budget);
     finalize_bw();
 }
 
@@ -481,8 +457,7 @@ void AVLOmap::remove(int key) {
     int budget = 3 * max_height_;
 
     if (root_key_ == INVALID_KEY) {
-        for (int i = 0; i < budget; ++i) oram_.dummy_access();
-        op_count_ = budget;
+        if (!ods_mode_) pad_to_budget(budget);
         finalize_bw();
         return;
     }
@@ -617,10 +592,9 @@ void AVLOmap::remove(int key) {
         for (int j = 0; j < static_cast<int>(local_.size()); ++j)
             if (local_[j].key == nd_key) { nd_idx = j; break; }
         if (nd_idx < 0) {
-            oram_.dummy_access();
-            oram_.dummy_access();
+            tracked_dummy(split_depth_);
+            tracked_dummy(split_depth_);
             phase2_ops += 2;
-            if (split_depth_ == 0) op_count_ += 2;
             continue;
         }
 
@@ -636,10 +610,9 @@ void AVLOmap::remove(int key) {
         int nd_depth = local_[nd_idx].depth;
 
         if (std::abs(bal) <= 1) {
-            oram_for_depth(nd_depth).dummy_access();
-            oram_for_depth(nd_depth).dummy_access();
+            tracked_dummy(nd_depth);
+            tracked_dummy(nd_depth);
             phase2_ops += 2;
-            if (split_depth_ == 0) op_count_ += 2;
             continue;
         }
 
@@ -656,8 +629,7 @@ void AVLOmap::remove(int key) {
         if (tall_key != INVALID_KEY && !tall_in_local) {
             move_to_local(tall_key, tall_leaf, nd_key, nd_depth + 1);
         } else {
-            oram_for_depth(nd_depth).dummy_access();
-            if (split_depth_ == 0) ++op_count_;
+            tracked_dummy(nd_depth + 1);
         }
         phase2_ops++;
 
@@ -691,12 +663,10 @@ void AVLOmap::remove(int key) {
                 move_to_local(inner_key, inner_leaf,
                               tall_key, tall_depth_val + 1);
             } else {
-                oram_for_depth(nd_depth).dummy_access();
-                if (split_depth_ == 0) ++op_count_;
+                tracked_dummy(tall_depth_val + 1);
             }
         } else {
-            oram_for_depth(nd_depth).dummy_access();
-            if (split_depth_ == 0) ++op_count_;
+            tracked_dummy(tall_depth_val + 1);
         }
         phase2_ops++;
 
@@ -712,12 +682,7 @@ void AVLOmap::remove(int key) {
     reassign_leaves();
     flush_local_to_stash();
 
-    if (!ods_mode_) {
-        int total_ops = phase1_ops + phase2_ops;
-        int pad = std::max(0, budget - total_ops);
-        for (int i = 0; i < pad; ++i) oram_.dummy_access();
-        if (split_depth_ == 0) op_count_ += pad;
-    }
+    if (!ods_mode_) pad_to_budget(budget);
     finalize_bw();
 }
 
@@ -830,6 +795,219 @@ void AVLOmap::rebalance() {
         balance_node(i);
     }
     update_heights();
+}
+
+// ─── Step-by-step interface ──────────────────────────────────────────────────
+
+void AVLOmap::begin_step_search(int key, const Bytes* update) {
+    last_bw_.reset();
+    reset_op_counts();
+    local_.clear();
+
+    ss_ = StepState{};
+    ss_.key = key;
+    ss_.update = update;
+    ss_.budget = 3 * max_height_;
+
+    if (root_key_ == INVALID_KEY) {
+        ss_.phase = StepPhase::PAD;
+        ss_.pad_remaining = ss_.budget;
+        if (split_depth_ > 0)
+            ss_.dummy_split_boundary = std::min(split_depth_, ss_.budget);
+        else
+            ss_.dummy_split_boundary = ss_.budget;
+        ss_.dummy_step = 0;
+    } else {
+        ss_.phase = StepPhase::TRAVERSE;
+        ss_.cur_key = root_key_;
+        ss_.cur_leaf = root_leaf_;
+        ss_.depth = 0;
+    }
+}
+
+void AVLOmap::begin_step_dummy() {
+    last_bw_.reset();
+    reset_op_counts();
+    local_.clear();
+
+    ss_ = StepState{};
+    ss_.is_dummy = true;
+    ss_.budget = 3 * max_height_;
+    ss_.phase = StepPhase::PAD;
+    ss_.pad_remaining = ss_.budget;
+    ss_.dummy_step = 0;
+    if (split_depth_ > 0)
+        ss_.dummy_split_boundary = std::min(split_depth_, ss_.budget);
+    else
+        ss_.dummy_split_boundary = ss_.budget;
+}
+
+OramStepRound AVLOmap::step_next_round() {
+    OramStepRound r;
+    if (ss_.phase == StepPhase::DONE)
+        return r;
+
+    PathORAM* oram = nullptr;
+    int leaf = INVALID_LEAF;
+
+    if (ss_.phase == StepPhase::TRAVERSE) {
+        oram = &oram_for_depth(ss_.depth);
+        leaf = ss_.cur_leaf;
+    } else {
+        if (split_depth_ > 0) {
+            oram = (ss_.dummy_step < ss_.dummy_split_boundary)
+                       ? &upper_oram_ : &oram_;
+        } else {
+            oram = &oram_;
+        }
+        leaf = oram->random_leaf();
+    }
+    ss_.cur_round_oram = oram;
+    ss_.cur_round_leaf = leaf;
+    r.reads.push_back({oram->get_store_id(), leaf});
+    return r;
+}
+
+void AVLOmap::step_apply_reads(const std::vector<PathData>& results) {
+    if (!results.empty() && ss_.cur_round_oram)
+        ss_.cur_round_oram->apply_fetched_path(
+            std::unordered_map<int, std::vector<Block>>(results[0]));
+}
+
+std::vector<StepWriteReq> AVLOmap::step_prepare_writes() {
+    if (!ss_.cur_round_oram) return {};
+    return {{ss_.cur_round_oram->get_store_id(),
+             ss_.cur_round_oram->prepare_eviction(ss_.cur_round_leaf)}};
+}
+
+void AVLOmap::step_process() {
+    if (ss_.phase == StepPhase::TRAVERSE) {
+        Block block = ss_.cur_round_oram->extract_from_stash(ss_.cur_key);
+        AVLNodeData nd = AVLNodeData::decode(block.value);
+        int parent = local_.empty() ? INVALID_KEY : local_.back().key;
+        local_.push_back({ss_.cur_key, block.leaf, nd, parent, ss_.depth});
+        ss_.ops++;
+
+        if (split_depth_ > 0) {
+            if (ss_.depth < split_depth_) ++upper_op_count_;
+            else ++lower_op_count_;
+        } else {
+            ++op_count_;
+        }
+
+        bool found = (ss_.key == ss_.cur_key);
+        if (found) {
+            ss_.result = nd.data;
+            if (ss_.update) local_.back().avl.data = *ss_.update;
+        }
+
+        bool end_traverse = found
+            || (ss_.cur_key == INVALID_KEY)
+            || (ss_.depth >= max_height_ - 1);
+
+        if (!found && !end_traverse) {
+            auto& node = local_.back();
+            if (ss_.key < ss_.cur_key) {
+                ss_.cur_key = node.avl.l_key;
+                ss_.cur_leaf = node.avl.l_leaf;
+            } else {
+                ss_.cur_key = node.avl.r_key;
+                ss_.cur_leaf = node.avl.r_leaf;
+            }
+            if (ss_.cur_key == INVALID_KEY)
+                end_traverse = true;
+        }
+
+        ss_.depth++;
+
+        if (end_traverse) {
+            reassign_leaves();
+            flush_local_to_stash();
+            ss_.phase = StepPhase::PAD;
+            ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
+            ss_.dummy_step = 0;
+            if (split_depth_ > 0)
+                ss_.dummy_split_boundary = std::max(0,
+                    std::min(split_depth_, ss_.budget) - upper_op_count_);
+            else
+                ss_.dummy_split_boundary = ss_.pad_remaining;
+            if (ss_.pad_remaining == 0)
+                ss_.phase = StepPhase::DONE;
+        }
+    } else if (ss_.phase == StepPhase::PAD) {
+        ss_.ops++;
+        ss_.dummy_step++;
+        ss_.pad_remaining--;
+
+        if (split_depth_ > 0) {
+            if (ss_.dummy_step <= ss_.dummy_split_boundary)
+                ++upper_op_count_;
+            else
+                ++lower_op_count_;
+        } else {
+            ++op_count_;
+        }
+
+        if (ss_.pad_remaining <= 0)
+            ss_.phase = StepPhase::DONE;
+    }
+}
+
+bool AVLOmap::step_done() const {
+    return ss_.phase == StepPhase::DONE;
+}
+
+Bytes AVLOmap::step_finish() {
+    finalize_bw();
+    return ss_.result;
+}
+
+// ─── State export / import ─────────────────────────────────────────────────
+
+Bytes AVLOmap::export_state() const {
+    Bytes buf;
+    auto si = [&](int v){ size_t p=buf.size(); buf.resize(p+4); std::memcpy(buf.data()+p,&v,4); };
+    si(capacity_); si(max_height_); si(root_key_); si(root_leaf_); si(split_depth_);
+    si(ods_mode_ ? 1 : 0);
+
+    auto b0 = oram_.export_state(-1);
+    si(static_cast<int>(b0.size()));
+    buf.insert(buf.end(), b0.begin(), b0.end());
+
+    if (split_depth_ > 0) {
+        auto b1 = upper_oram_.export_state(-1);
+        si(static_cast<int>(b1.size()));
+        buf.insert(buf.end(), b1.begin(), b1.end());
+    }
+    return buf;
+}
+
+std::unique_ptr<AVLOmap> AVLOmap::from_state(
+    const uint8_t*& p, std::shared_ptr<TcpChannel> channel) {
+    auto di = [&]() -> int { int v; std::memcpy(&v,p,4); p+=4; return v; };
+
+    int capacity = di(), max_height = di(), root_key = di(),
+        root_leaf = di(), split_depth = di(), ods_mode = di();
+
+    int b0_len = di();
+    (void)b0_len;
+    auto oram = PathORAM::from_state_network(p, channel);
+
+    auto avl = std::make_unique<AVLOmap>(1, oram.bucket_size(), nullptr);
+    avl->capacity_ = capacity;
+    avl->max_height_ = max_height;
+    avl->root_key_ = root_key;
+    avl->root_leaf_ = root_leaf;
+    avl->split_depth_ = split_depth;
+    avl->ods_mode_ = (ods_mode != 0);
+    avl->oram_ = std::move(oram);
+
+    if (split_depth > 0) {
+        int b1_len = di();
+        (void)b1_len;
+        avl->upper_oram_ = PathORAM::from_state_network(p, channel);
+    }
+    return avl;
 }
 
 }  // namespace tiered_omap

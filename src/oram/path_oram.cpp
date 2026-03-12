@@ -1,4 +1,5 @@
 #include "tiered_omap/oram/path_oram.h"
+#include "tiered_omap/network/network_storage.h"
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_set>
@@ -15,8 +16,9 @@ PathORAM::PathORAM(int num_data, int bucket_size, int stash_scale,
         storage_ = storage_creator_(num_data, bucket_size);
     else
         storage_ = std::make_unique<BinaryTreeStorage>(num_data, bucket_size);
-    int lvl = storage_->level();
-    stash_max_size_ = stash_scale * std::max(lvl - 1, 1);
+    cached_level_ = storage_->level();
+    cached_leaf_range_ = storage_->leaf_range();
+    stash_max_size_ = stash_scale * std::max(cached_level_ - 1, 1);
 }
 
 void PathORAM::init(const std::unordered_map<int, Bytes>& data) {
@@ -108,13 +110,88 @@ void PathORAM::decrypt_bucket(std::vector<Block>& bucket) {
 
 void PathORAM::read_path_to_stash(int leaf) {
     auto path_data = storage_->read_path(leaf);
+    apply_fetched_path(std::move(path_data));
+}
 
-    for (auto& [node, bucket] : path_data) {
+void PathORAM::apply_fetched_path(
+    std::unordered_map<int, std::vector<Block>> data) {
+    for (auto& [node, bucket] : data) {
         decrypt_bucket(bucket);
         for (auto& block : bucket)
             if (!block.is_dummy())
                 stash_.push_back(std::move(block));
     }
+}
+
+std::unordered_map<int, std::vector<Block>>
+PathORAM::prepare_eviction(int leaf) {
+    std::vector<int> leaves = {leaf};
+    auto indices = BinaryTreeStorage::get_merged_path_indices(
+        storage_->level(), leaves);
+
+    std::unordered_map<int, std::vector<Block>> path;
+    for (int idx : indices)
+        path[idx] = {};
+
+    std::vector<Block> remaining;
+    for (auto& block : stash_) {
+        bool inserted = BinaryTreeStorage::fill_block_to_path(
+            block, path, leaves, storage_->level(), bucket_size_);
+        if (!inserted)
+            remaining.push_back(std::move(block));
+    }
+    stash_ = std::move(remaining);
+
+    if (static_cast<int>(stash_.size()) > stash_max_size_) {
+        throw std::runtime_error(
+            "PathORAM: stash overflow (" + std::to_string(stash_.size()) +
+            " > " + std::to_string(stash_max_size_) + ")");
+    }
+
+    for (auto& [node, bucket] : path)
+        encrypt_bucket(bucket);
+    return path;
+}
+
+void PathORAM::read_multiple_paths_to_stash(const std::vector<int>& leaves) {
+    auto path_data = storage_->read_multiple_paths(leaves);
+    apply_fetched_path(std::move(path_data));
+}
+
+std::unordered_map<int, std::vector<Block>>
+PathORAM::prepare_eviction_paths(const std::vector<int>& leaves) {
+    auto indices = BinaryTreeStorage::get_merged_path_indices(
+        storage_->level(), leaves);
+
+    std::unordered_map<int, std::vector<Block>> path;
+    for (int idx : indices)
+        path[idx] = {};
+
+    std::vector<Block> remaining;
+    for (auto& block : stash_) {
+        bool inserted = BinaryTreeStorage::fill_block_to_path(
+            block, path, leaves, storage_->level(), bucket_size_);
+        if (!inserted)
+            remaining.push_back(std::move(block));
+    }
+    stash_ = std::move(remaining);
+
+    if (static_cast<int>(stash_.size()) > stash_max_size_) {
+        throw std::runtime_error(
+            "PathORAM: stash overflow (" + std::to_string(stash_.size()) +
+            " > " + std::to_string(stash_max_size_) + ")");
+    }
+
+    for (auto& [node, bucket] : path) {
+        while (static_cast<int>(bucket.size()) < bucket_size_)
+            bucket.push_back(Block{});
+        encrypt_bucket(bucket);
+    }
+    return path;
+}
+
+int PathORAM::get_store_id() const {
+    return storage_ ? storage_->store_id() : -1;
 }
 
 void PathORAM::evict_and_write_path(int leaf) {
@@ -211,6 +288,45 @@ void PathORAM::set_leaf(int key, int leaf) {
 
 int PathORAM::random_leaf() const {
     return SecureRandom::rand_below(storage_->leaf_range());
+}
+
+Bytes PathORAM::export_state(int store_id) const {
+    Bytes buf;
+    auto si = [&](int v) { size_t p=buf.size(); buf.resize(p+4); std::memcpy(buf.data()+p,&v,4); };
+    auto sb = [&](const Bytes& b) { si(static_cast<int>(b.size())); buf.insert(buf.end(),b.begin(),b.end()); };
+    auto sblk = [&](const Block& b) { si(b.key); si(b.leaf); sb(b.value); };
+    si(store_id);
+    si(level());
+    si(leaf_range());
+    si(num_data_); si(bucket_size_); si(stash_max_size_); si(block_size_bytes_);
+    sb(aes_key_);
+    si(static_cast<int>(pos_map_.size()));
+    for (auto& [k,v] : pos_map_) { si(k); si(v); }
+    si(static_cast<int>(stash_.size()));
+    for (auto& b : stash_) sblk(b);
+    return buf;
+}
+
+PathORAM PathORAM::from_state_network(const uint8_t*& p,
+                                      std::shared_ptr<TcpChannel> channel) {
+    auto di = [&]() -> int { int v; std::memcpy(&v,p,4); p+=4; return v; };
+    auto db = [&]() -> Bytes { int n=di(); Bytes v(p,p+n); p+=n; return v; };
+    auto dblk = [&]() -> Block { int k=di(); int l=di(); Bytes v=db(); return {k,l,std::move(v)}; };
+    int store_id = di();
+    int level = di();
+    int leaf_range = di();
+    PathORAM o;
+    o.num_data_ = di(); o.bucket_size_ = di(); o.stash_max_size_ = di(); o.block_size_bytes_ = di();
+    o.aes_key_ = db();
+    int pm_sz = di();
+    for (int i = 0; i < pm_sz; ++i) { int k=di(); int v=di(); o.pos_map_[k]=v; }
+    int st_sz = di();
+    for (int i = 0; i < st_sz; ++i) o.stash_.push_back(dblk());
+    o.cached_level_ = level;
+    o.cached_leaf_range_ = leaf_range;
+    o.storage_ = NetworkStorage::from_existing(
+        std::move(channel), store_id, level, leaf_range, o.bucket_size_);
+    return o;
 }
 
 }  // namespace tiered_omap

@@ -1,4 +1,5 @@
 #include "tiered_omap/network/storage_server.h"
+#include "tiered_omap/bench_setup.h"
 #include <iostream>
 #include <thread>
 #include <unistd.h>
@@ -160,10 +161,75 @@ void StorageServer::dispatch(ClientState& state, MsgType type,
         send_ok();
         break;
     }
+    case MsgType::BATCH_READ: {
+        int n = deser_int(p);
+        Bytes resp;
+        ser_int(resp, n);
+        for (int i = 0; i < n; ++i) {
+            int id = deser_int(p);
+            int leaf = deser_int(p);
+            auto* store = get_store(id);
+            if (!store) { send_err("bad store id in BATCH_READ"); return; }
+            auto path = store->read_path(leaf);
+            ser_path(resp, path);
+        }
+        send_ok(resp);
+        break;
+    }
+    case MsgType::BATCH_WRITE: {
+        int n = deser_int(p);
+        for (int i = 0; i < n; ++i) {
+            int id = deser_int(p);
+            auto path = deser_path(p);
+            auto* store = get_store(id);
+            if (!store) { send_err("bad store id in BATCH_WRITE"); return; }
+            store->write_multiple_paths(path);
+        }
+        send_ok();
+        break;
+    }
     case MsgType::DESTROY: {
         int id = deser_int(p);
         state.stores.erase(id);
         send_ok();
+        break;
+    }
+    case MsgType::SETUP_BENCH: {
+        state.stores.clear();
+        state.next_id = 0;
+        int mode = deser_int(p);       // 0=standalone, 1=tiered
+        int backend_i = deser_int(p);
+        int N = deser_int(p);
+        int n = deser_int(p);          // hot set size (0 for standalone)
+        int bucket_size = deser_int(p);
+        int value_size = deser_int(p);
+        int security = deser_int(p);   // 0=FO, 1=TM
+        int use_split = deser_int(p);
+        int data_count = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
+        int hot_be_i = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
+        int use_hot_be = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
+
+        auto backend = static_cast<OmapBackend>(backend_i);
+        auto hot_be = static_cast<OmapBackend>(hot_be_i);
+        std::cerr << "[StorageServer] SETUP_BENCH: mode=" << mode
+                  << " backend=" << backend_i << " N=" << N
+                  << " n=" << n << " value_size=" << value_size << "\n";
+
+        auto sec_mode = (security == 0) ? SecurityMode::FullOblivious
+                                        : SecurityMode::TierMembership;
+        Bytes result;
+        if (mode == 0) {
+            int init_n = (data_count > 0) ? data_count : N;
+            result = bench_setup::setup_standalone_on_server(
+                state, backend, N, bucket_size, value_size, init_n);
+        } else {
+            result = bench_setup::setup_tiered_on_server(
+                state, backend, N, n, bucket_size, value_size,
+                sec_mode, use_split != 0, hot_be, use_hot_be != 0);
+        }
+        send_ok(result);
+        std::cerr << "[StorageServer] SETUP_BENCH done, state_size="
+                  << result.size() << " stores=" << state.stores.size() << "\n";
         break;
     }
     default:

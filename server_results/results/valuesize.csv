@@ -1,0 +1,9 @@
+value_bytes,type,avg_bw_KB,avg_rounds,avg_answer_rnd
+64,standalone,918.00,72.0,
+64,tiered_tm,703.71,53.2,53.2
+256,standalone,2754.00,72.0,
+256,tiered_tm,2111.14,53.2,53.2
+1024,standalone,10098.00,72.0,
+1024,tiered_tm,7740.85,53.2,53.2
+4096,standalone,39474.00,72.0,
+4096,tiered_tm,30259.69,53.2,53.2

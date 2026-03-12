@@ -1,0 +1,13 @@
+backend,op,avg_bw_KB,avg_rounds
+AVL,search,2754.00,72.0
+AVL,update,2754.00,72.0
+AVL,insert,2916.00,72.0
+BPlus,search,3925.55,18.0
+BPlus,update,3925.55,18.0
+BPlus,insert,4361.72,20.0
+DaAvl,search,1073.00,30.0
+DaAvl,update,1073.00,30.0
+DaAvl,insert,1138.50,30.0
+DaBplus,search,702.45,21.0
+DaBplus,update,702.45,21.0
+DaBplus,insert,1414.41,21.0
