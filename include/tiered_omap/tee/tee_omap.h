@@ -6,9 +6,6 @@
 #include "tiered_omap/tee/tee_avl_omap.h"
 #include <functional>
 #include <memory>
-#include <queue>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace tiered_omap {
@@ -60,16 +57,23 @@ public:
                            ResponseCallback early_cb = nullptr,
                            ResponseCallback final_cb = nullptr);
 
-    void promote(int key);
+    void promote(int key, const Bytes& value);
     void demote(int key);
 
     const TeeOmapConfig& config() const { return config_; }
     int hot_count() const { return hot_dir_->size(); }
-    const std::unordered_set<int>& hot_keys() const { return hot_keys_; }
+    bool is_hot(int key) const {
+        return hot_dir_->lookup(key) != INVALID_LEAF;
+    }
 
 private:
-    // Maintenance helpers.
     void do_maintenance_step();
+
+    // Epoch-aware helpers: decode/encode user value + epoch metadata.
+    int stored_value_size() const;
+    Bytes wrap_value(const Bytes& val, const EpochMeta& m = {}) const;
+    std::pair<Bytes, EpochMeta> unwrap_value(const Bytes& stored) const;
+    EpochMeta bump_epoch(const EpochMeta& old_meta) const;
 
     TeeOmapConfig config_;
 
@@ -77,20 +81,15 @@ private:
     std::unique_ptr<EnclaveOram> hot_oram_;
     std::unique_ptr<TeeAvlOmap> cold_omap_;
 
-    std::unordered_set<int> hot_keys_;
     int hot_capacity_ = 0;
 
-    // ── Enclave-local frequency tracking ────────────────────────────────
-    // All in enclave memory → invisible to attacker → no oblivious scan needed.
-    struct FreqEntry {
-        int count = 0;
-        int epoch = 0;
-    };
-    std::unordered_map<int, FreqEntry> freq_;    // key → frequency
     int current_epoch_ = 1;
     int access_counter_ = 0;
     int scan_ptr_ = 0;
-    std::queue<int> promo_queue_;
+
+    // Pending promotion: single key + value saved from a recent cold access.
+    int pending_promo_key_ = INVALID_KEY;
+    Bytes pending_promo_val_;
 };
 
 }  // namespace tee

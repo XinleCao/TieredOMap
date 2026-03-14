@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tiered_omap {
@@ -22,20 +23,32 @@ class EnclaveOram {
 public:
     struct Stats {
         uint64_t pages_touched = 0;
+        uint64_t node_accesses = 0;
         uint64_t accesses = 0;
-        void reset() { pages_touched = accesses = 0; }
+        void reset() { pages_touched = node_accesses = accesses = 0; }
     };
 
     EnclaveOram() = default;
     EnclaveOram(int num_data, int value_size, int bucket_size = 4,
                 int stash_scale = 7);
 
-    void init(const std::vector<std::pair<int, Bytes>>& data);
+    // Init returns a map of key -> assigned leaf for the caller to record.
+    // If preset_leaves is non-empty, those assignments are used instead of
+    // generating random ones (needed by TeeAvlOmap where leaf pointers are
+    // embedded in the AVL node data before init).
+    std::unordered_map<int, int> init(
+        const std::vector<std::pair<int, Bytes>>& data,
+        const std::unordered_map<int, int>& preset_leaves = {});
 
-    // Standard ORAM access (read or read-modify-write).
-    Bytes access(int key, const Bytes* new_value = nullptr);
+    // Doubly-oblivious access. Caller supplies old_leaf (from its own
+    // position tracking) and new_leaf (fresh random). The ORAM reads the
+    // old_leaf path and re-randomises the block to new_leaf.
+    Bytes access_or_dummy(int key, int old_leaf, int new_leaf,
+                          bool real, const Bytes* new_value = nullptr);
 
-    // Dummy access (touch a random path, no real key).
+    // Convenience wrappers.
+    Bytes access(int key, int old_leaf, int new_leaf,
+                 const Bytes* new_value = nullptr);
     void dummy_access();
 
     // ── Low-level interface for multi-node operations (AVL tree) ────────
@@ -69,14 +82,22 @@ public:
     const Stats& total_stats() const { return total_stats_; }
     void reset_stats() { last_stats_.reset(); total_stats_.reset(); }
 
-    // Position map access (in-enclave).
-    int get_leaf(int key) const;
-    void set_leaf(int key, int leaf);
-
     int stash_size() const { return static_cast<int>(stash_.size()); }
+    int stash_valid_count() const;
+
+    // DEBUG: check where a key is (0=nowhere, 1=stash, 2=tree)
+    int locate_key(int key) const {
+        for (auto& sb : stash_)
+            if (sb.key == key) return 1;
+        for (auto& b : tree_)
+            for (auto& bl : b.blocks)
+                if (bl.key == key) return 2;
+        return 0;
+    }
 
     void begin_page_tracking();
     uint64_t end_page_tracking();
+    uint64_t tracked_node_accesses() const { return node_access_count_; }
 
     static constexpr int PAGE_SIZE = 4096;
 
@@ -103,7 +124,6 @@ private:
 
     std::vector<Bucket> tree_;
     std::vector<TreeBlock> stash_;
-    std::unordered_map<int, int> pos_map_;
 
     Stats last_stats_;
     Stats total_stats_;
@@ -119,6 +139,10 @@ private:
     int node_byte_size() const;
     void record_node_access(int node_idx);
     std::unordered_map<uint64_t, bool> touched_pages_;
+    uint64_t node_access_count_ = 0;
+
+    // Ensure stash_ has exactly stash_max_ entries, padding with INVALID_KEY.
+    void pad_stash();
 
     // Path helpers.
     static int parent(int i) { return (i - 1) / 2; }
@@ -127,6 +151,7 @@ private:
     int leaf_to_node(int leaf) const { return leaf_range_ - 1 + leaf; }
     int node_depth(int i) const;
     bool path_contains(int leaf, int node) const;
+    bool path_contains_oblivious(int leaf, int node) const;
 };
 
 }  // namespace tee

@@ -95,16 +95,23 @@ TEST(EnclaveOram, BasicAccessRW) {
     std::vector<std::pair<int, Bytes>> data;
     for (int i = 0; i < 64; ++i)
         data.push_back({i, int_to_bytes(i * 10)});
-    oram.init(data);
+    auto leaves = oram.init(data);
 
     for (int i = 0; i < 64; ++i) {
-        Bytes val = oram.access(i);
+        int nl = oram.random_leaf();
+        Bytes val = oram.access(i, leaves[i], nl);
         EXPECT_EQ(bytes_to_int(val), i * 10);
+        leaves[i] = nl;
     }
 
+    int nl = oram.random_leaf();
     Bytes new_val = int_to_bytes(999);
-    oram.access(7, &new_val);
-    Bytes check = oram.access(7);
+    oram.access(7, leaves[7], nl, &new_val);
+    leaves[7] = nl;
+
+    nl = oram.random_leaf();
+    Bytes check = oram.access(7, leaves[7], nl);
+    leaves[7] = nl;
     EXPECT_EQ(bytes_to_int(check), 999);
 }
 
@@ -124,9 +131,11 @@ TEST(EnclaveOram, PageTracking) {
     std::vector<std::pair<int, Bytes>> data;
     for (int i = 0; i < 128; ++i)
         data.push_back({i, Bytes(64, static_cast<uint8_t>(i))});
-    oram.init(data);
+    auto leaves = oram.init(data);
 
-    oram.access(0);
+    int nl = oram.random_leaf();
+    oram.access(0, leaves[0], nl);
+    leaves[0] = nl;
     EXPECT_GT(oram.last_stats().pages_touched, 0u);
 }
 
@@ -194,6 +203,71 @@ TEST(TeeAvlOmap, Update) {
     Bytes new_val = int_to_bytes(999);
     avl.search(7, &new_val);
     EXPECT_EQ(bytes_to_int(avl.search(7)), 999);
+}
+
+TEST(TeeAvlOmap, SearchThenRemove) {
+    TeeAvlOmap avl(32, 16, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 24; ++i)
+        data.push_back({i, int_to_bytes(i * 10)});
+    avl.init(data);
+
+    // Mimic promote: search then remove
+    Bytes val = avl.search(12);
+    EXPECT_EQ(bytes_to_int(val), 120);
+    avl.remove(12);
+
+    // Verify all other keys still accessible.
+    for (int i = 0; i < 24; ++i) {
+        Bytes r = avl.search(i);
+        if (i == 12)
+            EXPECT_TRUE(r.empty()) << "key=" << i;
+        else
+            EXPECT_EQ(bytes_to_int(r), i * 10) << "key=" << i;
+    }
+}
+
+TEST(TeeAvlOmap, RemoveKey5) {
+    TeeAvlOmap avl(32, 16, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 24; ++i)
+        data.push_back({i, int_to_bytes(i * 10)});
+    avl.init(data);
+
+    // Single remove without prior search.
+    avl.remove(5);
+
+    for (int i = 0; i < 24; ++i) {
+        Bytes r = avl.search(i);
+        if (i == 5)
+            EXPECT_TRUE(r.empty()) << "key=" << i;
+        else
+            EXPECT_EQ(bytes_to_int(r), i * 10) << "key=" << i;
+    }
+}
+
+TEST(TeeAvlOmap, SearchRemoveKey5) {
+    TeeAvlOmap avl(32, 16, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 24; ++i)
+        data.push_back({i, int_to_bytes(i * 10)});
+    avl.init(data);
+
+    // Search then remove (like promote does).
+    Bytes v = avl.search(5);
+    EXPECT_EQ(bytes_to_int(v), 50);
+    avl.remove(5);
+
+    for (int i = 0; i < 24; ++i) {
+        Bytes r = avl.search(i);
+        if (i == 5)
+            EXPECT_TRUE(r.empty()) << "key=" << i;
+        else
+            EXPECT_EQ(bytes_to_int(r), i * 10) << "key=" << i;
+    }
 }
 
 // ── TEE OMAP ────────────────────────────────────────────────────────────────
@@ -288,7 +362,10 @@ TEST(TeeOmap, PageMetrics) {
     auto hot_r = omap.access(5);
     auto cold_r = omap.access(100);
 
-    EXPECT_LT(hot_r.total_pages, cold_r.total_pages);
+    // Both accesses should touch pages (doubly-oblivious: dummy ops
+    // touch the same pages as real ops, so hot ≈ cold).
+    EXPECT_GT(hot_r.total_pages, 0u);
+    EXPECT_GT(cold_r.total_pages, 0u);
 }
 
 // ── TEE Maintenance ─────────────────────────────────────────────────────────
@@ -321,8 +398,8 @@ TEST(TeeOmap, MaintenanceConvergence) {
 
     // Verify initial state.
     EXPECT_EQ(omap.hot_count(), 8);
-    EXPECT_TRUE(omap.hot_keys().count(0));
-    EXPECT_FALSE(omap.hot_keys().count(24));
+    EXPECT_TRUE(omap.is_hot(0));
+    EXPECT_FALSE(omap.is_hot(24));
 
     // Run workload: hit cold keys 24..27 heavily (4+ times/epoch to exceed
     // promote_threshold=3), hit hot keys 4..7 to keep them alive.
@@ -342,11 +419,11 @@ TEST(TeeOmap, MaintenanceConvergence) {
     // Keys 24..27 should have been promoted (heavily accessed).
     int promoted_count = 0;
     for (int k = 24; k < 28; ++k)
-        if (omap.hot_keys().count(k)) ++promoted_count;
+        if (omap.is_hot(k)) ++promoted_count;
 
     int demoted_count = 0;
     for (int k = 0; k < 4; ++k)
-        if (!omap.hot_keys().count(k)) ++demoted_count;
+        if (!omap.is_hot(k)) ++demoted_count;
 
     EXPECT_GE(promoted_count, 2) << "Expected at least 2 of keys 24..27 promoted";
     EXPECT_GE(demoted_count, 2) << "Expected at least 2 of keys 0..3 demoted";
@@ -393,6 +470,152 @@ TEST(TeeOmap, MaintenanceFullOblivious) {
         auto r = omap.access(i);
         EXPECT_EQ(bytes_to_int(r.value), i) << "key=" << i;
     }
+}
+
+// ── Double Obliviousness Verification ────────────────────────────────────────
+// Verify that different keys produce the same page-touch count, confirming
+// the ORAM access pattern doesn't leak which key was accessed.
+
+TEST(DoubleOblivious, EnclaveOramAccessPattern) {
+    EnclaveOram oram(64, 32, 4);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i)
+        data.push_back({i, int_to_bytes(i * 10)});
+    auto leaves = oram.init(data);
+
+    int nl = oram.random_leaf();
+    oram.access(0, leaves[0], nl);
+    leaves[0] = nl;
+    uint64_t na_key0 = oram.last_stats().node_accesses;
+
+    nl = oram.random_leaf();
+    oram.access(31, leaves[31], nl);
+    leaves[31] = nl;
+    uint64_t na_key31 = oram.last_stats().node_accesses;
+
+    nl = oram.random_leaf();
+    oram.access(63, leaves[63], nl);
+    leaves[63] = nl;
+    uint64_t na_key63 = oram.last_stats().node_accesses;
+
+    oram.dummy_access();
+    uint64_t na_dummy = oram.last_stats().node_accesses;
+
+    EXPECT_EQ(na_key0, na_key31)
+        << "Different keys should have identical node access count";
+    EXPECT_EQ(na_key31, na_key63);
+    EXPECT_EQ(na_key63, na_dummy)
+        << "Dummy access should have identical node access count as real access";
+    EXPECT_GT(na_key0, 0u);
+}
+
+TEST(DoubleOblivious, TeeAvlSearchPattern) {
+    TeeAvlOmap avl(64, 16, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 32; ++i)
+        data.push_back({i, int_to_bytes(i)});
+    avl.init(data);
+
+    // Real search for existing key.
+    avl.search(5);
+    auto stats_real = avl.last_stats();
+
+    // Real search for different existing key.
+    avl.search(28);
+    auto stats_other = avl.last_stats();
+
+    // Dummy search.
+    avl.dummy_access();
+    auto stats_dummy = avl.last_stats();
+
+    EXPECT_EQ(stats_real.total_node_accesses(), stats_other.total_node_accesses())
+        << "search(5) and search(28) should have identical node access counts";
+    EXPECT_EQ(stats_real.total_node_accesses(), stats_dummy.total_node_accesses())
+        << "Real and dummy search should have identical node access counts";
+    EXPECT_GT(stats_real.total_node_accesses(), 0u);
+}
+
+TEST(DoubleOblivious, TeeOmapFOPattern) {
+    TeeOmapConfig cfg;
+    cfg.total_keys = 64;
+    cfg.hot_set_size = 8;
+    cfg.value_size = 16;
+    cfg.mode = TeeSecurityMode::FullOblivious;
+    cfg.use_split_oram = false;
+
+    TeeOmap omap(cfg);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i)
+        data.push_back({i, int_to_bytes(i)});
+    std::vector<int> hk = {0, 1, 2, 3, 4, 5, 6, 7};
+    omap.init(data, hk);
+
+    // In FO mode, hot and cold accesses should have identical page counts.
+    auto hot_r = omap.access(3);   // hot key
+    auto cold_r = omap.access(50); // cold key
+
+    EXPECT_EQ(hot_r.total_pages, cold_r.total_pages)
+        << "FO mode: hot and cold access should have identical page counts";
+
+    // Verify correctness is maintained.
+    EXPECT_EQ(bytes_to_int(hot_r.value), 3);
+    EXPECT_EQ(bytes_to_int(cold_r.value), 50);
+}
+
+TEST(DoubleOblivious, SearchOrDummyEquivalence) {
+    TeeAvlOmap avl(32, 16, 4, 0);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 16; ++i)
+        data.push_back({i, int_to_bytes(i * 100)});
+    avl.init(data);
+
+    // search_or_dummy(real=true) should find the key.
+    Bytes r1 = avl.search_or_dummy(7, true);
+    EXPECT_EQ(bytes_to_int(r1), 700);
+
+    // search_or_dummy(real=false) returns fixed-size zeros (oblivious).
+    Bytes r2 = avl.search_or_dummy(7, false);
+    EXPECT_EQ(r2.size(), 16u);
+    EXPECT_EQ(r2, Bytes(16, 0));
+
+    // Both should have identical page counts.
+    avl.search_or_dummy(7, true);
+    auto stats_real2 = avl.last_stats();
+    avl.search_or_dummy(7, false);
+    auto stats_dummy2 = avl.last_stats();
+    EXPECT_EQ(stats_real2.total_node_accesses(), stats_dummy2.total_node_accesses());
+}
+
+TEST(DoubleOblivious, AccessOrDummyEquivalence) {
+    EnclaveOram oram(32, 16, 4);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 32; ++i)
+        data.push_back({i, int_to_bytes(i)});
+    auto leaves = oram.init(data);
+
+    int nl = oram.random_leaf();
+    Bytes r1 = oram.access_or_dummy(10, leaves[10], nl, true);
+    leaves[10] = nl;
+    EXPECT_EQ(bytes_to_int(r1), 10);
+
+    int rl = oram.random_leaf();
+    Bytes r2 = oram.access_or_dummy(10, rl, rl, false);
+    EXPECT_EQ(bytes_to_int(r2), 0);
+
+    nl = oram.random_leaf();
+    oram.access_or_dummy(10, leaves[10], nl, true);
+    leaves[10] = nl;
+    uint64_t pages_real = oram.last_stats().pages_touched;
+
+    rl = oram.random_leaf();
+    oram.access_or_dummy(10, rl, rl, false);
+    uint64_t pages_dummy = oram.last_stats().pages_touched;
+    EXPECT_EQ(pages_real, pages_dummy);
 }
 
 // ── TEE Server / Client (local loopback) ────────────────────────────────────

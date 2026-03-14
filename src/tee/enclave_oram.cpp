@@ -22,18 +22,22 @@ EnclaveOram::EnclaveOram(int num_data, int value_size, int bucket_size,
     }
 }
 
-void EnclaveOram::init(const std::vector<std::pair<int, Bytes>>& data) {
+std::unordered_map<int, int> EnclaveOram::init(
+        const std::vector<std::pair<int, Bytes>>& data,
+        const std::unordered_map<int, int>& preset_leaves) {
     stash_.clear();
 
-    // Preserve pre-assigned leaves (set via set_leaf before init).
+    std::unordered_map<int, int> leaf_map;
     for (auto& [key, val] : data) {
-        if (pos_map_.find(key) == pos_map_.end())
-            pos_map_[key] = SecureRandom::rand_below(leaf_range_);
+        if (leaf_map.count(key)) continue;
+        auto it = preset_leaves.find(key);
+        leaf_map[key] = (it != preset_leaves.end())
+                      ? it->second
+                      : SecureRandom::rand_below(leaf_range_);
     }
 
-    // Simple sequential fill: place each block along its assigned path.
     for (auto& [key, val] : data) {
-        int leaf = pos_map_[key];
+        int leaf = leaf_map[key];
         Bytes padded = pad_bytes(val, value_size_);
 
         int node = leaf_to_node(leaf);
@@ -54,93 +58,86 @@ void EnclaveOram::init(const std::vector<std::pair<int, Bytes>>& data) {
         if (!placed)
             stash_.push_back({key, leaf, padded});
     }
+
+    pad_stash();
+    return leaf_map;
 }
 
-Bytes EnclaveOram::access(int key, const Bytes* new_value) {
+// ── Doubly-oblivious access ─────────────────────────────────────────────────
+// Unified code path for real and dummy access. The control flow is identical
+// regardless of `real`, `key`, or whether the key is found.
+
+Bytes EnclaveOram::access(int key, int old_leaf, int new_leaf,
+                          const Bytes* new_value) {
+    return access_or_dummy(key, old_leaf, new_leaf, true, new_value);
+}
+
+Bytes EnclaveOram::access_or_dummy(int key, int old_leaf, int new_leaf,
+                                   bool real, const Bytes* new_value) {
     last_stats_.reset();
     begin_page_tracking();
 
-    auto it = pos_map_.find(key);
-    if (it == pos_map_.end())
-        throw std::runtime_error("EnclaveOram::access: key not found");
+    int dummy_leaf = random_leaf();
+    int use_leaf = o_select_i(real ? 1 : 0, old_leaf, dummy_leaf);
 
-    int old_leaf = it->second;
-    int new_leaf = random_leaf();
-    pos_map_[key] = new_leaf;
+    auto path_nodes = read_path(use_leaf);
 
-    auto path_nodes = read_path(old_leaf);
-
-    // Find block in stash (oblivious linear scan).
     Bytes result(value_size_, 0);
-    bool found = false;
-    for (auto& sb : stash_) {
-        bool match = (sb.key == key);
-        o_mov_bytes(match, result, sb.value);
-        // Update value if writing.
-        if (new_value) {
-            Bytes padded = pad_bytes(*new_value, value_size_);
-            o_mov_bytes(match, sb.value, padded);
-        }
-        o_mov_i(match, sb.leaf, new_leaf);
-        if (match) found = true;
-    }
-    if (!found)
-        throw std::runtime_error("EnclaveOram::access: key " +
-                                 std::to_string(key) + " not in stash after path read");
+    Bytes padded_new(value_size_, 0);
+    if (new_value)
+        padded_new = pad_bytes(*new_value, value_size_);
 
-    evict_path(old_leaf, path_nodes);
+    int real_i = real ? 1 : 0;
+    int has_new = (new_value != nullptr) ? 1 : 0;
+    for (auto& sb : stash_) {
+        int match = real_i & o_equal(sb.key, key);
+        o_mov_bytes(match, result, sb.value);
+        int do_write = match & has_new;
+        o_mov_bytes(do_write, sb.value, padded_new);
+        o_mov_i(match, sb.leaf, new_leaf);
+    }
+
+    evict_path(use_leaf, path_nodes);
 
     last_stats_.accesses = 1;
     last_stats_.pages_touched = end_page_tracking();
+    last_stats_.node_accesses = node_access_count_;
     total_stats_.accesses += last_stats_.accesses;
     total_stats_.pages_touched += last_stats_.pages_touched;
+    total_stats_.node_accesses += last_stats_.node_accesses;
 
     return result;
 }
 
 void EnclaveOram::dummy_access() {
-    last_stats_.reset();
-    begin_page_tracking();
-
-    int leaf = random_leaf();
-    auto path_nodes = read_path(leaf);
-    evict_path(leaf, path_nodes);
-
-    last_stats_.accesses = 1;
-    last_stats_.pages_touched = end_page_tracking();
-    total_stats_.accesses += last_stats_.accesses;
-    total_stats_.pages_touched += last_stats_.pages_touched;
+    int rl = random_leaf();
+    Bytes discard = access_or_dummy(INVALID_KEY, rl, rl, false, nullptr);
+    (void)discard;
 }
 
 int EnclaveOram::random_leaf() const {
     return SecureRandom::rand_below(leaf_range_);
 }
 
-int EnclaveOram::get_leaf(int key) const {
-    auto it = pos_map_.find(key);
-    return (it != pos_map_.end()) ? it->second : INVALID_LEAF;
-}
-
-void EnclaveOram::set_leaf(int key, int leaf) {
-    pos_map_[key] = leaf;
-}
-
-// ── Path read ────────────────────────────────────────────────────────────────
+// ── Doubly-oblivious path read ──────────────────────────────────────────────
+// Always reads exactly `level_` nodes (root to leaf). Every block in every
+// bucket is unconditionally moved to stash (including dummies).
 
 std::vector<int> EnclaveOram::read_path(int leaf) {
     std::vector<int> nodes;
+    nodes.reserve(level_);
+
     int node = leaf_to_node(leaf);
-    while (node >= 0) {
+    for (int d = 0; d < level_; ++d) {
         nodes.push_back(node);
         record_node_access(node);
 
         auto& bucket = tree_[node];
         for (int j = 0; j < bucket_size_; ++j) {
-            if (bucket.blocks[j].key != INVALID_KEY) {
-                stash_.push_back(std::move(bucket.blocks[j]));
-                bucket.blocks[j] = {};
-                bucket.blocks[j].value.resize(value_size_, 0);
-            }
+            // Unconditionally push every slot to stash — no branch on key.
+            stash_.push_back(bucket.blocks[j]);
+            bucket.blocks[j] = {};
+            bucket.blocks[j].value.resize(value_size_, 0);
         }
         if (node == 0) break;
         node = parent(node);
@@ -148,63 +145,97 @@ std::vector<int> EnclaveOram::read_path(int leaf) {
     return nodes;
 }
 
-// ── Oblivious eviction ──────────────────────────────────────────────────────
+// ── Doubly-oblivious eviction ───────────────────────────────────────────────
+
+void EnclaveOram::pad_stash() {
+    while (static_cast<int>(stash_.size()) < stash_max_) {
+        TreeBlock dummy;
+        dummy.value.resize(value_size_, 0);
+        stash_.push_back(std::move(dummy));
+    }
+}
+
+int EnclaveOram::stash_valid_count() const {
+    int c = 0;
+    for (auto& sb : stash_)
+        c += 1 - o_equal(sb.key, INVALID_KEY);
+    return c;
+}
 
 void EnclaveOram::evict_path(int /*leaf*/, const std::vector<int>& path_nodes) {
-    // For each node on the path (deepest first), try to fill its bucket
-    // from stash using oblivious selection.
+    // The stash may contain: stash_max_ base entries + level_*bucket_size_
+    // from read_path + a small number from add_to_stash. Process all of them.
+    int n = static_cast<int>(stash_.size());
+
     for (int pi = 0; pi < static_cast<int>(path_nodes.size()); ++pi) {
         int node = path_nodes[pi];
         record_node_access(node);
 
         auto& bucket = tree_[node];
         for (int j = 0; j < bucket_size_; ++j) {
-            // Oblivious scan: pick the first stash block whose path
-            // intersects this node.
-            bool filled = false;
-            for (auto& sb : stash_) {
-                bool candidate = (sb.key != INVALID_KEY)
-                              && path_contains(sb.leaf, node)
-                              && !filled;
-                // Conditionally move block into bucket slot.
+            int filled_i = 0;
+            for (int si = 0; si < n; ++si) {
+                auto& sb = stash_[si];
+                int is_real = 1 - o_equal(sb.key, INVALID_KEY);
+                int on_path = path_contains_oblivious(sb.leaf, node) ? 1 : 0;
+                int not_filled = 1 - filled_i;
+                int candidate = is_real & on_path & not_filled;
                 o_mov_i(candidate, bucket.blocks[j].key, sb.key);
                 o_mov_i(candidate, bucket.blocks[j].leaf, sb.leaf);
                 o_mov_bytes(candidate, bucket.blocks[j].value, sb.value);
-                // Conditionally remove from stash.
                 int inv = INVALID_KEY;
                 o_mov_i(candidate, sb.key, inv);
-                if (candidate) filled = true;
+                int one = 1;
+                o_mov_i(candidate, filled_i, one);
             }
         }
     }
 
-    // Compact stash: remove invalidated entries.
-    stash_.erase(
-        std::remove_if(stash_.begin(), stash_.end(),
-                        [](const TreeBlock& b) { return b.key == INVALID_KEY; }),
-        stash_.end());
+    // Oblivious compaction: bubble INVALID_KEY entries to end.
+    for (int pass = 0; pass < n; ++pass) {
+        for (int i = 0; i < n - 1; ++i) {
+            int left_inv = o_equal(stash_[i].key, INVALID_KEY);
+            int right_val = 1 - o_equal(stash_[i + 1].key, INVALID_KEY);
+            int do_swap = left_inv & right_val;
+            o_swap_i(do_swap, stash_[i].key, stash_[i + 1].key);
+            o_swap_i(do_swap, stash_[i].leaf, stash_[i + 1].leaf);
+            o_swap_bytes(do_swap, stash_[i].value, stash_[i + 1].value);
+        }
+    }
 
-    if (static_cast<int>(stash_.size()) > stash_max_)
+    // Count valid entries, shrink to stash_max_ (valid entries are at front).
+    int valid = 0;
+    for (auto& sb : stash_)
+        valid += 1 - o_equal(sb.key, INVALID_KEY);
+    stash_.resize(std::max(valid, stash_max_));
+    pad_stash();
+
+    if (valid > stash_max_)
         throw std::runtime_error(
-            "EnclaveOram: stash overflow (" + std::to_string(stash_.size()) +
+            "EnclaveOram: stash overflow (" + std::to_string(valid) +
             " > " + std::to_string(stash_max_) + ")");
 }
 
-// ── Low-level interface for multi-node operations ───────────────────────────
+// ── Doubly-oblivious low-level interface ────────────────────────────────────
 
 void EnclaveOram::read_path_to_stash(int leaf) {
-    read_path(leaf);   // moves all blocks from the path into stash_
+    read_path(leaf);
 }
 
 Block EnclaveOram::extract_from_stash(int key) {
-    for (auto it = stash_.begin(); it != stash_.end(); ++it) {
-        if (it->key == key) {
-            Block b{it->key, it->leaf, std::move(it->value)};
-            stash_.erase(it);
-            return b;
-        }
+    Block result{};
+    result.value.resize(value_size_, 0);
+    for (auto& sb : stash_) {
+        int key_match = o_equal(sb.key, key);
+        int not_invalid = 1 - o_equal(sb.key, INVALID_KEY);
+        int match = key_match & not_invalid;
+        o_mov_i(match, result.key, sb.key);
+        o_mov_i(match, result.leaf, sb.leaf);
+        o_mov_bytes(match, result.value, sb.value);
+        int inv = INVALID_KEY;
+        o_mov_i(match, sb.key, inv);
     }
-    return Block{};  // not found
+    return result;
 }
 
 void EnclaveOram::add_to_stash(int key, int leaf, const Bytes& value) {
@@ -213,8 +244,9 @@ void EnclaveOram::add_to_stash(int key, int leaf, const Bytes& value) {
 
 void EnclaveOram::evict_one_path(int leaf) {
     std::vector<int> path_nodes;
+    path_nodes.reserve(level_);
     int node = leaf_to_node(leaf);
-    while (node >= 0) {
+    for (int d = 0; d < level_; ++d) {
         path_nodes.push_back(node);
         if (node == 0) break;
         node = parent(node);
@@ -222,7 +254,7 @@ void EnclaveOram::evict_one_path(int leaf) {
     evict_path(leaf, path_nodes);
 }
 
-// ── Path geometry ───────────────────────────────────────────────────────────
+// ── Doubly-oblivious path geometry ──────────────────────────────────────────
 
 int EnclaveOram::node_depth(int i) const {
     int d = 0;
@@ -232,13 +264,21 @@ int EnclaveOram::node_depth(int i) const {
 }
 
 bool EnclaveOram::path_contains(int leaf, int node) const {
+    return path_contains_oblivious(leaf, node);
+}
+
+bool EnclaveOram::path_contains_oblivious(int leaf, int node) const {
+    // Fixed-iteration loop: always walks exactly `level_` steps.
     int cur = leaf_to_node(leaf);
-    while (cur >= node) {
-        if (cur == node) return true;
-        if (cur == 0) break;
-        cur = parent(cur);
+    int found = 0;
+    for (int d = 0; d < level_; ++d) {
+        int eq = o_equal(cur, node);
+        found |= eq;
+        // Move up unless already at root (cur stays 0).
+        int par = (cur > 0) ? parent(cur) : 0;
+        cur = par;
     }
-    return false;
+    return found != 0;
 }
 
 // ── Page tracking ───────────────────────────────────────────────────────────
@@ -249,6 +289,7 @@ int EnclaveOram::node_byte_size() const {
 
 void EnclaveOram::begin_page_tracking() {
     touched_pages_.clear();
+    node_access_count_ = 0;
 }
 
 uint64_t EnclaveOram::end_page_tracking() {
@@ -256,6 +297,7 @@ uint64_t EnclaveOram::end_page_tracking() {
 }
 
 void EnclaveOram::record_node_access(int node_idx) {
+    ++node_access_count_;
     int bytes_per_node = node_byte_size();
     uint64_t byte_start = static_cast<uint64_t>(node_idx) * bytes_per_node;
     uint64_t byte_end = byte_start + bytes_per_node;

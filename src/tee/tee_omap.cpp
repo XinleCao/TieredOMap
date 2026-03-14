@@ -1,9 +1,37 @@
 #include "tiered_omap/tee/tee_omap.h"
 #include <algorithm>
-#include <stdexcept>
 
 namespace tiered_omap {
 namespace tee {
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+int TeeOmap::stored_value_size() const {
+    return config_.maintenance.enabled
+         ? config_.value_size + static_cast<int>(EPOCH_META_SIZE)
+         : config_.value_size;
+}
+
+Bytes TeeOmap::wrap_value(const Bytes& val, const EpochMeta& m) const {
+    if (!config_.maintenance.enabled) return val;
+    return encode_with_epoch(pad_bytes(val, config_.value_size), m);
+}
+
+std::pair<Bytes, EpochMeta> TeeOmap::unwrap_value(const Bytes& stored) const {
+    if (!config_.maintenance.enabled) return {stored, {}};
+    return decode_epoch(stored);
+}
+
+EpochMeta TeeOmap::bump_epoch(const EpochMeta& old_meta) const {
+    EpochMeta m = old_meta;
+    int stale = o_less(m.ep, current_epoch_);
+    int fresh_cnt = m.cnt + 1;
+    m.cnt = o_select_i(stale, 1, fresh_cnt);
+    m.ep  = o_select_i(stale, current_epoch_, m.ep);
+    return m;
+}
+
+// ── Constructor ─────────────────────────────────────────────────────────────
 
 TeeOmap::TeeOmap(const TeeOmapConfig& config) : config_(config) {
     int n = config_.hot_set_size;
@@ -13,9 +41,10 @@ TeeOmap::TeeOmap(const TeeOmapConfig& config) : config_(config) {
                   ? std::max(n * 2, n + 64)
                   : n;
 
+    int sv = stored_value_size();
     hot_dir_ = std::make_unique<PackedDirectory>(hot_capacity_);
     hot_oram_ = std::make_unique<EnclaveOram>(
-        hot_capacity_, config_.value_size, config_.bucket_size);
+        hot_capacity_, sv, config_.bucket_size);
 
     int cold_cap = config_.maintenance.enabled
                  ? std::max(N - n, N)
@@ -24,117 +53,150 @@ TeeOmap::TeeOmap(const TeeOmapConfig& config) : config_(config) {
                     ? std::max(1, ceil_log2(std::max(n, 2)))
                     : 0;
     cold_omap_ = std::make_unique<TeeAvlOmap>(
-        cold_cap, config_.value_size, config_.bucket_size, split_depth);
+        cold_cap, sv, config_.bucket_size, split_depth);
 }
+
+// ── Init ────────────────────────────────────────────────────────────────────
 
 void TeeOmap::init(const std::vector<std::pair<int, Bytes>>& all_data,
                    const std::vector<int>& hot_keys) {
-    hot_keys_.clear();
-    hot_keys_.insert(hot_keys.begin(), hot_keys.end());
+    std::unordered_set<int> hk_set(hot_keys.begin(), hot_keys.end());
 
     std::vector<std::pair<int, Bytes>> hot_data, cold_data;
     for (auto& [k, v] : all_data) {
-        if (hot_keys_.count(k))
-            hot_data.push_back({k, v});
+        Bytes stored = wrap_value(v);
+        if (hk_set.count(k))
+            hot_data.push_back({k, stored});
         else
-            cold_data.push_back({k, v});
+            cold_data.push_back({k, stored});
     }
 
-    // Pad hot ORAM with dummies if capacity > actual hot keys (for maintenance).
     int real_hot = static_cast<int>(hot_data.size());
+    Bytes dummy_val(stored_value_size(), 0);
     for (int i = 0; i < hot_capacity_ - real_hot; ++i)
-        hot_data.push_back({-(i + 1), Bytes(config_.value_size, 0)});
+        hot_data.push_back({-(i + 1), dummy_val});
 
-    hot_oram_->init(hot_data);
-    for (auto& [k, v] : hot_data) {
-        if (k >= 0) {
-            int leaf = hot_oram_->get_leaf(k);
+    auto hot_leaves = hot_oram_->init(hot_data);
+    for (auto& [k, leaf] : hot_leaves) {
+        if (k >= 0)
             hot_dir_->insert(k, leaf);
-        }
     }
 
     cold_omap_->init(cold_data);
-
-    // Init frequency table for all keys.
-    if (config_.maintenance.enabled) {
-        for (auto& [k, v] : all_data)
-            freq_[k] = {0, 0};
-    }
 }
+
+// ── Doubly-oblivious access ─────────────────────────────────────────────────
 
 TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
                                 ResponseCallback early_cb,
                                 ResponseCallback final_cb) {
     TeeAccessResult result;
     auto& mcfg = config_.maintenance;
+    int sv = stored_value_size();
 
-    // ── Phase 1: Hot tier (directory scan + hot ORAM) ───────────────────
+    // ── Phase 1: Hot tier ────────────────────────────────────────────────
+    // Use low-level ORAM ops so we can insert epoch update in between.
 
     int old_pos = hot_dir_->lookup(key);
-    bool hot_hit = (old_pos != INVALID_LEAF);
+    int hot_hit_i = 1 - o_equal(old_pos, INVALID_LEAF);
+    int new_hot_leaf = hot_oram_->random_leaf();
 
-    if (hot_hit) {
-        result.value = hot_oram_->access(key, new_value);
-        result.found_in_hot = true;
-        int new_leaf = hot_oram_->get_leaf(key);
-        hot_dir_->update_pos(key, new_leaf);
-    } else {
-        hot_oram_->dummy_access();
-        hot_dir_->update_pos(key, INVALID_LEAF);
+    int dummy_leaf = hot_oram_->random_leaf();
+    int use_leaf = o_select_i(hot_hit_i, old_pos, dummy_leaf);
+
+    hot_oram_->read_path_to_stash(use_leaf);
+    Block blk = hot_oram_->extract_from_stash(
+        o_select_i(hot_hit_i, key, -2));
+
+    // Decode epoch from stored value.
+    auto [hot_val, hot_meta] = unwrap_value(blk.value);
+
+    // Update epoch for hot key.
+    EpochMeta new_hot_meta = bump_epoch(hot_meta);
+
+    // Prepare value to write back (oblivious selection).
+    Bytes wb_val = pad_bytes(hot_val, config_.value_size);
+    if (new_value) {
+        Bytes nv_padded = pad_bytes(*new_value, config_.value_size);
+        o_mov_bytes(hot_hit_i, wb_val, nv_padded);
     }
+    Bytes wb_stored = wrap_value(wb_val, new_hot_meta);
+    wb_stored = pad_bytes(wb_stored, sv);
 
-    int dir_pages = (hot_dir_->capacity() * 12 + EnclaveOram::PAGE_SIZE - 1)
+    // Add back to stash (real or dummy).
+    hot_oram_->add_to_stash(
+        o_select_i(hot_hit_i, key, blk.key), new_hot_leaf, wb_stored);
+    hot_oram_->evict_one_path(use_leaf);
+
+    // Update directory leaf.
+    hot_dir_->update_pos(key, o_select_i(hot_hit_i, new_hot_leaf, INVALID_LEAF));
+
+    // Bump hot directory frequency (oblivious scan).
+    if (mcfg.enabled)
+        hot_dir_->bump_freq(key, current_epoch_);
+
+    int dir_pages = (hot_dir_->capacity() * 20 + EnclaveOram::PAGE_SIZE - 1)
                   / EnclaveOram::PAGE_SIZE;
     result.hot_pages = static_cast<uint64_t>(dir_pages) * 2
                      + hot_oram_->last_stats().pages_touched;
 
-    // ── Early response ──────────────────────────────────────────────────
+    // Obliviously select result from hot tier.
+    result.value.resize(config_.value_size, 0);
+    Bytes padded_hot = pad_bytes(hot_val, config_.value_size);
+    o_mov_bytes(hot_hit_i, result.value, padded_hot);
+    result.found_in_hot = (hot_hit_i != 0);
 
+    // ── Early response ───────────────────────────────────────────────────
     if (early_cb)
         early_cb(result.value, result.found_in_hot);
 
-    // ── Phase 2: Cold tier ──────────────────────────────────────────────
+    // ── Phase 2: Cold tier ───────────────────────────────────────────────
+    int cold_real = 1 - hot_hit_i;
 
-    if (config_.mode == TeeSecurityMode::FullOblivious) {
-        if (!hot_hit) {
-            Bytes cold_val = cold_omap_->search(key, new_value);
-            result.value = cold_val;
-        } else {
-            cold_omap_->dummy_access();
-        }
-    } else {
-        if (!hot_hit) {
-            Bytes cold_val = cold_omap_->search(key, new_value);
-            result.value = cold_val;
-        }
+    // Build a value transform that bumps epoch in the cold OMAP node.
+    TeeAvlOmap::ValueTransform cold_transform = nullptr;
+    if (mcfg.enabled) {
+        cold_transform = [&](const Bytes& old_stored) -> Bytes {
+            auto [cv, cm] = unwrap_value(old_stored);
+            EpochMeta nm = bump_epoch(cm);
+            Bytes wv = pad_bytes(cv, config_.value_size);
+            if (new_value) {
+                Bytes nv_padded = pad_bytes(*new_value, config_.value_size);
+                o_mov_bytes(cold_real, wv, nv_padded);
+            }
+            return wrap_value(wv, nm);
+        };
     }
+
+    const Bytes* cold_update = (!mcfg.enabled && new_value) ? new_value : nullptr;
+    Bytes cold_stored = cold_omap_->search_or_dummy(
+        key, cold_real != 0, cold_update, cold_transform);
+
+    auto [cold_val, cold_meta] = unwrap_value(cold_stored);
+
+    // Obliviously select result from cold tier.
+    int use_cold = 1 - hot_hit_i;
+    Bytes padded_cold = pad_bytes(cold_val, config_.value_size);
+    o_mov_bytes(use_cold, result.value, padded_cold);
 
     result.cold_up_pages = cold_omap_->last_stats().upper_pages;
     result.cold_low_pages = cold_omap_->last_stats().lower_pages;
     result.total_pages = result.hot_pages + result.cold_up_pages
                        + result.cold_low_pages;
 
-    // ── Final response ──────────────────────────────────────────────────
-
+    // ── Final response ───────────────────────────────────────────────────
     if (final_cb)
         final_cb(result.value, !result.found_in_hot);
 
-    // ── Frequency tracking & maintenance ────────────────────────────────
-
+    // ── Frequency tracking & maintenance ─────────────────────────────────
     if (mcfg.enabled) {
-        auto& fe = freq_[key];
-        if (fe.epoch < current_epoch_) {
-            fe.count = 1;
-            fe.epoch = current_epoch_;
-        } else {
-            ++fe.count;
-        }
-
-        // Cold key with high frequency → enqueue for promotion.
-        if (!hot_hit && fe.count >= mcfg.promote_threshold
-            && !hot_keys_.count(key)) {
-            promo_queue_.push(key);
-        }
+        // Check promotion criteria for cold key.
+        int cold_freq_ok = 1 - o_less(cold_meta.cnt, mcfg.promote_threshold);
+        int is_promo_candidate = use_cold & cold_freq_ok;
+        // Obliviously save promotion candidate.
+        o_mov_i(is_promo_candidate, pending_promo_key_, key);
+        Bytes pv = pad_bytes(cold_val, config_.value_size);
+        o_mov_bytes(is_promo_candidate, pending_promo_val_, pv);
 
         ++access_counter_;
         if (access_counter_ >= mcfg.epoch_length) {
@@ -147,99 +209,86 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
     return result;
 }
 
-// ── Maintenance: one promote + one demote per epoch boundary ────────────
+// ── Maintenance: one demote + one promote per epoch boundary ─────────────
 
 void TeeOmap::do_maintenance_step() {
     auto& mcfg = config_.maintenance;
 
-    // ── Demotion: scan hot keys round-robin ─────────────────────────────
-    // Enclave can inspect hot_dir_ directly (enclave memory, not oblivious).
-    int demote_key = INVALID_KEY;
-    auto& entries = hot_dir_->entries();
-    int cap = hot_dir_->capacity();
-    for (int i = 0; i < cap; ++i) {
-        int idx = (scan_ptr_ + i) % cap;
-        int k = entries[idx].key;
-        if (k == INVALID_KEY) continue;
+    // ── Demotion: oblivious scan of hot directory ────────────────────────
+    int demote_key = hot_dir_->find_demote_candidate(
+        scan_ptr_, current_epoch_, mcfg.staleness_epochs, mcfg.demote_threshold);
+    scan_ptr_ = (scan_ptr_ + 1) % std::max(hot_dir_->capacity(), 1);
 
-        auto it = freq_.find(k);
-        if (it == freq_.end()) continue;
-        auto& fe = it->second;
+    // Always execute demote ops (real or dummy) for fixed access pattern.
+    // demote_key is INVALID_KEY when no candidate found → demote() handles it.
+    demote(demote_key);
 
-        bool stale = (fe.epoch <= current_epoch_ - mcfg.staleness_epochs);
-        bool cold_freq = (fe.count < mcfg.demote_threshold);
-        if (stale || cold_freq) {
-            demote_key = k;
-            scan_ptr_ = (idx + 1) % cap;
-            break;
-        }
-    }
-    if (demote_key == INVALID_KEY)
-        scan_ptr_ = (scan_ptr_ + 1) % std::max(cap, 1);
+    // ── Promotion ────────────────────────────────────────────────────────
+    int promo_key = pending_promo_key_;
+    Bytes promo_val = pending_promo_val_;
 
-    bool did_demote = false;
-    if (demote_key != INVALID_KEY && hot_keys_.count(demote_key)) {
-        demote(demote_key);
-        did_demote = true;
-    }
+    // Check if candidate is still cold (not already hot).
+    int already_hot = 1 - o_equal(hot_dir_->lookup(promo_key), INVALID_LEAF);
+    int capacity_ok = (hot_dir_->size() < hot_capacity_) ? 1 : 0;
+    int do_promo = (1 - o_equal(promo_key, INVALID_KEY))
+                 & (1 - already_hot) & capacity_ok;
+    int eff_key = o_select_i(do_promo, promo_key, INVALID_KEY);
 
-    // For FullOblivious: if no real demotion, do dummy ops to hide it.
-    if (config_.mode == TeeSecurityMode::FullOblivious && !did_demote) {
-        hot_oram_->dummy_access();
-        cold_omap_->dummy_access();
-    }
+    promote(eff_key, promo_val);
 
-    // ── Promotion ───────────────────────────────────────────────────────
-    int promo_key = INVALID_KEY;
-    bool did_promote = false;
-    while (!promo_queue_.empty()) {
-        int pk = promo_queue_.front();
-        promo_queue_.pop();
-        if (!hot_keys_.count(pk)
-            && static_cast<int>(hot_keys_.size()) < hot_capacity_) {
-            promo_key = pk;
-            break;
-        }
-    }
-
-    if (promo_key != INVALID_KEY) {
-        promote(promo_key);
-        did_promote = true;
-    }
-
-    if (config_.mode == TeeSecurityMode::FullOblivious && !did_promote) {
-        cold_omap_->dummy_access();
-        hot_oram_->dummy_access();
-    }
+    // Clear pending.
+    pending_promo_key_ = INVALID_KEY;
+    pending_promo_val_.assign(config_.value_size, 0);
 }
 
-// ── Promote / Demote ────────────────────────────────────────────────────
+// ── Promote / Demote (fixed ORAM access pattern) ────────────────────────
 
-void TeeOmap::promote(int key) {
-    Bytes val = cold_omap_->search(key);
-    if (val.empty()) return;
+void TeeOmap::promote(int key, const Bytes& value) {
+    int is_real = 1 - o_equal(key, INVALID_KEY);
 
+    // Cold OMAP remove: traverses the AVL tree (3*max_height steps).
+    // When key=INVALID_KEY, traverses but finds nothing → no-op.
     cold_omap_->remove(key);
 
-    // Insert into hot ORAM.
-    // The hot ORAM needs a dummy slot for the new key.  We set up a pos_map
-    // entry and add to stash, then do one access to place it.
-    hot_oram_->set_leaf(key, hot_oram_->random_leaf());
-    hot_oram_->add_to_stash(key, hot_oram_->get_leaf(key), val);
-    hot_oram_->evict_one_path(hot_oram_->get_leaf(key));
+    // Hot ORAM: add the value (or dummy block).
+    int leaf = hot_oram_->random_leaf();
+    hot_oram_->read_path_to_stash(leaf);
 
-    hot_dir_->insert(key, hot_oram_->get_leaf(key));
-    hot_keys_.insert(key);
+    Bytes stored = wrap_value(value);
+    stored = pad_bytes(stored, stored_value_size());
+    hot_oram_->add_to_stash(
+        o_select_i(is_real, key, INVALID_KEY), leaf, stored);
+    hot_oram_->evict_one_path(leaf);
+
+    // Hot directory: insert handles INVALID_KEY as dummy (full scan, no insert).
+    hot_dir_->insert(key, leaf);
 }
 
 void TeeOmap::demote(int key) {
-    if (!hot_keys_.count(key)) return;
+    int is_real = 1 - o_equal(key, INVALID_KEY);
 
-    Bytes val = hot_oram_->access(key);
+    // Hot ORAM: read the value out (or dummy read).
+    int old_leaf = hot_dir_->lookup(key);
+    int use_old = o_select_i(is_real, old_leaf, hot_oram_->random_leaf());
+
+    hot_oram_->read_path_to_stash(use_old);
+    Block blk = hot_oram_->extract_from_stash(
+        o_select_i(is_real, key, -2));
+
+    // Real: don't add back (removing from hot). Dummy: add the block back.
+    hot_oram_->add_to_stash(
+        o_select_i(is_real, INVALID_KEY, blk.key),
+        hot_oram_->random_leaf(), blk.value);
+    hot_oram_->evict_one_path(use_old);
+
+    // Hot directory: remove handles INVALID_KEY as dummy (full scan, no remove).
     hot_dir_->remove(key);
-    hot_keys_.erase(key);
 
-    cold_omap_->insert(key, val);
+    // Cold OMAP: insert value (INVALID_KEY → dummy insert, same ORAM pattern).
+    auto [val, meta] = unwrap_value(blk.value);
+    Bytes stored = wrap_value(val, meta);
+    stored = pad_bytes(stored, stored_value_size());
+    cold_omap_->insert(o_select_i(is_real, key, INVALID_KEY), stored);
 }
 
 }  // namespace tee

@@ -20,6 +20,8 @@ public:
     struct Entry {
         int key = INVALID_KEY;
         int pos_label = INVALID_LEAF;
+        int freq_count = 0;
+        int freq_epoch = 0;
     };
 
     explicit PackedDirectory(int capacity);
@@ -42,6 +44,17 @@ public:
     // Combined lookup + update in a single scan: reads old pos_label,
     // writes new_pos in its place.  Returns old pos_label.
     int lookup_and_update(int key, int new_pos);
+
+    // Oblivious frequency bump: increments freq_count for `key`.
+    // If the entry's epoch < current_epoch, resets count to 1.
+    void bump_freq(int key, int current_epoch);
+
+    // Oblivious demote scan: returns the key of the entry at round-robin
+    // position `scan_idx` if its frequency is stale or below threshold.
+    // Returns INVALID_KEY if no demotion warranted.
+    // Always performs a full scan regardless of result.
+    int find_demote_candidate(int scan_idx, int current_epoch,
+                              int staleness_epochs, int demote_threshold) const;
 
     int capacity() const { return capacity_; }
     int size() const { return count_; }
