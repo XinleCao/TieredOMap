@@ -9,7 +9,7 @@ PackedDirectory::PackedDirectory(int capacity)
 int PackedDirectory::lookup(int key) const {
     int result = INVALID_LEAF;
     for (int i = 0; i < capacity_; ++i) {
-        bool match = (entries_[i].key == key);
+        int match = o_equal(entries_[i].key, key);
         o_mov_i(match, result, entries_[i].pos_label);
     }
     return result;
@@ -36,7 +36,7 @@ bool PackedDirectory::insert(int key, int pos_label) {
         o_mov_i(is_slot, entries_[i].pos_label, pos_label);
         inserted |= is_slot;
     }
-    if (inserted) ++count_;
+    count_ += inserted;
     return inserted != 0;
 }
 
@@ -54,14 +54,14 @@ bool PackedDirectory::remove(int key) {
         o_mov_i(match, entries_[i].freq_epoch, zero);
         removed |= match;
     }
-    if (removed) --count_;
+    count_ -= removed;
     return removed != 0;
 }
 
 int PackedDirectory::lookup_and_update(int key, int new_pos) {
     int old_pos = INVALID_LEAF;
     for (int i = 0; i < capacity_; ++i) {
-        bool match = (entries_[i].key == key);
+        int match = o_equal(entries_[i].key, key);
         o_mov_i(match, old_pos, entries_[i].pos_label);
         o_mov_i(match, entries_[i].pos_label, new_pos);
     }

@@ -95,92 +95,105 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
     int sv = stored_value_size();
 
     // ── Phase 1: Hot tier ────────────────────────────────────────────────
-    // Use low-level ORAM ops so we can insert epoch update in between.
-
+    // Directory lookup is always needed to determine tier membership.
     int old_pos = hot_dir_->lookup(key);
     int hot_hit_i = 1 - o_equal(old_pos, INVALID_LEAF);
-    int new_hot_leaf = hot_oram_->random_leaf();
-
-    int dummy_leaf = hot_oram_->random_leaf();
-    int use_leaf = o_select_i(hot_hit_i, old_pos, dummy_leaf);
-
-    hot_oram_->read_path_to_stash(use_leaf);
-    Block blk = hot_oram_->extract_from_stash(
-        o_select_i(hot_hit_i, key, -2));
-
-    // Decode epoch from stored value.
-    auto [hot_val, hot_meta] = unwrap_value(blk.value);
-
-    // Update epoch for hot key.
-    EpochMeta new_hot_meta = bump_epoch(hot_meta);
-
-    // Prepare value to write back (oblivious selection).
-    Bytes wb_val = pad_bytes(hot_val, config_.value_size);
-    if (new_value) {
-        Bytes nv_padded = pad_bytes(*new_value, config_.value_size);
-        o_mov_bytes(hot_hit_i, wb_val, nv_padded);
-    }
-    Bytes wb_stored = wrap_value(wb_val, new_hot_meta);
-    wb_stored = pad_bytes(wb_stored, sv);
-
-    // Add back to stash (real or dummy).
-    hot_oram_->add_to_stash(
-        o_select_i(hot_hit_i, key, blk.key), new_hot_leaf, wb_stored);
-    hot_oram_->evict_one_path(use_leaf);
-
-    // Update directory leaf.
-    hot_dir_->update_pos(key, o_select_i(hot_hit_i, new_hot_leaf, INVALID_LEAF));
-
-    // Bump hot directory frequency (oblivious scan).
-    if (mcfg.enabled)
-        hot_dir_->bump_freq(key, current_epoch_);
 
     int dir_pages = (hot_dir_->capacity() * 20 + EnclaveOram::PAGE_SIZE - 1)
                   / EnclaveOram::PAGE_SIZE;
-    result.hot_pages = static_cast<uint64_t>(dir_pages) * 2
-                     + hot_oram_->last_stats().pages_touched;
 
-    // Obliviously select result from hot tier.
+    // In TM mode, cold queries can skip the hot ORAM entirely (tier
+    // membership is public). In FO mode, always access both tiers.
+    bool is_tm = (config_.mode == TeeSecurityMode::TierMembership);
+    bool skip_hot_oram = is_tm && (hot_hit_i == 0);
+
+    Bytes hot_val(config_.value_size, 0);
+    EpochMeta hot_meta{};
+
+    if (!skip_hot_oram) {
+        int new_hot_leaf = hot_oram_->random_leaf();
+        int dummy_leaf = hot_oram_->random_leaf();
+        int use_leaf = o_select_i(hot_hit_i, old_pos, dummy_leaf);
+
+        hot_oram_->read_path_to_stash(use_leaf);
+        Block blk = hot_oram_->extract_from_stash(
+            o_select_i(hot_hit_i, key, -2));
+
+        auto decoded = unwrap_value(blk.value);
+        hot_val = decoded.first;
+        hot_meta = decoded.second;
+
+        EpochMeta new_hot_meta = bump_epoch(hot_meta);
+
+        Bytes wb_val = pad_bytes(hot_val, config_.value_size);
+        if (new_value) {
+            Bytes nv_padded = pad_bytes(*new_value, config_.value_size);
+            o_mov_bytes(hot_hit_i, wb_val, nv_padded);
+        }
+        Bytes wb_stored = wrap_value(wb_val, new_hot_meta);
+        wb_stored = pad_bytes(wb_stored, sv);
+
+        hot_oram_->add_to_stash(
+            o_select_i(hot_hit_i, key, blk.key), new_hot_leaf, wb_stored);
+        hot_oram_->evict_one_path(use_leaf);
+
+        hot_dir_->update_pos(key, o_select_i(hot_hit_i, new_hot_leaf, INVALID_LEAF));
+    }
+
+    if (mcfg.enabled)
+        hot_dir_->bump_freq(key, current_epoch_);
+
+    result.hot_pages = static_cast<uint64_t>(dir_pages) * 2
+                     + (skip_hot_oram ? 0 : hot_oram_->last_stats().pages_touched);
+
     result.value.resize(config_.value_size, 0);
     Bytes padded_hot = pad_bytes(hot_val, config_.value_size);
     o_mov_bytes(hot_hit_i, result.value, padded_hot);
     result.found_in_hot = (hot_hit_i != 0);
 
-    // ── Early response ───────────────────────────────────────────────────
     if (early_cb)
         early_cb(result.value, result.found_in_hot);
 
     // ── Phase 2: Cold tier ───────────────────────────────────────────────
+    // In TM mode, tier membership is public. Hot queries skip the cold
+    // tier entirely; cold queries skip the hot ORAM (directory lookup
+    // above is always needed to determine membership).
+    // In FO mode, both tiers are always accessed (dummy when not needed).
     int cold_real = 1 - hot_hit_i;
+    bool skip_cold = is_tm && (hot_hit_i != 0);
 
-    // Build a value transform that bumps epoch in the cold OMAP node.
-    TeeAvlOmap::ValueTransform cold_transform = nullptr;
-    if (mcfg.enabled) {
-        cold_transform = [&](const Bytes& old_stored) -> Bytes {
-            auto [cv, cm] = unwrap_value(old_stored);
-            EpochMeta nm = bump_epoch(cm);
-            Bytes wv = pad_bytes(cv, config_.value_size);
-            if (new_value) {
-                Bytes nv_padded = pad_bytes(*new_value, config_.value_size);
-                o_mov_bytes(cold_real, wv, nv_padded);
-            }
-            return wrap_value(wv, nm);
-        };
+    Bytes cold_stored(stored_value_size(), 0);
+    EpochMeta cold_meta{};
+
+    if (!skip_cold) {
+        TeeAvlOmap::ValueTransform cold_transform = nullptr;
+        if (mcfg.enabled) {
+            cold_transform = [&](const Bytes& old_stored) -> Bytes {
+                auto [cv, cm] = unwrap_value(old_stored);
+                EpochMeta nm = bump_epoch(cm);
+                Bytes wv = pad_bytes(cv, config_.value_size);
+                if (new_value) {
+                    Bytes nv_padded = pad_bytes(*new_value, config_.value_size);
+                    o_mov_bytes(cold_real, wv, nv_padded);
+                }
+                return wrap_value(wv, nm);
+            };
+        }
+
+        const Bytes* cold_update = (!mcfg.enabled && new_value) ? new_value : nullptr;
+        cold_stored = cold_omap_->search_or_dummy(
+            key, cold_real != 0, cold_update, cold_transform);
+
+        auto decoded = unwrap_value(cold_stored);
+        cold_meta = decoded.second;
+
+        // Obliviously select result from cold tier.
+        Bytes padded_cold = pad_bytes(decoded.first, config_.value_size);
+        o_mov_bytes(cold_real, result.value, padded_cold);
     }
 
-    const Bytes* cold_update = (!mcfg.enabled && new_value) ? new_value : nullptr;
-    Bytes cold_stored = cold_omap_->search_or_dummy(
-        key, cold_real != 0, cold_update, cold_transform);
-
-    auto [cold_val, cold_meta] = unwrap_value(cold_stored);
-
-    // Obliviously select result from cold tier.
-    int use_cold = 1 - hot_hit_i;
-    Bytes padded_cold = pad_bytes(cold_val, config_.value_size);
-    o_mov_bytes(use_cold, result.value, padded_cold);
-
-    result.cold_up_pages = cold_omap_->last_stats().upper_pages;
-    result.cold_low_pages = cold_omap_->last_stats().lower_pages;
+    result.cold_up_pages = skip_cold ? 0 : cold_omap_->last_stats().upper_pages;
+    result.cold_low_pages = skip_cold ? 0 : cold_omap_->last_stats().lower_pages;
     result.total_pages = result.hot_pages + result.cold_up_pages
                        + result.cold_low_pages;
 
@@ -190,12 +203,13 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
 
     // ── Frequency tracking & maintenance ─────────────────────────────────
     if (mcfg.enabled) {
-        // Check promotion criteria for cold key.
         int cold_freq_ok = 1 - o_less(cold_meta.cnt, mcfg.promote_threshold);
-        int is_promo_candidate = use_cold & cold_freq_ok;
-        // Obliviously save promotion candidate.
+        int is_promo_candidate = cold_real & cold_freq_ok;
         o_mov_i(is_promo_candidate, pending_promo_key_, key);
-        Bytes pv = pad_bytes(cold_val, config_.value_size);
+        Bytes pv = pad_bytes(
+            skip_cold ? Bytes(config_.value_size, 0)
+                      : unwrap_value(cold_stored).first,
+            config_.value_size);
         o_mov_bytes(is_promo_candidate, pending_promo_val_, pv);
 
         ++access_counter_;

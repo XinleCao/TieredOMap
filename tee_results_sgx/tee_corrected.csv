@@ -1,0 +1,19 @@
+logN,config,hot_answer_us,avg_total_us,hit_pct,note
+14,flat_avl,52871,52799,,answer=total (no tiering)
+14,packed_FO,392,49130,74.5,answer=early_cb (hot tier time)
+14,packed_TM,380,12708,74.5,answer=total for hot queries
+16,flat_avl,81651,82631,,
+16,packed_FO,394,74860,66.5,
+16,packed_TM,382,29015,61.5,
+18,flat_avl,116904,116912,,
+18,packed_FO,399,106118,60.5,
+18,packed_TM,382,47922,54.5,
+20,flat_avl,163901,162508,,
+20,packed_FO,407,150522,55.0,
+20,packed_TM,389,75297,50.0,
+22,flat_avl,227073,227031,,
+22,packed_FO,432,207794,50.5,
+22,packed_TM,416,119369,42.5,
+24,flat_avl,303623,300339,,
+24,packed_FO,535,278673,44.0,
+24,packed_TM,514,172650,38.0,
