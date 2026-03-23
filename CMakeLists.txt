@@ -89,7 +89,13 @@ target_link_libraries(bench_paper PRIVATE tiered_omap)
 add_executable(bench_tee benchmark/bench_tee.cpp)
 target_link_libraries(bench_tee PRIVATE tiered_omap)
 
+add_executable(bench_tee_e2e benchmark/bench_tee_e2e.cpp)
+target_link_libraries(bench_tee_e2e PRIVATE tiered_omap)
+
 # ─── ORAM Server ─────────────────────────────────────────────────────────────
 
 add_executable(oram_server tools/oram_server.cpp)
 target_link_libraries(oram_server PRIVATE tiered_omap)
+
+add_executable(tee_server tools/tee_server_main.cpp)
+target_link_libraries(tee_server PRIVATE tiered_omap)

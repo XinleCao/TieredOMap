@@ -84,7 +84,7 @@ void PackedDirectory::bump_freq(int key, int current_epoch) {
 }
 
 int PackedDirectory::find_demote_candidate(int scan_idx, int current_epoch,
-                                           int staleness_epochs,
+                                           int staleness_windows,
                                            int demote_threshold) const {
     int result = INVALID_KEY;
     int cap = capacity_;
@@ -93,7 +93,7 @@ int PackedDirectory::find_demote_candidate(int scan_idx, int current_epoch,
         auto& e = entries_[idx];
         int is_real = 1 - o_equal(e.key, INVALID_KEY);
         int is_stale = is_real
-                     & (o_less(e.freq_epoch, current_epoch - staleness_epochs + 1)
+                     & (o_less(e.freq_epoch, current_epoch - staleness_windows + 1)
                         | o_equal(e.freq_epoch, 0));
         int is_cold = is_real & o_less(e.freq_count, demote_threshold);
         int should = is_stale | is_cold;

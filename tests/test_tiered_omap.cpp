@@ -265,10 +265,11 @@ TEST(DynamicMaintenance, EpochMetadataEncodeDecode) {
 
 TEST(DynamicMaintenance, MaintenanceManagerBasic) {
     MaintenanceConfig mcfg;
-    mcfg.epoch_length = 10;
+    mcfg.observation_window = 10;
+    mcfg.swap_interval = 10;
     mcfg.promote_threshold = 3;
     mcfg.demote_threshold = 1;
-    mcfg.staleness_epochs = 2;
+    mcfg.staleness_windows = 2;
     mcfg.enabled = true;
 
     MaintenanceManager mgr(mcfg);
@@ -281,7 +282,7 @@ TEST(DynamicMaintenance, MaintenanceManagerBasic) {
         stored = mgr.on_access(100, false, stored, should_promote);
     }
     EXPECT_EQ(stored.cnt, 5);
-    EXPECT_EQ(stored.ep, 1);
+    EXPECT_EQ(stored.ep, 0);  // still within first observation window (5 < B_obs)
 
     // The key should have been promoted (prev_freq >= threshold on epoch change).
     // But we need to cross an epoch boundary for prev_freq to be set.
@@ -290,8 +291,8 @@ TEST(DynamicMaintenance, MaintenanceManagerBasic) {
     for (int i = 0; i < 5; ++i) {
         dummy = mgr.on_access(200, true, dummy, should_promote);
     }
-    // Now epoch should have advanced.
-    EXPECT_EQ(mgr.current_epoch(), 2);
+    // Now observation epoch should have advanced (10 accesses / B_obs = 1).
+    EXPECT_EQ(mgr.obs_epoch(), 1);
 
     // Access key 100 again in new epoch.
     stored = mgr.on_access(100, false, stored, should_promote);
@@ -306,10 +307,11 @@ TEST(DynamicMaintenance, PromoteColdKey) {
     cfg.hot_set_size = n;
     cfg.mode = SecurityMode::FullOblivious;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.observation_window = 16;
+    cfg.maintenance.swap_interval = 16;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -337,10 +339,11 @@ TEST(DynamicMaintenance, DemoteStaleKey) {
     cfg.hot_set_size = n;
     cfg.mode = SecurityMode::FullOblivious;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 100;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -370,10 +373,11 @@ TEST(DynamicMaintenance, BPlusPhysicalPromotion) {
     cfg.backend = OmapBackend::BPlus;
     cfg.bplus_order = 4;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.observation_window = 16;
+    cfg.maintenance.swap_interval = 16;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -406,10 +410,11 @@ TEST(DynamicMaintenance, BPlusPhysicalDemotion) {
     cfg.backend = OmapBackend::BPlus;
     cfg.bplus_order = 4;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 100;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -440,10 +445,11 @@ TEST(DynamicMaintenance, BPlusPhysicalRoundTrip) {
     cfg.backend = OmapBackend::BPlus;
     cfg.bplus_order = 4;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -481,10 +487,11 @@ TEST(Piggyback, BPlusDemotionZeroExtraRounds) {
     cfg.backend = OmapBackend::BPlus;
     cfg.bplus_order = 4;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 100;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
     cfg.maintenance.piggyback = true;
 
     TieredOMap tmap(cfg);
@@ -516,10 +523,11 @@ TEST(Piggyback, BPlusValuesPreservedAfterDemotion) {
     cfg.backend = OmapBackend::BPlus;
     cfg.bplus_order = 4;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 100;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
     cfg.maintenance.piggyback = true;
 
     TieredOMap tmap(cfg);
@@ -550,10 +558,11 @@ TEST(Piggyback, StandaloneVsPiggybackConsistency) {
         cfg.backend = OmapBackend::BPlus;
         cfg.bplus_order = 4;
         cfg.maintenance.enabled = true;
-        cfg.maintenance.epoch_length = 8;
+        cfg.maintenance.observation_window = 8;
+        cfg.maintenance.swap_interval = 8;
         cfg.maintenance.promote_threshold = 100;
         cfg.maintenance.demote_threshold = 1;
-        cfg.maintenance.staleness_epochs = 2;
+        cfg.maintenance.staleness_windows = 2;
         cfg.maintenance.piggyback = piggyback;
 
         TieredOMap tmap(cfg);
@@ -591,10 +600,11 @@ TEST(DynamicMaintenance, AVLPhysicalPromotion) {
     cfg.mode = SecurityMode::FullOblivious;
     cfg.backend = OmapBackend::AVL;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.observation_window = 16;
+    cfg.maintenance.swap_interval = 16;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -626,10 +636,11 @@ TEST(DynamicMaintenance, AVLPhysicalDemotion) {
     cfg.mode = SecurityMode::FullOblivious;
     cfg.backend = OmapBackend::AVL;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 100;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -659,10 +670,11 @@ TEST(DynamicMaintenance, AVLPhysicalRoundTrip) {
     cfg.mode = SecurityMode::FullOblivious;
     cfg.backend = OmapBackend::AVL;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 8;
+    cfg.maintenance.observation_window = 8;
+    cfg.maintenance.swap_interval = 8;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -693,10 +705,11 @@ TEST(DynamicMaintenance, ValuesPreservedWithEpoch) {
     cfg.hot_set_size = n;
     cfg.mode = SecurityMode::FullOblivious;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.observation_window = 16;
+    cfg.maintenance.swap_interval = 16;
     cfg.maintenance.promote_threshold = 100;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 100;
+    cfg.maintenance.staleness_windows = 100;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);

@@ -1,9 +1,9 @@
 [libos]
-entrypoint = "/bench_tee"
+entrypoint = "/tee_server"
 
 [loader]
 log_level = "error"
-argv = ["/bench_tee", "--min_logN", "24", "--max_logN", "24", "--n", "1024", "--val", "256", "--Q", "200", "--s", "1.0", "--outdir", "/root/TieredOMap/tee_results_sgx"]
+argv = ["/tee_server", "--min_logN", "14", "--max_logN", "22", "--n", "1024", "--val", "256", "--port", "12345"]
 
 [loader.env]
 LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
@@ -21,22 +21,12 @@ path = "/usr/lib/x86_64-linux-gnu"
 uri = "file:/usr/lib/x86_64-linux-gnu"
 
 [[fs.mounts]]
-path = "/bench_tee"
-uri = "file:/root/TieredOMap/build/bench_tee"
-
-[[fs.mounts]]
-path = "/root/TieredOMap/tee_results_sgx"
-uri = "file:/root/TieredOMap/tee_results_sgx"
-type = "chroot"
+path = "/tee_server"
+uri = "file:/root/TieredOMap/build/tee_server"
 
 [[fs.mounts]]
 path = "/etc"
 uri = "file:/etc"
-
-[[fs.mounts]]
-path = "/tmp"
-uri = "file:/tmp"
-type = "chroot"
 
 [sgx]
 enclave_size = "64G"
@@ -44,7 +34,7 @@ max_threads = 4
 debug = false
 edmm_enable = false
 trusted_files = [
-    "file:/root/TieredOMap/build/bench_tee",
+    "file:/root/TieredOMap/build/tee_server",
     "file:{{ gramine.libos }}",
     "file:{{ gramine.runtimedir() }}/",
     "file:/lib/x86_64-linux-gnu/libcrypto.so.3",
@@ -53,10 +43,6 @@ trusted_files = [
     "file:/lib/x86_64-linux-gnu/libgcc_s.so.1",
     "file:/lib/x86_64-linux-gnu/libc.so.6",
     "file:/lib64/ld-linux-x86-64.so.2",
-]
-allowed_files = [
-    "file:/root/TieredOMap/tee_results_sgx/",
-    "file:/tmp/",
 ]
 
 [sys]

@@ -383,10 +383,11 @@ TEST(TeeOmap, MaintenanceConvergence) {
     cfg.mode = TeeSecurityMode::TierMembership;
     cfg.use_split_oram = false;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.observation_window = 16;
+    cfg.maintenance.swap_interval = 16;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TeeOmap omap(cfg);
 
@@ -405,7 +406,7 @@ TEST(TeeOmap, MaintenanceConvergence) {
     // promote_threshold=3), hit hot keys 4..7 to keep them alive.
     // Never access hot keys 0..3 → they go stale and get demoted.
     for (int epoch = 0; epoch < 12; ++epoch) {
-        for (int i = 0; i < cfg.maintenance.epoch_length; ++i) {
+        for (int i = 0; i < cfg.maintenance.swap_interval; ++i) {
             int key;
             if (i % 4 < 3)
                 key = 24 + (i / 4) % 4;   // cold keys 24..27 (3 out of 4 slots)
@@ -444,10 +445,11 @@ TEST(TeeOmap, MaintenanceFullOblivious) {
     cfg.mode = TeeSecurityMode::FullOblivious;
     cfg.use_split_oram = false;
     cfg.maintenance.enabled = true;
-    cfg.maintenance.epoch_length = 16;
+    cfg.maintenance.observation_window = 16;
+    cfg.maintenance.swap_interval = 16;
     cfg.maintenance.promote_threshold = 3;
     cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_epochs = 2;
+    cfg.maintenance.staleness_windows = 2;
 
     TeeOmap omap(cfg);
 
@@ -459,7 +461,7 @@ TEST(TeeOmap, MaintenanceFullOblivious) {
 
     // Run workload.
     for (int epoch = 0; epoch < 8; ++epoch) {
-        for (int i = 0; i < cfg.maintenance.epoch_length; ++i) {
+        for (int i = 0; i < cfg.maintenance.swap_interval; ++i) {
             int key = (i % 2 == 0) ? (24 + i % 8) : (4 + i % 4);
             EXPECT_NO_THROW(omap.access(key));
         }

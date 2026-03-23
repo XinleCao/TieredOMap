@@ -54,7 +54,7 @@ public:
     // Returns INVALID_KEY if no demotion warranted.
     // Always performs a full scan regardless of result.
     int find_demote_candidate(int scan_idx, int current_epoch,
-                              int staleness_epochs, int demote_threshold) const;
+                              int staleness_windows, int demote_threshold) const;
 
     int capacity() const { return capacity_; }
     int size() const { return count_; }

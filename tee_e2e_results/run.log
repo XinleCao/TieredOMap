@@ -1,0 +1,176 @@
+[2026-03-23 02:34:21] === TEE E2E Benchmark (direct TCP, port 12345) ===
+[2026-03-23 02:34:21] TEE server: 47.94.113.65  logN range: 14..22
+[2026-03-23 02:34:21] 
+[2026-03-23 02:34:21] >>> logN=14  N=16384  n=1024
+[2026-03-23 02:34:22] Preparing SGX manifest for logN=14...
+    0000000000010000-0000000fffe3d000 [REG:RWX] (free)
+Measurement:
+    f1078a597c08bc0d03698cacb0b056cba3577d0907d4073c21a55a078075f39b
+Manifest signed
+[2026-03-23 02:34:32] Launching SGX enclave...
+[2026-03-23 02:34:33] Waiting for server to finish OMAP init...
+[2026-03-23 02:35:37]   Server ready after 60s!
+[2026-03-23 02:35:37] Running benchmark Q=200 queries (direct TCP to 47.94.113.65:12345)...
+
+=== logN=14 N=16384 n=1024 ===
+Connecting to 47.94.113.65:12345...
+Connected.
+Warmup done. Running 200 queries...
+  q=0  early=37.63ms  total=86.99ms  cold
+  q=1  early=38.00ms  total=38.01ms  HOT
+  q=2  early=38.03ms  total=38.04ms  HOT
+  q=50  early=37.98ms  total=38.04ms  HOT
+  q=100  early=37.96ms  total=38.01ms  HOT
+  q=150  early=37.94ms  total=37.99ms  HOT
+
+--- logN=14 Results ---
+  hit%=76.0
+  avg_hot_early=37.99 ms  (n=152)
+  avg_cold_total=86.99 ms  (n=48)
+  avg_all_total=52.21 ms
+Saved to /home/ubuntu/tee_e2e_results/tee_e2e.csv
+
+=== All done ===
+[2026-03-23 02:35:52] Benchmark succeeded for logN=14
+[2026-03-23 02:35:53] Sleeping 5s before next logN...
+[2026-03-23 02:35:58] 
+[2026-03-23 02:35:58] >>> logN=16  N=65536  n=1024
+[2026-03-23 02:35:59] Preparing SGX manifest for logN=16...
+    0000000000010000-0000000fffe3d000 [REG:RWX] (free)
+Measurement:
+    9dc5622f78fc512f30fbdb9da3bc84443872d67c50c10a4c0451f61a73133683
+Manifest signed
+[2026-03-23 02:36:09] Launching SGX enclave...
+[2026-03-23 02:36:10] Waiting for server to finish OMAP init...
+[2026-03-23 02:37:14]   Server ready after 60s!
+[2026-03-23 02:37:14] Running benchmark Q=200 queries (direct TCP to 47.94.113.65:12345)...
+
+=== logN=16 N=65536 n=1024 ===
+Connecting to 47.94.113.65:12345...
+Connected.
+Warmup done. Running 200 queries...
+  q=0  early=39.69ms  total=115.04ms  cold
+  q=1  early=40.10ms  total=49.67ms  HOT
+  q=2  early=40.09ms  total=40.11ms  HOT
+  q=50  early=40.02ms  total=49.64ms  HOT
+  q=100  early=40.04ms  total=40.09ms  HOT
+  q=150  early=40.09ms  total=49.66ms  HOT
+
+--- logN=16 Results ---
+  hit%=69.0
+  avg_hot_early=40.06 ms  (n=138)
+  avg_cold_total=114.78 ms  (n=62)
+  avg_all_total=69.12 ms
+Saved to /home/ubuntu/tee_e2e_results/tee_e2e.csv
+
+=== All done ===
+[2026-03-23 02:37:32] Benchmark succeeded for logN=16
+[2026-03-23 02:37:34] Sleeping 5s before next logN...
+[2026-03-23 02:37:39] 
+[2026-03-23 02:37:39] >>> logN=18  N=262144  n=1024
+[2026-03-23 02:37:40] Preparing SGX manifest for logN=18...
+    0000000000010000-0000000fffe3d000 [REG:RWX] (free)
+Measurement:
+    faee5eaa31b6009c7d4326d5d38a095d0848516bedac2a42f79bdc507c7185a7
+Manifest signed
+[2026-03-23 02:37:50] Launching SGX enclave...
+[2026-03-23 02:37:50] Waiting for server to finish OMAP init...
+[2026-03-23 02:38:55]   Server ready after 60s!
+[2026-03-23 02:38:55] Running benchmark Q=200 queries (direct TCP to 47.94.113.65:12345)...
+
+=== logN=18 N=262144 n=1024 ===
+Connecting to 47.94.113.65:12345...
+Connected.
+Warmup done. Running 200 queries...
+  q=0  early=39.68ms  total=145.27ms  cold
+  q=1  early=40.05ms  total=49.68ms  HOT
+  q=2  early=40.03ms  total=40.03ms  HOT
+  q=50  early=40.07ms  total=49.68ms  HOT
+  q=100  early=40.01ms  total=49.63ms  HOT
+  q=150  early=40.02ms  total=49.65ms  HOT
+
+--- logN=18 Results ---
+  hit%=61.5
+  avg_hot_early=40.05 ms  (n=123)
+  avg_cold_total=145.84 ms  (n=77)
+  avg_all_total=84.96 ms
+Saved to /home/ubuntu/tee_e2e_results/tee_e2e.csv
+
+=== All done ===
+[2026-03-23 02:39:17] Benchmark succeeded for logN=18
+[2026-03-23 02:39:18] Sleeping 5s before next logN...
+[2026-03-23 02:39:23] 
+[2026-03-23 02:39:23] >>> logN=20  N=1048576  n=1024
+[2026-03-23 02:39:24] Preparing SGX manifest for logN=20...
+    0000000000010000-0000000fffe3d000 [REG:RWX] (free)
+Measurement:
+    30c2d74231dd558804badb974768917688ee0eab2cc4c8b0183ed5f46d8cad3d
+Manifest signed
+[2026-03-23 02:39:34] Launching SGX enclave...
+[2026-03-23 02:39:35] Waiting for server to finish OMAP init...
+[2026-03-23 02:40:50]   Server ready after 70s!
+[2026-03-23 02:40:50] Running benchmark Q=200 queries (direct TCP to 47.94.113.65:12345)...
+
+=== logN=20 N=1048576 n=1024 ===
+Connecting to 47.94.113.65:12345...
+Connected.
+Warmup done. Running 200 queries...
+  q=0  early=41.31ms  total=191.84ms  cold
+  q=1  early=41.68ms  total=41.69ms  HOT
+  q=2  early=41.68ms  total=51.31ms  HOT
+  q=50  early=41.69ms  total=41.70ms  HOT
+  q=100  early=41.74ms  total=51.29ms  HOT
+  q=150  early=41.69ms  total=41.72ms  HOT
+
+--- logN=20 Results ---
+  hit%=57.5
+  avg_hot_early=41.70 ms  (n=115)
+  avg_cold_total=192.35 ms  (n=85)
+  avg_all_total=108.37 ms
+Saved to /home/ubuntu/tee_e2e_results/tee_e2e.csv
+
+=== All done ===
+[2026-03-23 02:41:17] Benchmark succeeded for logN=20
+[2026-03-23 02:41:18] Sleeping 5s before next logN...
+[2026-03-23 02:41:23] 
+[2026-03-23 02:41:23] >>> logN=22  N=4194304  n=1024
+[2026-03-23 02:41:24] Preparing SGX manifest for logN=22...
+    0000000000010000-0000000fffe3d000 [REG:RWX] (free)
+Measurement:
+    638e7db9668cd90bb60a181c5b3184a32759e4e2a33afbd64b012ce894102ed1
+Manifest signed
+[2026-03-23 02:41:34] Launching SGX enclave...
+[2026-03-23 02:41:35] Waiting for server to finish OMAP init...
+[2026-03-23 02:43:11]   Server ready after 90s!
+[2026-03-23 02:43:11] Running benchmark Q=200 queries (direct TCP to 47.94.113.65:12345)...
+
+=== logN=22 N=4194304 n=1024 ===
+Connecting to 47.94.113.65:12345...
+Connected.
+Warmup done. Running 200 queries...
+  q=0  early=39.79ms  total=246.99ms  cold
+  q=1  early=40.18ms  total=40.25ms  HOT
+  q=2  early=40.24ms  total=40.25ms  HOT
+  q=50  early=40.19ms  total=40.20ms  HOT
+  q=100  early=40.21ms  total=40.22ms  HOT
+  q=150  early=39.77ms  total=248.57ms  cold
+
+--- logN=22 Results ---
+  hit%=52.5
+  avg_hot_early=40.20 ms  (n=105)
+  avg_cold_total=248.04 ms  (n=95)
+  avg_all_total=141.42 ms
+Saved to /home/ubuntu/tee_e2e_results/tee_e2e.csv
+
+=== All done ===
+[2026-03-23 02:43:46] Benchmark succeeded for logN=22
+[2026-03-23 02:43:47] Sleeping 5s before next logN...
+[2026-03-23 02:43:52] 
+[2026-03-23 02:43:52] === ALL DONE ===
+[2026-03-23 02:43:52] Results:
+logN,N,n,avg_hot_early_ms,avg_cold_total_ms,avg_all_ms,hit_pct
+14,16384,1024,37.99,86.99,52.21,76.0
+16,65536,1024,40.06,114.78,69.12,69.0
+18,262144,1024,40.05,145.84,84.96,61.5
+20,1048576,1024,41.70,192.35,108.37,57.5
+22,4194304,1024,40.20,248.04,141.42,52.5

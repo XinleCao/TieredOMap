@@ -345,22 +345,22 @@ static void exp_bandwidth(const Cfg& cfg) {
         int N = 1 << logN;
         int n = std::min(cfg.n, N / 2);
 
-        {
+            {
             std::string tag = "logN=" + std::to_string(logN) + " standalone";
-            g_progress.config(tag);
-            auto omap = setup_standalone(cfg, be, N);
-            ZipfSampler z(N, cfg.s, 42);
-            for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
-            double bw = 0, rnd = 0;
-            for (int i = 0; i < cfg.Q; ++i) {
-                omap->search(z.sample());
-                bw += omap->last_stats().total_bytes();
-                rnd += omap->last_stats().rounds;
-                g_progress.query_tick(i, cfg.Q);
-            }
-            bw /= cfg.Q; rnd /= cfg.Q;
+                g_progress.config(tag);
+                auto omap = setup_standalone(cfg, be, N);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+                double bw = 0, rnd = 0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    omap->search(z.sample());
+                    bw += omap->last_stats().total_bytes();
+                    rnd += omap->last_stats().rounds;
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                bw /= cfg.Q; rnd /= cfg.Q;
             csv << logN << ",standalone,"
-                << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                    << std::fixed << std::setprecision(2) << bw / 1024 << ","
                 << std::setprecision(1) << rnd << "," << rnd << ",\n";
             std::ostringstream ss;
             ss << (int)(bw/1024) << "KB " << (int)rnd << "rnd";
@@ -384,39 +384,39 @@ static void exp_bandwidth(const Cfg& cfg) {
             csv << logN << ",fair,"
                 << std::fixed << std::setprecision(2) << bw / 1024 << ","
                 << std::setprecision(1) << rnd << "," << rnd << ",\n";
-            std::ostringstream ss;
-            ss << (int)(bw/1024) << "KB " << (int)rnd << "rnd";
-            g_progress.config_done(ss.str());
-        }
+                std::ostringstream ss;
+                ss << (int)(bw/1024) << "KB " << (int)rnd << "rnd";
+                g_progress.config_done(ss.str());
+            }
 
-        {
+            {
             std::string tag = "logN=" + std::to_string(logN) + " TM+split";
-            g_progress.config(tag);
+                g_progress.config(tag);
             auto tm = setup_tiered(cfg, be, N, n,
                                    SecurityMode::TierMembership, true);
-            ZipfSampler z(N, cfg.s, 42);
-            for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
-            double bw = 0, rnd = 0, ans = 0;
-            int hot_cnt = 0;
-            for (int i = 0; i < cfg.Q; ++i) {
-                auto r = tm->access(z.sample());
-                bw += r.total_bw.total_bytes();
-                rnd += r.total_bw.rounds;
-                ans += r.rounds_to_answer;
-                if (r.found_in_hot) ++hot_cnt;
-                g_progress.query_tick(i, cfg.Q);
-            }
-            bw /= cfg.Q; rnd /= cfg.Q; ans /= cfg.Q;
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+                double bw = 0, rnd = 0, ans = 0;
+                int hot_cnt = 0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    auto r = tm->access(z.sample());
+                    bw += r.total_bw.total_bytes();
+                    rnd += r.total_bw.rounds;
+                    ans += r.rounds_to_answer;
+                    if (r.found_in_hot) ++hot_cnt;
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                bw /= cfg.Q; rnd /= cfg.Q; ans /= cfg.Q;
             double hit = 100.0 * hot_cnt / cfg.Q;
             csv << logN << ",TM_split,"
-                << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                    << std::fixed << std::setprecision(2) << bw / 1024 << ","
                 << std::setprecision(1) << rnd << "," << ans << ","
                 << hit << "\n";
-            std::ostringstream ss;
-            ss << (int)(bw/1024) << "KB " << (int)rnd << "rnd  ans="
-               << std::fixed << std::setprecision(1) << ans
+                std::ostringstream ss;
+                ss << (int)(bw/1024) << "KB " << (int)rnd << "rnd  ans="
+                   << std::fixed << std::setprecision(1) << ans
                << " hit=" << (int)hit << "%";
-            g_progress.config_done(ss.str());
+                g_progress.config_done(ss.str());
         }
     }
     csv.close();
@@ -648,72 +648,72 @@ static void exp_latency(const Cfg& cfg) {
         int n = std::min(cfg.n, N / 2);
         std::cout << "\n  --- logN=" << logN << " (N=" << N << ", n=" << n << ") ---\n";
 
-        for (auto& [label, be] : ALL_BACKENDS) {
-            double bl_ms, bl_rnd;
-            {
+    for (auto& [label, be] : ALL_BACKENDS) {
+        double bl_ms, bl_rnd;
+        {
                 g_progress.config("logN=" + std::to_string(logN) + " "
                                   + label + " standalone");
-                auto omap = setup_standalone(cfg, be, N);
-                ZipfSampler z(N, cfg.s, 42);
-                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
-                double total_us = 0, rnd = 0;
-                for (int i = 0; i < cfg.Q; ++i) {
-                    auto t0 = Clock::now();
-                    omap->search(z.sample());
-                    total_us += std::chrono::duration<double, std::micro>(
-                        Clock::now() - t0).count();
-                    rnd += omap->last_stats().rounds;
-                    g_progress.query_tick(i, cfg.Q);
-                }
-                bl_ms = total_us / cfg.Q / 1000.0;
-                bl_rnd = rnd / cfg.Q;
+            auto omap = setup_standalone(cfg, be, N);
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+            double total_us = 0, rnd = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto t0 = Clock::now();
+                omap->search(z.sample());
+                total_us += std::chrono::duration<double, std::micro>(
+                    Clock::now() - t0).count();
+                rnd += omap->last_stats().rounds;
+                g_progress.query_tick(i, cfg.Q);
+            }
+            bl_ms = total_us / cfg.Q / 1000.0;
+            bl_rnd = rnd / cfg.Q;
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(1)
                    << bl_ms << "ms " << (int)bl_rnd << "rnd";
                 g_progress.config_done(ss.str());
-            }
+        }
 
-            double tm_ms, tm_ans_ms, tm_rnd, tm_ans_rnd;
-            int hot_cnt = 0;
-            {
+        double tm_ms, tm_ans_ms, tm_rnd, tm_ans_rnd;
+        int hot_cnt = 0;
+        {
                 g_progress.config("logN=" + std::to_string(logN) + " "
                                   + label + " TM+split");
                 auto tm = setup_tiered(cfg, be, N, n,
                                        SecurityMode::TierMembership, true);
-                ZipfSampler z(N, cfg.s, 42);
-                for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
-                double total_us = 0, ans_us = 0, rnd = 0, ans_rnd = 0;
-                for (int i = 0; i < cfg.Q; ++i) {
-                    auto t0 = Clock::now();
-                    auto r = tm->access(z.sample());
-                    double elapsed = std::chrono::duration<double, std::micro>(
-                        Clock::now() - t0).count();
-                    total_us += elapsed;
-                    rnd += r.total_bw.rounds;
-                    ans_rnd += r.rounds_to_answer;
-                    if (r.found_in_hot) ++hot_cnt;
-                    double ans_frac = (r.total_bw.rounds > 0)
-                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
-                    ans_us += elapsed * ans_frac;
-                    g_progress.query_tick(i, cfg.Q);
-                }
-                tm_ms = total_us / cfg.Q / 1000.0;
-                tm_ans_ms = ans_us / cfg.Q / 1000.0;
-                tm_rnd = rnd / cfg.Q;
-                tm_ans_rnd = ans_rnd / cfg.Q;
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+            double total_us = 0, ans_us = 0, rnd = 0, ans_rnd = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto t0 = Clock::now();
+                auto r = tm->access(z.sample());
+                double elapsed = std::chrono::duration<double, std::micro>(
+                    Clock::now() - t0).count();
+                total_us += elapsed;
+                rnd += r.total_bw.rounds;
+                ans_rnd += r.rounds_to_answer;
+                if (r.found_in_hot) ++hot_cnt;
+                double ans_frac = (r.total_bw.rounds > 0)
+                    ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                ans_us += elapsed * ans_frac;
+                g_progress.query_tick(i, cfg.Q);
+            }
+            tm_ms = total_us / cfg.Q / 1000.0;
+            tm_ans_ms = ans_us / cfg.Q / 1000.0;
+            tm_rnd = rnd / cfg.Q;
+            tm_ans_rnd = ans_rnd / cfg.Q;
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(1)
                    << tm_ans_ms << "ms(hot) " << tm_ms << "ms(total)";
                 g_progress.config_done(ss.str());
-            }
+        }
 
-            double hit_pct = 100.0 * hot_cnt / cfg.Q;
-            double expected_ms = tm_ans_ms * hit_pct / 100.0
-                               + tm_ms * (1.0 - hit_pct / 100.0);
+        double hit_pct = 100.0 * hot_cnt / cfg.Q;
+        double expected_ms = tm_ans_ms * hit_pct / 100.0
+                           + tm_ms * (1.0 - hit_pct / 100.0);
 
             csv << logN << "," << label << ",standalone,"
                 << std::fixed << std::setprecision(1)
-                << bl_ms << ",," << bl_rnd << ",,\n";
+            << bl_ms << ",," << bl_rnd << ",,\n";
             csv << logN << "," << label << ",tiered," << tm_ms << ","
                 << tm_ans_ms << "," << tm_rnd << "," << tm_ans_rnd << ","
                 << hit_pct << "\n";
@@ -748,9 +748,9 @@ static void exp_throughput(const Cfg& cfg) {
             {
                 g_progress.config("logN=" + std::to_string(logN)
                                   + " " + label + " standalone");
-                auto omap = setup_standalone(cfg, be, N);
-                ZipfSampler z(N, cfg.s, 42);
-                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+            auto omap = setup_standalone(cfg, be, N);
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
                 auto t0 = Clock::now();
                 for (int i = 0; i < cfg.Q; ++i) omap->search(z.sample());
                 double elapsed_us = std::chrono::duration<double, std::micro>(
@@ -796,41 +796,85 @@ static void exp_throughput(const Cfg& cfg) {
 // Paper: AVL backend, TM+split, sweep Zipf s
 // ═══════════════════════════════════════════════════════════════════════════
 
-static void exp_skewness(const Cfg& cfg) {
-    std::cout << "\n=== Exp: Skewness Effect (AVL, TM+split) ===\n";
-    ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/skewness.csv");
-    csv << "zipf_s,avg_answer_rnd,avg_bw_KB,hit_pct\n";
+static void run_skewness_backend(const Cfg& cfg, OmapBackend be,
+                                 const char* be_label, const char* file_tag) {
+    int N = 1 << cfg.max_logN;
+    std::string fname = std::string(file_tag) + ".csv";
+    std::ofstream csv(cfg.outdir + "/" + fname);
+    csv << "zipf_s,log_n,hit_pct,base_rnd,avg_ans_rnd,hot_ans_rnd,"
+        << "avg_red_pct,hot_red_pct,avg_bw_KB,base_bw_KB\n";
 
-    int N = 1 << 16;
-    int n = cfg.n;
-    OmapBackend be = OmapBackend::AVL;
-
-    for (double s : {0.5, 0.7, 0.9, 1.0, 1.1, 1.3, 1.5}) {
-        g_progress.config("s=" + std::to_string(s));
-        auto tm = setup_tiered(cfg, be, N, n,
-                               SecurityMode::TierMembership, true);
-        ZipfSampler z(N, s, 42);
-        for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
-        double ans = 0, bw = 0; int hot = 0;
+    double base_rnd = 0, base_bw = 0;
+    {
+        g_progress.config(std::string(be_label) + " baseline N=" +
+                          std::to_string(N));
+        auto omap = setup_standalone(cfg, be, N);
+        ZipfSampler z(N, 1.0, 42);
+        for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
         for (int i = 0; i < cfg.Q; ++i) {
-            auto r = tm->access(z.sample());
-            ans += r.rounds_to_answer;
-            bw += r.total_bw.total_bytes();
-            if (r.found_in_hot) ++hot;
+            omap->search(z.sample());
+            base_rnd += omap->last_stats().rounds;
+            base_bw += omap->last_stats().total_bytes();
         }
-        ans /= cfg.Q; bw /= cfg.Q;
-        double hit = 100.0 * hot / cfg.Q;
-        csv << s << "," << std::fixed
-            << std::setprecision(2) << ans << ","
-            << bw / 1024 << "," << hit << "\n";
-        std::ostringstream ss;
-        ss << "ans=" << std::fixed << std::setprecision(1) << ans
-           << " hit=" << (int)hit << "%";
-        g_progress.config_done(ss.str());
+        base_rnd /= cfg.Q; base_bw /= cfg.Q;
+        g_progress.config_done(
+            "rnd=" + std::to_string((int)base_rnd) + " bw=" +
+            std::to_string((int)(base_bw/1024)) + "KB");
+    }
+
+    std::vector<int> n_vals = {1024, 4096, 16384};
+    std::vector<double> s_vals = {0.5, 0.7, 0.9, 1.0, 1.1, 1.3, 1.5};
+
+    for (int n : n_vals) {
+        int log_n = (int)std::round(std::log2(n));
+        for (double s : s_vals) {
+            std::string tag = std::string(be_label) + " n=2^" +
+                std::to_string(log_n) + " s=" + std::to_string(s).substr(0,3);
+            g_progress.config(tag);
+            auto tm = setup_tiered(cfg, be, N, n,
+                                   SecurityMode::TierMembership, true);
+            ZipfSampler z(N, s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+            double avg_ans = 0, hot_ans = 0, avg_bw = 0;
+            int hot_cnt = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto r = tm->access(z.sample());
+                avg_ans += r.rounds_to_answer;
+                avg_bw += r.total_bw.total_bytes();
+                if (r.found_in_hot) {
+                    hot_ans += r.rounds_to_answer;
+                    ++hot_cnt;
+                }
+                g_progress.query_tick(i, cfg.Q);
+            }
+            avg_ans /= cfg.Q; avg_bw /= cfg.Q;
+            double hit_pct = 100.0 * hot_cnt / cfg.Q;
+            double hot_avg = (hot_cnt > 0) ? hot_ans / hot_cnt : 0;
+            double avg_red = base_rnd > 0
+                ? (base_rnd - avg_ans) / base_rnd * 100 : 0;
+            double hot_red = (base_rnd > 0 && hot_cnt > 0)
+                ? (base_rnd - hot_avg) / base_rnd * 100 : 0;
+            csv << std::fixed << std::setprecision(2) << s << ","
+                << log_n << "," << hit_pct << "," << base_rnd << ","
+                << avg_ans << "," << hot_avg << ","
+                << avg_red << "," << hot_red << ","
+                << avg_bw/1024 << "," << base_bw/1024 << "\n";
+            csv.flush();
+            g_progress.config_done(
+                "avg_red=" + std::to_string((int)avg_red) + "% hot_red=" +
+                std::to_string((int)hot_red) + "%");
+        }
     }
     csv.close();
-    std::cout << "  -> " << cfg.outdir << "/skewness.csv\n";
+    std::cout << "  -> " << cfg.outdir << "/" << fname << "\n";
+}
+
+static void exp_skewness(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Skewness + Hot-Set Size Effect ===\n";
+    ensure_dir(cfg.outdir);
+    run_skewness_backend(cfg, OmapBackend::AVL, "AVL", "skewness");
+    run_skewness_backend(cfg, OmapBackend::BPlus, "BPlus", "skewness_bplus");
+    run_skewness_backend(cfg, OmapBackend::DaBplus, "DaBplus", "skewness_dabplus");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -839,54 +883,61 @@ static void exp_skewness(const Cfg& cfg) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 static void exp_hotsize(const Cfg& cfg) {
-    std::cout << "\n=== Exp: Hot-Set Size (AVL, FO+split) ===\n";
+    std::cout << "\n=== Exp: Hot-Set Size (AVL, TM+split) ===\n";
     ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/hotsize.csv");
-    csv << "log_n,avg_answer_rnd,avg_total_bw_KB\n";
-
-    int N = 1 << 16;
+    int N = 1 << cfg.max_logN;
     OmapBackend be = OmapBackend::AVL;
 
-    // Also record standalone baseline
+    double base_rnd = 0;
     {
-        g_progress.config("standalone baseline");
+        g_progress.config("AVL baseline N=" + std::to_string(N));
         auto omap = setup_standalone(cfg, be, N);
-        ZipfSampler z(N, cfg.s, 42);
+        ZipfSampler z(N, 1.0, 42);
         for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
-        double bw = 0, rnd = 0;
         for (int i = 0; i < cfg.Q; ++i) {
             omap->search(z.sample());
-            bw += omap->last_stats().total_bytes();
-            rnd += omap->last_stats().rounds;
+            base_rnd += omap->last_stats().rounds;
         }
-        bw /= cfg.Q; rnd /= cfg.Q;
-        csv << "0," << std::fixed << std::setprecision(2) << rnd << ","
-            << bw / 1024 << "\n";
-        std::ostringstream ss;
-        ss << (int)(bw/1024) << "KB " << (int)rnd << "rnd";
-        g_progress.config_done(ss.str());
+        base_rnd /= cfg.Q;
+        g_progress.config_done("rnd=" + std::to_string((int)base_rnd));
     }
 
-    for (int log_n : {4, 6, 8, 10, 12}) {
-        int n = 1 << log_n;
-        g_progress.config("n=2^" + std::to_string(log_n));
-        auto tm = setup_tiered(cfg, be, N, n,
-                               SecurityMode::FullOblivious, true);
-        ZipfSampler z(N, cfg.s, 42);
-        for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
-        double ans = 0, bw = 0;
-        for (int i = 0; i < cfg.Q; ++i) {
-            auto r = tm->access(z.sample());
-            ans += r.rounds_to_answer;
-            bw += r.total_bw.total_bytes();
+    std::ofstream csv(cfg.outdir + "/hotsize.csv");
+    csv << "zipf_s,log_n,base_rnd,avg_ans_rnd,avg_red_pct,hit_pct\n";
+
+    std::vector<double> s_vals = {0.9, 1.0, 1.3};
+    std::vector<int> log_n_vals = {6, 8, 10, 12, 14, 16};
+
+    for (double s : s_vals) {
+        for (int log_n : log_n_vals) {
+            int n = 1 << log_n;
+            if (n >= N / 2) continue;
+            std::string tag = "s=" + std::to_string(s).substr(0,3)
+                + " n=2^" + std::to_string(log_n);
+            g_progress.config(tag);
+            auto tm = setup_tiered(cfg, be, N, n,
+                                   SecurityMode::TierMembership, true);
+            ZipfSampler z(N, s, 42);
+            for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+            double avg_ans = 0; int hot_cnt = 0;
+            for (int i = 0; i < cfg.Q; ++i) {
+                auto r = tm->access(z.sample());
+                avg_ans += r.rounds_to_answer;
+                if (r.found_in_hot) ++hot_cnt;
+                g_progress.query_tick(i, cfg.Q);
+            }
+            avg_ans /= cfg.Q;
+            double hit_pct = 100.0 * hot_cnt / cfg.Q;
+            double avg_red = base_rnd > 0
+                ? (base_rnd - avg_ans) / base_rnd * 100 : 0;
+            csv << std::fixed << std::setprecision(2) << s << ","
+                << log_n << "," << base_rnd << ","
+                << avg_ans << "," << avg_red << "," << hit_pct << "\n";
+            csv.flush();
+            g_progress.config_done(
+                "red=" + std::to_string((int)avg_red) + "% hit=" +
+                std::to_string((int)hit_pct) + "%");
         }
-        ans /= cfg.Q; bw /= cfg.Q;
-        csv << log_n << "," << std::fixed << std::setprecision(2) << ans << ","
-            << bw / 1024 << "\n";
-        std::ostringstream ss;
-        ss << "ans=" << std::fixed << std::setprecision(1) << ans
-           << " bw=" << (int)(bw/1024) << "KB";
-        g_progress.config_done(ss.str());
     }
     csv.close();
     std::cout << "  -> " << cfg.outdir << "/hotsize.csv\n";
@@ -942,53 +993,88 @@ static void exp_split_ablation(const Cfg& cfg) {
 // Paper: N=2^16, n=1024, s=1.0, epoch=256, AVL backend
 // ═══════════════════════════════════════════════════════════════════════════
 
-static void exp_dynamic(const Cfg& cfg) {
-    std::cout << "\n=== Exp: Dynamic Hot-Set Convergence ===\n";
-    ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/dynamic.csv");
-    csv << "query_idx,hit_pct,epoch\n";
+static double zipf_H(int N, double s) {
+    double h = 0;
+    for (int i = 1; i <= N; ++i) h += std::pow(i, -s);
+    return h;
+}
 
-    int N = 1 << 16;
+static double theoretical_hit_rate(const std::unordered_set<int>& hot_keys,
+                                   int N, double s, double H, int shift = 0) {
+    double sum = 0;
+    for (int k : hot_keys) {
+        int rank0 = (k - shift % N + N) % N;
+        sum += std::pow(rank0 + 1, -s);
+    }
+    return 100.0 * sum / H;
+}
+
+static void run_convergence(const Cfg& cfg, int logN, const char* file_tag) {
+    int N = 1 << logN;
     int n = cfg.n;
-    int total = 3000;
-    int window = 100;
+    int total = 500000;
+    int report_every = 2000;
+    double s = cfg.s;
+    double H = zipf_H(N, s);
+    double optimal = 0;
+    for (int i = 1; i <= n; ++i) optimal += std::pow(i, -s);
+    optimal = 100.0 * optimal / H;
+
+    std::string fname = std::string(file_tag) + ".csv";
+    std::ofstream csv(cfg.outdir + "/" + fname);
+    csv << "queries_K,B_obs,hit_rate_pct\n";
 
     auto data = make_data(N, cfg.value_size);
     auto hk = make_hot_keys(n);
-
     OmapBackend be = OmapBackend::AVL;
-    TieredOMapConfig tc;
-    tc.total_keys = N; tc.hot_set_size = n;
-    tc.mode = SecurityMode::TierMembership;
-    tc.use_split_oram = true;
-    tc.backend = be;
-    tc.storage_creator = cfg.storage_creator;
-    tc.maintenance.enabled = true;
-    tc.maintenance.epoch_length = 256;
-    tc.maintenance.promote_threshold = 5;
-    tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_epochs = 3;
-    TieredOMap tm(tc); tm.init(data, hk);
-    ZipfSampler z(N, cfg.s, 42);
 
-    std::vector<int> hits;
-    for (int q = 0; q < total; ++q) {
-        auto r = tm.access(z.sample());
-        hits.push_back(r.found_in_hot ? 1 : 0);
-        if ((q + 1) % window == 0) {
-            int start = q + 1 - window;
-            int sum = 0;
-            for (int j = start; j <= q; ++j) sum += hits[j];
-            double pct = 100.0 * sum / window;
-            int ep = tm.maintenance_mgr()
-                         ? tm.maintenance_mgr()->current_epoch() : 0;
-            csv << q + 1 << "," << std::fixed
-                << std::setprecision(1) << pct << "," << ep << "\n";
+    std::vector<int> obs_windows = {16384, 32768, 65536};
+
+    for (int B_obs : obs_windows) {
+        std::string label = "B_obs=" + std::to_string(B_obs);
+        g_progress.config(label.c_str());
+
+        TieredOMapConfig tc;
+        tc.total_keys = N; tc.hot_set_size = n;
+        tc.mode = SecurityMode::TierMembership;
+        tc.use_split_oram = true;
+        tc.backend = be;
+        tc.storage_creator = cfg.storage_creator;
+        tc.maintenance.enabled = true;
+        tc.maintenance.observation_window = B_obs;
+        tc.maintenance.swap_interval = 32;
+        tc.maintenance.promote_threshold = 5;
+        tc.maintenance.demote_threshold = 2;
+        tc.maintenance.staleness_windows = 1;
+        TieredOMap tm(tc); tm.init(data, hk);
+        ZipfSampler z(N, s, 42);
+
+        double hr0 = theoretical_hit_rate(tm.hot_keys(), N, s, H);
+        csv << "0," << B_obs << "," << std::fixed << std::setprecision(2)
+            << hr0 << "\n";
+
+        for (int q = 0; q < total; ++q) {
+            tm.access(z.sample());
+            if ((q + 1) % report_every == 0) {
+                double hr = theoretical_hit_rate(tm.hot_keys(), N, s, H);
+                csv << (q + 1) / 1000.0 << "," << B_obs << ","
+                    << std::fixed << std::setprecision(2) << hr << "\n";
+                csv.flush();
+            }
+            g_progress.query_tick(q, total);
         }
-        g_progress.query_tick(q, total);
+        g_progress.config_done("done");
     }
+    csv << "# optimal," << std::fixed << std::setprecision(2) << optimal << "\n";
     csv.close();
-    std::cout << "  -> " << cfg.outdir << "/dynamic.csv\n";
+    std::cout << "  -> " << cfg.outdir << "/" << fname << "\n";
+}
+
+static void exp_dynamic(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Dynamic Hot-Set Convergence ===\n";
+    ensure_dir(cfg.outdir);
+    run_convergence(cfg, 24, "dynamic");
+    run_convergence(cfg, 20, "dynamic_N20");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -996,67 +1082,77 @@ static void exp_dynamic(const Cfg& cfg) {
 // Paper: N=2^16, n=1024, s=1.0, shift at query 2000, AVL backend
 // ═══════════════════════════════════════════════════════════════════════════
 
-static void exp_drift(const Cfg& cfg) {
-    std::cout << "\n=== Exp: Workload Drift ===\n";
-    ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/drift.csv");
-    csv << "query_idx,scenario,hit_pct\n";
-
-    int N = 1 << 16;
+static void run_drift(const Cfg& cfg, int logN, const char* file_tag) {
+    int N = 1 << logN;
     int n = cfg.n;
-    int total = 5000;
-    int shift_at = 2000;
-    int window = 100;
+    int B_obs_fixed = 65536;
+    int shift_offset = N / 2;
+    int post_onset = 150000;
+    int report_every = 2000;
+    double s = cfg.s;
+    double H = zipf_H(N, s);
+
+    std::string fname = std::string(file_tag) + ".csv";
+    std::ofstream csv(cfg.outdir + "/" + fname);
+    csv << "onset_queries_K,B_swap,hit_rate_pct\n";
 
     auto data = make_data(N, cfg.value_size);
     auto hk = make_hot_keys(n);
     OmapBackend be = OmapBackend::AVL;
 
-    auto run_scenario = [&](bool enable_maint, const char* scenario_label) {
+    std::vector<int> swap_intervals = {32, 64, 128, 0};
+
+    for (int B_swap : swap_intervals) {
+        bool maint_on = (B_swap > 0);
+        std::string label = maint_on
+            ? "B_swap=" + std::to_string(B_swap) : "no_maint";
+        g_progress.config(label.c_str());
+
         TieredOMapConfig tc;
         tc.total_keys = N; tc.hot_set_size = n;
         tc.mode = SecurityMode::TierMembership;
         tc.use_split_oram = true;
         tc.backend = be;
         tc.storage_creator = cfg.storage_creator;
-        if (enable_maint) {
+        if (maint_on) {
             tc.maintenance.enabled = true;
-            tc.maintenance.epoch_length = 256;
+            tc.maintenance.observation_window = B_obs_fixed;
+            tc.maintenance.swap_interval = B_swap;
             tc.maintenance.promote_threshold = 5;
             tc.maintenance.demote_threshold = 2;
-            tc.maintenance.staleness_epochs = 3;
+            tc.maintenance.staleness_windows = 1;
         }
         TieredOMap tm(tc); tm.init(data, hk);
+        ZipfSampler z(N, s, 42);
 
-        std::vector<int> hits;
+        int total = B_obs_fixed + post_onset;
+
         for (int q = 0; q < total; ++q) {
-            int shift = (q >= shift_at) ? n : 0;
-            ZipfSampler z(N, cfg.s, 42 + q);
-            int key = (z.sample() + shift) % N;
-            auto r = tm.access(key);
-            hits.push_back(r.found_in_hot ? 1 : 0);
-            if ((q + 1) % window == 0) {
-                int start = q + 1 - window;
-                int sum = 0;
-                for (int j = start; j <= q; ++j) sum += hits[j];
-                csv << q + 1 << "," << scenario_label << ","
-                    << std::fixed << std::setprecision(1)
-                    << 100.0 * sum / window << "\n";
+            int key = (z.sample() + shift_offset) % N;
+            tm.access(key);
+            int from_onset = q - B_obs_fixed;
+            if (from_onset >= 0 && from_onset % report_every == 0) {
+                double hr = theoretical_hit_rate(
+                    tm.hot_keys(), N, s, H, shift_offset);
+                csv << from_onset / 1000.0 << ","
+                    << (maint_on ? std::to_string(B_swap) : "no_maint")
+                    << "," << std::fixed << std::setprecision(2)
+                    << hr << "\n";
+                csv.flush();
             }
             g_progress.query_tick(q, total);
         }
-    };
-
-    g_progress.config("no maintenance");
-    run_scenario(false, "no_maint");
-    g_progress.config_done("done");
-
-    g_progress.config("with maintenance");
-    run_scenario(true, "with_maint");
-    g_progress.config_done("done");
-
+        g_progress.config_done("done");
+    }
     csv.close();
-    std::cout << "  -> " << cfg.outdir << "/drift.csv\n";
+    std::cout << "  -> " << cfg.outdir << "/" << fname << "\n";
+}
+
+static void exp_drift(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Workload Drift ===\n";
+    ensure_dir(cfg.outdir);
+    run_drift(cfg, 24, "drift");
+    run_drift(cfg, 20, "drift_N20");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1067,7 +1163,7 @@ static void exp_wan_static(const Cfg& cfg) {
     std::cout << "\n=== WAN Static (simulated RTT, fair baseline) ===\n";
 
     int N = 1 << 14;
-    int n = std::min(cfg.n, N / 2);
+        int n = std::min(cfg.n, N / 2);
     int rtt_us = cfg.rtt_us > 0 ? cfg.rtt_us : 10000;
     double rtt_ms = rtt_us / 1000.0;
     int Q = std::min(cfg.Q, 50);
@@ -1090,17 +1186,17 @@ static void exp_wan_static(const Cfg& cfg) {
     auto run_zipf = [&](int seed = 42) { return ZipfSampler(N, cfg.s, seed); };
 
     // --- (A) Raw standalone OMAP (256B values, no index/data split) ---
-    {
-        auto omap = setup_standalone(cfg, be, N);
+            {
+                auto omap = setup_standalone(cfg, be, N);
         omap->set_round_delay_us(rtt_us);
         auto z = run_zipf();
         for (int i = 0; i < 5; ++i) omap->search(z.sample());
         double bw = 0, rnd = 0, lat_us = 0;
         for (int i = 0; i < Q; ++i) {
-            auto t0 = Clock::now();
+                auto t0 = Clock::now();
             omap->search(z.sample());
             lat_us += std::chrono::duration<double, std::micro>(
-                Clock::now() - t0).count();
+                    Clock::now() - t0).count();
             bw += omap->last_stats().total_bytes();
             rnd += omap->last_stats().rounds;
         }
@@ -1116,10 +1212,10 @@ static void exp_wan_static(const Cfg& cfg) {
         for (int i = 0; i < 5; ++i) ido.search(z.sample());
         double bw = 0, rnd = 0, lat_us = 0;
         for (int i = 0; i < Q; ++i) {
-            auto t0 = Clock::now();
+                auto t0 = Clock::now();
             ido.search(z.sample());
             lat_us += std::chrono::duration<double, std::micro>(
-                Clock::now() - t0).count();
+                    Clock::now() - t0).count();
             bw += ido.total_bytes();
             rnd += ido.rounds();
         }
@@ -1163,17 +1259,17 @@ static void exp_wan_static(const Cfg& cfg) {
         auto z = run_zipf();
         for (int i = 0; i < 5; ++i) tm->access(z.sample());
         double bw = 0, rnd = 0, ans = 0, lat_us = 0, ans_us = 0;
-        int hot = 0;
+            int hot = 0;
         for (int i = 0; i < Q; ++i) {
-            auto t0 = Clock::now();
-            auto r = tm->access(z.sample());
+                auto t0 = Clock::now();
+                auto r = tm->access(z.sample());
             double elapsed = std::chrono::duration<double, std::micro>(
-                Clock::now() - t0).count();
+                    Clock::now() - t0).count();
             lat_us += elapsed;
-            bw += r.total_bw.total_bytes();
-            rnd += r.total_bw.rounds;
-            ans += r.rounds_to_answer;
-            if (r.found_in_hot) ++hot;
+                bw += r.total_bw.total_bytes();
+                rnd += r.total_bw.rounds;
+                ans += r.rounds_to_answer;
+                if (r.found_in_hot) ++hot;
             double frac = r.total_bw.rounds > 0
                 ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
             ans_us += elapsed * frac;
@@ -1283,15 +1379,17 @@ static void exp_wan_dynamic(const Cfg& cfg) {
 
     MaintenanceConfig mc;
     mc.enabled = true;
-    mc.epoch_length = 256;
+    mc.observation_window = 256;
+    mc.swap_interval = 256;
     mc.promote_threshold = 5;
     mc.demote_threshold = 2;
-    mc.staleness_epochs = 3;
+    mc.staleness_windows = 3;
     mc.piggyback = true;
 
     std::cout << "  N=" << N << " n=" << n << " s=" << cfg.s
               << " RTT=" << rtt_ms << "ms Q=" << Q
-              << " epoch=" << mc.epoch_length << "\n\n";
+              << " B_obs=" << mc.observation_window
+              << " B_swap=" << mc.swap_interval << "\n\n";
 
     struct Result {
         const char* label;
@@ -1336,13 +1434,13 @@ static void exp_wan_dynamic(const Cfg& cfg) {
         int hot = 0;
         for (int i = 0; i < Q; ++i) {
             auto t0 = Clock::now();
-            auto r = tm->access(z.sample());
+                auto r = tm->access(z.sample());
             double elapsed = std::chrono::duration<double, std::micro>(
                 Clock::now() - t0).count();
             lat_us += elapsed;
-            bw += r.total_bw.total_bytes();
-            rnd += r.total_bw.rounds;
-            ans += r.rounds_to_answer;
+                bw += r.total_bw.total_bytes();
+                rnd += r.total_bw.rounds;
+                ans += r.rounds_to_answer;
             if (r.found_in_hot) ++hot;
             double frac = r.total_bw.rounds > 0
                 ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
@@ -1476,6 +1574,287 @@ static void exp_wan_dynamic(const Cfg& cfg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp: Paper WAN — full Table 1 + Fig 3 data with hot/cold separation
+// Produces one CSV row per (N, backend) with all columns for the paper.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_paper_wan(const Cfg& cfg) {
+    std::cout << "\n=== Paper WAN: Table 1 + Fig 3 (hot/cold separated) ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/paper_wan.csv");
+    csv << "logN,backend,hit_pct,"
+        << "base_bw_KB,base_rnd,base_ms,"
+        << "tm_hot_bw_KB,tm_cold_bw_KB,tm_mean_bw_KB,fo_bw_KB,"
+        << "tm_hot_rnd,tm_cold_rnd,tm_mean_rnd,"
+        << "tm_hot_ms,tm_cold_ms,tm_mean_ms\n";
+
+    static const BackendSpec PAPER_BE[] = {
+        {"AVL",     OmapBackend::AVL},
+        {"BPlus",   OmapBackend::BPlus},
+        {"DaBplus", OmapBackend::DaBplus},
+    };
+
+    std::vector<int> logNs;
+    for (int l = 16; l <= cfg.max_logN; l += 2) logNs.push_back(l);
+
+    for (int logN : logNs) {
+        int N = 1 << logN;
+        int n = std::min(cfg.n, N / 2);
+        std::cout << "\n--- logN=" << logN << " N=" << N << " n=" << n << " ---\n";
+
+        for (auto& [label, be] : PAPER_BE) {
+            int Q = cfg.Q;
+
+            // ── (A) Standalone baseline ──
+            double bl_bw = 0, bl_rnd = 0, bl_ms = 0;
+            {
+                g_progress.config("logN=" + std::to_string(logN) + " " + label + " base");
+                auto omap = setup_standalone(cfg, be, N);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+                for (int i = 0; i < Q; ++i) {
+                    auto t0 = Clock::now();
+                    omap->search(z.sample());
+                    bl_ms += std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    bl_bw += omap->last_stats().total_bytes();
+                    bl_rnd += omap->last_stats().rounds;
+                    g_progress.query_tick(i, Q);
+                }
+                bl_bw /= Q; bl_rnd /= Q; bl_ms /= Q;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(0) << bl_bw/1024 << "KB "
+                   << (int)bl_rnd << "rnd " << std::setprecision(0) << bl_ms << "ms";
+                g_progress.config_done(ss.str());
+            }
+
+            // ── (B) TieredOMAP TM mode — hot/cold separated ──
+            double hot_bw = 0, cold_bw = 0;
+            double hot_rnd = 0, cold_rnd = 0;
+            double hot_ms = 0, cold_ms = 0;
+            int hot_cnt = 0, cold_cnt = 0;
+            {
+                g_progress.config("logN=" + std::to_string(logN) + " " + label + " TM");
+                auto tm = setup_tiered(cfg, be, N, n,
+                                       SecurityMode::TierMembership, true);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+                for (int i = 0; i < Q; ++i) {
+                    auto t0 = Clock::now();
+                    auto r = tm->access(z.sample());
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    double ans_frac = (r.total_bw.rounds > 0)
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    if (r.found_in_hot) {
+                        hot_bw += r.total_bw.total_bytes();
+                        hot_rnd += r.rounds_to_answer;
+                        hot_ms += elapsed * ans_frac;
+                        ++hot_cnt;
+                    } else {
+                        cold_bw += r.total_bw.total_bytes();
+                        cold_rnd += r.total_bw.rounds;
+                        cold_ms += elapsed;
+                        ++cold_cnt;
+                    }
+                    g_progress.query_tick(i, Q);
+                }
+                if (hot_cnt > 0) { hot_bw /= hot_cnt; hot_rnd /= hot_cnt; hot_ms /= hot_cnt; }
+                if (cold_cnt > 0) { cold_bw /= cold_cnt; cold_rnd /= cold_cnt; cold_ms /= cold_cnt; }
+                double hit = 100.0 * hot_cnt / Q;
+                std::ostringstream ss;
+                ss << "hit=" << std::fixed << std::setprecision(0) << hit << "% "
+                   << "hot:" << (int)(hot_bw/1024) << "KB/" << (int)hot_rnd << "rnd/"
+                   << std::setprecision(0) << hot_ms << "ms  "
+                   << "cold:" << (int)(cold_bw/1024) << "KB/" << (int)cold_rnd << "rnd/"
+                   << std::setprecision(0) << cold_ms << "ms";
+                g_progress.config_done(ss.str());
+            }
+
+            // ── (C) TieredOMAP FO mode — bandwidth only ──
+            double fo_bw = 0;
+            {
+                g_progress.config("logN=" + std::to_string(logN) + " " + label + " FO");
+                auto fo = setup_tiered(cfg, be, N, n,
+                                       SecurityMode::FullOblivious, true);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) fo->access(z.sample());
+                for (int i = 0; i < Q; ++i) {
+                    auto r = fo->access(z.sample());
+                    fo_bw += r.total_bw.total_bytes();
+                    g_progress.query_tick(i, Q);
+                }
+                fo_bw /= Q;
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(0) << fo_bw/1024 << "KB";
+                g_progress.config_done(ss.str());
+            }
+
+            // ── Write CSV row ──
+            double hit_pct = (hot_cnt + cold_cnt > 0)
+                ? 100.0 * hot_cnt / (hot_cnt + cold_cnt) : 0;
+            double mean_bw = hit_pct/100 * hot_bw + (1 - hit_pct/100) * cold_bw;
+            double mean_rnd = hit_pct/100 * hot_rnd + (1 - hit_pct/100) * cold_rnd;
+            double mean_ms = hit_pct/100 * hot_ms + (1 - hit_pct/100) * cold_ms;
+
+            csv << logN << "," << label << ","
+                << std::fixed << std::setprecision(1) << hit_pct << ","
+                << std::setprecision(0) << bl_bw/1024 << ","
+                << std::setprecision(0) << bl_rnd << ","
+                << std::setprecision(0) << bl_ms << ","
+                << std::setprecision(0) << hot_bw/1024 << ","
+                << std::setprecision(0) << cold_bw/1024 << ","
+                << std::setprecision(0) << mean_bw/1024 << ","
+                << std::setprecision(0) << fo_bw/1024 << ","
+                << std::setprecision(0) << hot_rnd << ","
+                << std::setprecision(0) << cold_rnd << ","
+                << std::setprecision(0) << mean_rnd << ","
+                << std::setprecision(0) << hot_ms << ","
+                << std::setprecision(0) << cold_ms << ","
+                << std::setprecision(0) << mean_ms << "\n";
+            csv.flush();
+        }
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/paper_wan.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exp: Profile per-(backend, N, n) round counts and latency
+//   Measure deterministic round/time metrics once per configuration.
+//   Python script then combines with theoretical Zipf hit rates
+//   to compute reduction ratios for all (s, n) combinations.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_profile(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Profile rounds & latency per (backend, N, n) ===\n";
+    ensure_dir(cfg.outdir);
+    int N = 1 << cfg.max_logN;
+    int Q = cfg.Q;
+    int rtt_us = cfg.rtt_us;
+    if (rtt_us > 0)
+        std::cout << "  RTT simulation: " << rtt_us << " us per round\n";
+
+    std::ofstream csv(cfg.outdir + "/profile.csv");
+    csv << "backend,logN,log_n,base_rnd,base_ms,"
+        << "hot_rnd,hot_ms,cold_rnd,cold_ms,"
+        << "base_bw_KB,hot_bw_KB,cold_bw_KB\n";
+
+    struct ProfileSpec {
+        const char* label;
+        OmapBackend baseline_be;
+        OmapBackend cold_be;
+        OmapBackend hot_be;
+        bool use_hot_be;
+    };
+    static const ProfileSpec PROFILE_BE[] = {
+        {"AVL",     OmapBackend::AVL,    OmapBackend::AVL,    OmapBackend::AVL,   false},
+        {"BPlus",   OmapBackend::BPlus,  OmapBackend::BPlus,  OmapBackend::BPlus, false},
+        {"DaBplus", OmapBackend::DaBplus,OmapBackend::DaBplus, OmapBackend::BPlus, true},
+    };
+
+    std::vector<int> skew_n = {1024, 4096, 16384};
+    std::vector<int> full_n = {64, 256, 1024, 4096, 16384, 65536};
+
+    for (auto& spec : PROFILE_BE) {
+        const char* label = spec.label;
+        OmapBackend be = spec.baseline_be;
+        auto& n_vals = (be == OmapBackend::AVL) ? full_n : skew_n;
+
+        // (A) Standalone baseline
+        double bl_rnd = 0, bl_ms = 0, bl_bw = 0;
+        {
+            g_progress.config(std::string(label) + " baseline N=" + std::to_string(N));
+            auto omap = setup_standalone(cfg, be, N);
+            if (rtt_us > 0) omap->set_round_delay_us(rtt_us);
+            ZipfSampler z(N, 1.0, 42);
+            for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+            for (int i = 0; i < Q; ++i) {
+                auto t0 = Clock::now();
+                omap->search(z.sample());
+                bl_ms += std::chrono::duration<double, std::milli>(
+                    Clock::now() - t0).count();
+                bl_rnd += omap->last_stats().rounds;
+                bl_bw += omap->last_stats().total_bytes();
+                g_progress.query_tick(i, Q);
+            }
+            bl_rnd /= Q; bl_ms /= Q; bl_bw /= Q;
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(1)
+               << bl_rnd << "rnd " << bl_ms << "ms";
+            g_progress.config_done(ss.str());
+        }
+
+        // (B) Tiered for each n
+        for (int n : n_vals) {
+            if (n >= N / 2) continue;
+            int log_n = (int)std::round(std::log2(n));
+            g_progress.config(std::string(label) + " n=2^" + std::to_string(log_n));
+
+            auto tm = setup_tiered(cfg, spec.cold_be, N, n,
+                                   SecurityMode::TierMembership, true,
+                                   0, spec.hot_be, spec.use_hot_be);
+            if (rtt_us > 0) tm->set_round_delay_us(rtt_us);
+            ZipfSampler z(N, 1.0, 42);
+            for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+
+            double h_rnd = 0, h_ms = 0, h_bw = 0;
+            double c_rnd = 0, c_ms = 0, c_bw = 0;
+            int h_cnt = 0, c_cnt = 0;
+
+            for (int i = 0; i < Q; ++i) {
+                auto t0 = Clock::now();
+                auto r = tm->access(z.sample());
+                double elapsed = std::chrono::duration<double, std::milli>(
+                    Clock::now() - t0).count();
+
+                double ans_frac = (r.total_bw.rounds > 0)
+                    ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+
+                if (r.found_in_hot) {
+                    h_rnd += r.rounds_to_answer;
+                    h_ms += elapsed * ans_frac;
+                    h_bw += r.total_bw.total_bytes();
+                    ++h_cnt;
+                } else {
+                    c_rnd += r.total_bw.rounds;
+                    c_ms += elapsed;
+                    c_bw += r.total_bw.total_bytes();
+                    ++c_cnt;
+                }
+                g_progress.query_tick(i, Q);
+            }
+
+            double hot_rnd = h_cnt > 0 ? h_rnd / h_cnt : 0;
+            double hot_ms  = h_cnt > 0 ? h_ms / h_cnt : 0;
+            double hot_bw  = h_cnt > 0 ? h_bw / h_cnt : 0;
+            double cold_rnd = c_cnt > 0 ? c_rnd / c_cnt : 0;
+            double cold_ms  = c_cnt > 0 ? c_ms / c_cnt : 0;
+            double cold_bw  = c_cnt > 0 ? c_bw / c_cnt : 0;
+
+            csv << label << "," << cfg.max_logN << "," << log_n << ","
+                << std::fixed << std::setprecision(2)
+                << bl_rnd << "," << bl_ms << ","
+                << hot_rnd << "," << hot_ms << ","
+                << cold_rnd << "," << cold_ms << ","
+                << bl_bw/1024 << "," << hot_bw/1024 << ","
+                << cold_bw/1024 << "\n";
+            csv.flush();
+
+            std::ostringstream ss;
+            ss << "h=" << h_cnt << " c=" << c_cnt
+               << " h_rnd=" << std::fixed << std::setprecision(1) << hot_rnd
+               << " c_rnd=" << cold_rnd
+               << " h_ms=" << std::setprecision(0) << hot_ms
+               << " c_ms=" << cold_ms;
+            g_progress.config_done(ss.str());
+        }
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/profile.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1504,6 +1883,8 @@ int main(int argc, char** argv) {
         {"drift",           exp_drift},
         {"wan_static",      exp_wan_static},
         {"wan_dynamic",     exp_wan_dynamic},
+        {"paper_wan",       exp_paper_wan},
+        {"profile",         exp_profile},
     };
 
     bool all = (cfg.exp == "all");

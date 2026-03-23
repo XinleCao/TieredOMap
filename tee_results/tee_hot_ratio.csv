@@ -1,0 +1,6 @@
+logN,n,config,avg_time_us,avg_pages,hit_pct
+18,65536,tiered_packed,107041.4,1615.6,92.5
+18,32768,tiered_packed,104745.9,1276.7,89.5
+18,16384,tiered_packed,103284.9,1099.1,83.5
+18,8192,tiered_packed,102219.0,1006.9,74.0
+18,4096,tiered_packed,101120.3,954.8,70.0

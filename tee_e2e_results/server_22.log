@@ -1,0 +1,14 @@
+Gramine is starting. Parsing TOML manifest file, this may take some time...
+-----------------------------------------------------------------------------------------------------------------------
+Gramine detected the following insecure configurations:
+
+  - sys.insecure__allow_eventfd = true         (host-based eventfd is enabled)
+
+Gramine will continue application execution, but this configuration must not be used in production!
+-----------------------------------------------------------------------------------------------------------------------
+
+Listening on port 12345
+
+=== logN=22 N=4194304 n=1024 ===
+Building OMAP... done.
+Waiting for client...

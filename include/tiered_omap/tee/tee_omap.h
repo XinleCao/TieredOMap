@@ -18,10 +18,11 @@ enum class TeeSecurityMode {
 
 struct TeeMaintenanceConfig {
     bool enabled = false;
-    int epoch_length = 256;
+    int observation_window = 256;
+    int swap_interval = 256;
     int promote_threshold = 5;
     int demote_threshold = 2;
-    int staleness_epochs = 3;
+    int staleness_windows = 3;
 };
 
 struct TeeOmapConfig {

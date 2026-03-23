@@ -213,9 +213,8 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
         o_mov_bytes(is_promo_candidate, pending_promo_val_, pv);
 
         ++access_counter_;
-        if (access_counter_ >= mcfg.epoch_length) {
-            access_counter_ = 0;
-            ++current_epoch_;
+        current_epoch_ = access_counter_ / mcfg.observation_window;
+        if (access_counter_ % mcfg.swap_interval == 0 && access_counter_ > 0) {
             do_maintenance_step();
         }
     }
@@ -230,7 +229,7 @@ void TeeOmap::do_maintenance_step() {
 
     // ── Demotion: oblivious scan of hot directory ────────────────────────
     int demote_key = hot_dir_->find_demote_candidate(
-        scan_ptr_, current_epoch_, mcfg.staleness_epochs, mcfg.demote_threshold);
+        scan_ptr_, current_epoch_, mcfg.staleness_windows, mcfg.demote_threshold);
     scan_ptr_ = (scan_ptr_ + 1) % std::max(hot_dir_->capacity(), 1);
 
     // Always execute demote ops (real or dummy) for fixed access pattern.

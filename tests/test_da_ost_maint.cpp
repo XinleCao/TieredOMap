@@ -126,10 +126,11 @@ TEST(DaOstMaint, TieredOMapDaAvlMaintenance) {
     tc.mode = SecurityMode::FullOblivious;
     tc.backend = OmapBackend::DaAvl;
     tc.maintenance.enabled = true;
-    tc.maintenance.epoch_length = 128;
+    tc.maintenance.observation_window = 128;
+    tc.maintenance.swap_interval = 128;
     tc.maintenance.promote_threshold = 5;
     tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_epochs = 3;
+    tc.maintenance.staleness_windows = 3;
     TieredOMap tm(tc); tm.init(data, hk);
     ZipfSampler z(N, 1.0, 42);
 
@@ -153,10 +154,11 @@ TEST(DaOstMaint, TieredOMapDaAvlPiggyback) {
     tc.backend = OmapBackend::DaAvl;
     tc.maintenance.enabled = true;
     tc.maintenance.piggyback = true;
-    tc.maintenance.epoch_length = 128;
+    tc.maintenance.observation_window = 128;
+    tc.maintenance.swap_interval = 128;
     tc.maintenance.promote_threshold = 5;
     tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_epochs = 3;
+    tc.maintenance.staleness_windows = 3;
     TieredOMap tm(tc); tm.init(data, hk);
     ZipfSampler z(N, 1.0, 42);
 
@@ -182,10 +184,11 @@ TEST(DaOstMaint, TieredOMapDaBplusPiggyback) {
     tc.backend = OmapBackend::DaBplus;
     tc.maintenance.enabled = true;
     tc.maintenance.piggyback = true;
-    tc.maintenance.epoch_length = 128;
+    tc.maintenance.observation_window = 128;
+    tc.maintenance.swap_interval = 128;
     tc.maintenance.promote_threshold = 5;
     tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_epochs = 3;
+    tc.maintenance.staleness_windows = 3;
     TieredOMap tm(tc); tm.init(data, hk);
     ZipfSampler z(N, 1.0, 42);
 

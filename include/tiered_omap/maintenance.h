@@ -6,10 +6,11 @@
 namespace tiered_omap {
 
 struct MaintenanceConfig {
-    int epoch_length = 256;
-    int promote_threshold = 5;
-    int demote_threshold = 2;
-    int staleness_epochs = 3;
+    int observation_window = 65536;   // B_obs: frequency estimation window
+    int swap_interval = 32;           // B_swap: maintenance step frequency
+    int promote_threshold = 5;        // θ_p
+    int demote_threshold = 2;         // θ_d
+    int staleness_windows = 1;        // Δ: stale if ep ≤ obs_epoch - Δ
     bool enabled = false;
     bool piggyback = false;
 };
@@ -26,64 +27,62 @@ public:
     explicit MaintenanceManager(const MaintenanceConfig& cfg)
         : cfg_(cfg) {}
 
-    // Called after each access. Returns updated epoch metadata to write back.
-    // Sets should_promote if this cold key qualifies for promotion.
+    // Called after each access. Updates epoch metadata and detects promotions.
+    // The observation epoch e_obs = floor(total_accesses / B_obs) controls
+    // frequency resets; the swap counter triggers maintenance every B_swap.
     EpochMeta on_access(int key, bool is_hot,
                         const EpochMeta& stored, bool& should_promote) {
         should_promote = false;
         EpochMeta updated = stored;
 
-        if (updated.ep < current_epoch_) {
+        bool epoch_changed = (updated.ep < obs_epoch_);
+        if (epoch_changed) {
             prev_freq_ = updated.cnt;
             updated.cnt = 1;
-            updated.ep = current_epoch_;
+            updated.ep = obs_epoch_;
         } else {
-            prev_freq_ = updated.cnt;
             updated.cnt = updated.cnt + 1;
         }
 
-        if (!is_hot && prev_freq_ >= cfg_.promote_threshold) {
+        if (epoch_changed && !is_hot
+            && prev_freq_ >= cfg_.promote_threshold) {
             should_promote = true;
             promotion_queue_.push(key);
         }
 
-        ++access_counter_;
-        if (access_counter_ >= cfg_.epoch_length) {
-            access_counter_ = 0;
-            ++current_epoch_;
-        }
+        ++total_accesses_;
+        obs_epoch_ = total_accesses_ / cfg_.observation_window;
+        swap_counter_ = total_accesses_ % cfg_.swap_interval;
 
         return updated;
     }
 
-    // Check if a maintenance step (scan+demote or promote) should run now.
+    // Maintenance triggers right after a swap boundary (counter wraps to 0).
+    // Skip epoch 0: no reliable frequency data until a full window completes.
     bool should_maintain() const {
-        return access_counter_ == 0 && current_epoch_ > 0;
+        return swap_counter_ == 0 && total_accesses_ > 0 && obs_epoch_ > 0;
     }
 
-    // Will the *next* access tick trigger maintenance?
-    // (counter is at epoch_length-1 before the on_access that will wrap it)
+    // Will the next access trigger maintenance?
     bool should_maintain_next() const {
-        return access_counter_ == cfg_.epoch_length - 1;
+        return (total_accesses_ + 1) % cfg_.swap_interval == 0;
     }
 
-    // Get the next hot entry index to scan for demotion.
     int scan_index() const { return scan_ptr_; }
 
-    // Advance scan pointer. Call after performing the scan step.
     void advance_scan(int hot_set_size) {
         if (hot_set_size > 0)
             scan_ptr_ = (scan_ptr_ + 1) % hot_set_size;
     }
 
-    // Decide whether to demote based on the scanned entry's metadata.
+    // Demotion: only use the previous completed epoch's data.
     bool should_demote(const EpochMeta& meta) const {
-        bool stale = meta.ep <= current_epoch_ - cfg_.staleness_epochs;
-        bool cold = meta.cnt < cfg_.demote_threshold;
-        return stale || cold;
+        if (meta.ep == obs_epoch_) return false;
+        if (meta.ep == obs_epoch_ - 1)
+            return meta.cnt < cfg_.demote_threshold;
+        return true;
     }
 
-    // Pop a promotion candidate if available.
     bool pop_promotion(int& key) {
         if (promotion_queue_.empty()) return false;
         key = promotion_queue_.front();
@@ -93,16 +92,18 @@ public:
 
     bool has_pending_promotions() const { return !promotion_queue_.empty(); }
 
-    int current_epoch() const { return current_epoch_; }
-    int access_count() const { return access_counter_; }
+    int obs_epoch() const { return obs_epoch_; }
+    int total_access_count() const { return total_accesses_; }
+    int swap_count() const { return swap_counter_; }
     int last_prev_freq() const { return prev_freq_; }
 
     const MaintenanceConfig& config() const { return cfg_; }
 
 private:
     MaintenanceConfig cfg_;
-    int current_epoch_ = 1;
-    int access_counter_ = 0;
+    int obs_epoch_ = 0;
+    int total_accesses_ = 0;
+    int swap_counter_ = 0;
     int scan_ptr_ = 0;
     int prev_freq_ = 0;
     std::queue<int> promotion_queue_;
