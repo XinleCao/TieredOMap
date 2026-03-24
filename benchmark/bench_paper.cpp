@@ -57,6 +57,7 @@ struct Cfg {
     std::string outdir = "results";
     std::string host;
     int port = 12345;
+    std::string backend_filter;
     StorageCreator storage_creator;
     std::shared_ptr<TcpChannel> channel;
 };
@@ -80,6 +81,7 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--value_size") c.value_size = std::stoi(v);
         else if (k == "--host") c.host = v;
         else if (k == "--port") c.port = std::stoi(v);
+        else if (k == "--backend") c.backend_filter = v;
     }
 
     if (!c.host.empty()) {
@@ -1581,12 +1583,15 @@ static void exp_wan_dynamic(const Cfg& cfg) {
 static void exp_paper_wan(const Cfg& cfg) {
     std::cout << "\n=== Paper WAN: Table 1 + Fig 3 (hot/cold separated) ===\n";
     ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/paper_wan.csv");
-    csv << "logN,backend,hit_pct,"
-        << "base_bw_KB,base_rnd,base_ms,"
-        << "tm_hot_bw_KB,tm_cold_bw_KB,tm_mean_bw_KB,fo_bw_KB,"
-        << "tm_hot_rnd,tm_cold_rnd,tm_mean_rnd,"
-        << "tm_hot_ms,tm_cold_ms,tm_mean_ms\n";
+    bool appending = !cfg.backend_filter.empty();
+    std::ofstream csv(cfg.outdir + "/paper_wan.csv",
+                      appending ? std::ios::app : std::ios::trunc);
+    if (!appending)
+        csv << "logN,backend,hit_pct,"
+            << "base_bw_KB,base_rnd,base_ms,"
+            << "tm_hot_bw_KB,tm_cold_bw_KB,tm_mean_bw_KB,fo_bw_KB,"
+            << "tm_hot_rnd,tm_cold_rnd,tm_mean_rnd,"
+            << "tm_hot_ms,tm_cold_ms,tm_mean_ms\n";
 
     static const BackendSpec PAPER_BE[] = {
         {"AVL",     OmapBackend::AVL},
@@ -1603,6 +1608,8 @@ static void exp_paper_wan(const Cfg& cfg) {
         std::cout << "\n--- logN=" << logN << " N=" << N << " n=" << n << " ---\n";
 
         for (auto& [label, be] : PAPER_BE) {
+            if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
+                continue;
             int Q = cfg.Q;
 
             // ── (A) Standalone baseline ──
@@ -1633,10 +1640,12 @@ static void exp_paper_wan(const Cfg& cfg) {
             double hot_rnd = 0, cold_rnd = 0;
             double hot_ms = 0, cold_ms = 0;
             int hot_cnt = 0, cold_cnt = 0;
+            bool da_hot = (be == OmapBackend::DaBplus);
             {
                 g_progress.config("logN=" + std::to_string(logN) + " " + label + " TM");
                 auto tm = setup_tiered(cfg, be, N, n,
-                                       SecurityMode::TierMembership, true);
+                                       SecurityMode::TierMembership, true,
+                                       0, OmapBackend::BPlus, da_hot);
                 ZipfSampler z(N, cfg.s, 42);
                 for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
                 for (int i = 0; i < Q; ++i) {
@@ -1676,7 +1685,8 @@ static void exp_paper_wan(const Cfg& cfg) {
             {
                 g_progress.config("logN=" + std::to_string(logN) + " " + label + " FO");
                 auto fo = setup_tiered(cfg, be, N, n,
-                                       SecurityMode::FullOblivious, true);
+                                       SecurityMode::FullOblivious, true,
+                                       0, OmapBackend::BPlus, da_hot);
                 ZipfSampler z(N, cfg.s, 42);
                 for (int i = 0; i < cfg.warmup; ++i) fo->access(z.sample());
                 for (int i = 0; i < Q; ++i) {
