@@ -1,217 +1,196 @@
 #!/usr/bin/env python3
 """
-Simulate TieredOMap's epoch-based hot-set maintenance (Algorithm 2).
+Simulate TieredOMap's cache-based dynamic hot-set maintenance.
 
-Replicates the exact logic from:
-  - maintenance.h::MaintenanceManager::on_access
-  - maintenance.h::MaintenanceManager::should_demote
-  - tiered_omap.cpp::TieredOMap::do_maintenance_step
+Implements the new mechanism (Algorithm 2):
+  - Local cache B of fixed size, initialized from I_hot
+  - Hot scan swap: periodic extract from I_hot[ptr], write back cache best
+  - Cold promotion swap: reactive when cold key's f_prev > min(cache f_prev)
+  - State machine: idle / hot-pend / cold-pend (one swap at a time)
 
-Produces CSV data for:
+Produces pgfplots coordinates for:
   EXP-3a/3b: Static distribution convergence (N=2^24, 2^20)
   EXP-4a/4b: Workload drift recovery (N=2^24, 2^20)
 """
 
-import bisect
 import csv
-import math
 import os
 import sys
 import time
-from collections import deque
 
 import numpy as np
 
 
-# ── Zipf utilities ──────────────────────────────────────────────────────
-
 def zipf_probs(N, s):
-    """Return array of Zipf probabilities for ranks 0..N-1 (0-indexed)."""
     ranks = np.arange(1, N + 1, dtype=np.float64)
     weights = ranks ** (-s)
-    H = weights.sum()
-    return weights / H
-
-
-def zipf_cdf(N, s):
-    """Return CDF for inverse-transform Zipf sampling."""
-    probs = zipf_probs(N, s)
-    return np.cumsum(probs)
+    return weights / weights.sum()
 
 
 class ZipfSampler:
     def __init__(self, N, s, seed=42):
-        self.N = N
-        self.cdf = zipf_cdf(N, s)
+        self.cdf = np.cumsum(zipf_probs(N, s))
         self.rng = np.random.RandomState(seed)
 
-    def sample(self):
-        u = self.rng.random()
-        return int(np.searchsorted(self.cdf, u))
-
     def sample_batch(self, count):
-        us = self.rng.random(count)
-        return np.searchsorted(self.cdf, us).astype(int)
+        return np.searchsorted(self.cdf, self.rng.random(count)).astype(int)
 
 
-# ── Maintenance simulator ──────────────────────────────────────────────
+class CacheMaintenanceSimulator:
+    """New cache-based maintenance with strict one-swap-at-a-time state machine."""
 
-class MaintenanceSimulator:
-    """Exact replica of MaintenanceManager + TieredOMap::do_maintenance_step."""
-
-    def __init__(self, N, n, B_obs, B_swap,
-                 promote_threshold=5, demote_threshold=2, staleness_windows=1):
+    def __init__(self, N, n, B, B_obs, B_swap):
         self.N = N
         self.n = n
+        self.B = B
         self.B_obs = B_obs
         self.B_swap = B_swap
-        self.promote_threshold = promote_threshold
-        self.demote_threshold = demote_threshold
-        self.staleness_windows = staleness_windows
 
-        self.hot_set = set(range(n))
-        self.hot_key_list = list(range(n))
+        self.cnt = np.zeros(N, dtype=np.int32)
+        self.ep = np.full(N, -2, dtype=np.int32)
+        self.f_prev = np.zeros(N, dtype=np.int32)
 
-        self.key_meta = {}  # key -> (cnt, ep)
-        self.total_accesses = 0
-        self.obs_epoch = 0
-        self.scan_ptr = 0
-        self.promotion_queue = deque()
+        initial_hot = list(range(n))
+        self.cache = set(initial_hot[:B])
+        self.I_hot = set(initial_hot[B:])
+        self.I_hot_scan = list(initial_hot[B:])
+        self.I_cold = set(range(N)) - set(initial_hot)
 
-    def on_access(self, key):
-        """Replicate MaintenanceManager::on_access from maintenance.h."""
-        is_hot = key in self.hot_set
-        cnt, ep = self.key_meta.get(key, (0, 0))
+        self.ptr = 0
+        self.st = 'idle'
+        self.t = 0
 
-        epoch_changed = (ep < self.obs_epoch)
-        if epoch_changed:
-            prev_freq = cnt
-            cnt = 1
-            ep = self.obs_epoch
+    def effective_hot_set(self):
+        return self.I_hot | self.cache
+
+    def _update_epoch(self, k):
+        e = self.t // self.B_obs
+        if self.ep[k] < e:
+            self.f_prev[k] = self.cnt[k] if self.ep[k] == e - 1 else 0
+            self.cnt[k] = 1
+            self.ep[k] = e
         else:
-            cnt += 1
-            prev_freq = 0
+            self.cnt[k] += 1
 
-        self.key_meta[key] = (cnt, ep)
+    def _cache_min_fprev(self):
+        return min(self.f_prev[c] for c in self.cache)
 
-        if epoch_changed and not is_hot and prev_freq >= self.promote_threshold:
-            self.promotion_queue.append(key)
+    def access(self, k):
+        self.t += 1
+        self._update_epoch(k)
 
-        self.total_accesses += 1
-        self.obs_epoch = self.total_accesses // self.B_obs
+        in_cache = k in self.cache
+        in_cold = k in self.I_cold
 
-        if (self.total_accesses % self.B_swap == 0
-                and self.total_accesses > 0
-                and self.obs_epoch > 0):
-            self._maintenance_step()
+        swap_completed = False
 
-    def _should_demote(self, cnt, ep):
-        """Replicate MaintenanceManager::should_demote.
-        Only use the previous completed epoch's data for decisions.
-        """
-        if ep == self.obs_epoch:
-            return False
-        if ep == self.obs_epoch - 1:
-            return cnt < self.demote_threshold
-        return True
+        # Phase A: complete pending swap from previous access
+        if self.st == 'hot-pend':
+            best = max(self.cache, key=lambda c: self.f_prev[c])
+            self.cache.remove(best)
+            self.I_hot.add(best)
+            self.I_hot_scan.append(best)
+            self.st = 'idle'
+            swap_completed = True
+        elif self.st == 'cold-pend':
+            worst = min(self.cache, key=lambda c: self.f_prev[c])
+            self.cache.remove(worst)
+            self.I_cold.add(worst)
+            self.st = 'idle'
+            swap_completed = True
 
-    def _maintenance_step(self):
-        """Replicate TieredOMap::do_maintenance_step.
+        if swap_completed:
+            return
 
-        Bug fix: the C++ code returns early when hot_key_list is empty,
-        which prevents promotions from ever being processed after a full
-        hot-set eviction (e.g., after an abrupt drift). We split the
-        demotion scan (requires non-empty list) from the promotion
-        processing (should always run).
-        """
-        if self.hot_key_list:
-            idx = self.scan_ptr % len(self.hot_key_list)
-            scan_key = self.hot_key_list[idx]
+        # Phase B: cold promotion trigger
+        if in_cold and self.st == 'idle' and self.t > self.B_obs:
+            if self.f_prev[k] > self._cache_min_fprev():
+                self.I_cold.remove(k)
+                self.cache.add(k)
+                self.st = 'cold-pend'
+                return
 
-            cnt, ep = self.key_meta.get(scan_key, (0, 0))
-            demote = self._should_demote(cnt, ep)
-
-            if demote:
-                self.hot_set.discard(scan_key)
-                try:
-                    self.hot_key_list.remove(scan_key)
-                except ValueError:
-                    pass
-
-            if self.hot_key_list:
-                self.scan_ptr = (self.scan_ptr + 1) % len(self.hot_key_list)
+        # Phase C: hot scan trigger
+        if (self.st == 'idle'
+                and self.t % self.B_swap == 0
+                and self.t > 0
+                and len(self.I_hot_scan) > 0):
+            idx = self.ptr % len(self.I_hot_scan)
+            scan_key = self.I_hot_scan[idx]
+            self.I_hot.remove(scan_key)
+            self.I_hot_scan.pop(idx)
+            self.cache.add(scan_key)
+            if self.I_hot_scan:
+                self.ptr = idx % len(self.I_hot_scan)
             else:
-                self.scan_ptr = 0
-
-        promo_key = None
-        while self.promotion_queue:
-            candidate = self.promotion_queue.popleft()
-            if candidate not in self.hot_set and len(self.hot_set) < self.n:
-                promo_key = candidate
-                break
-
-        if promo_key is not None:
-            self.hot_set.add(promo_key)
-            bisect.insort(self.hot_key_list, promo_key)
+                self.ptr = 0
+            self.st = 'hot-pend'
 
 
-# ── Hit rate computation ────────────────────────────────────────────────
+class NoMaintenanceSimulator:
+    """Baseline: no maintenance, hot set never changes."""
 
-def theoretical_hit_rate(hot_set, probs):
-    """Sum of Zipf probabilities for keys in hot_set."""
+    def __init__(self, N, n):
+        self.hot_set = set(range(n))
+
+    def effective_hot_set(self):
+        return self.hot_set
+
+    def access(self, k):
+        pass
+
+
+def hit_rate_pct(hot_set, probs):
     return sum(probs[k] for k in hot_set) * 100.0
 
 
-def theoretical_hit_rate_shifted(hot_set, N, s, H, shift_offset):
-    """Hit rate under shifted distribution: key k has rank (k - shift) % N."""
-    total = 0.0
-    for k in hot_set:
-        rank0 = (k - shift_offset % N + N) % N
-        total += (rank0 + 1) ** (-s)
-    return 100.0 * total / H
+def hit_rate_shifted(hot_set, probs_shifted):
+    return sum(probs_shifted[k] for k in hot_set) * 100.0
 
 
 # ── EXP-3: Static distribution convergence ─────────────────────────────
 
-def run_convergence(N, n, s, B_obs_list, B_swap, total_queries,
-                    report_every, seed=42):
-    """Run EXP-3: static Zipf, measure hit rate over time."""
+def run_convergence(N, n, s, B, B_obs_list, B_swap,
+                    total_queries, report_every, seed=42):
     probs = zipf_probs(N, s)
-    optimal = sum(probs[i] for i in range(n)) * 100.0
-
-    results = {}  # B_obs -> [(queries_K, hit_rate)]
+    optimal = sum(probs[:n]) * 100.0
+    results = {}
 
     for B_obs in B_obs_list:
         print(f"  B_obs={B_obs}...", end=" ", flush=True)
         t0 = time.time()
 
-        sim = MaintenanceSimulator(N, n, B_obs, B_swap)
+        sim = CacheMaintenanceSimulator(N, n, B, B_obs, B_swap)
         z = ZipfSampler(N, s, seed)
+        samples = z.sample_batch(total_queries)
 
-        hr0 = theoretical_hit_rate(sim.hot_set, probs)
+        hr0 = hit_rate_pct(sim.effective_hot_set(), probs)
         data = [(0.0, hr0)]
 
-        samples = z.sample_batch(total_queries)
         for q in range(total_queries):
-            sim.on_access(int(samples[q]))
+            sim.access(int(samples[q]))
             if (q + 1) % report_every == 0:
-                hr = theoretical_hit_rate(sim.hot_set, probs)
+                hr = hit_rate_pct(sim.effective_hot_set(), probs)
                 data.append(((q + 1) / 1000.0, hr))
 
         results[B_obs] = data
-        elapsed = time.time() - t0
-        final_hr = data[-1][1]
-        print(f"done ({elapsed:.1f}s, final={final_hr:.2f}%)")
+        dt = time.time() - t0
+        print(f"done ({dt:.1f}s, final={data[-1][1]:.1f}%)")
 
     return results, optimal
 
 
-def run_drift(N, n, s, B_swap_list, B_obs_fixed, shift_offset,
-              post_onset, report_every, seed=42):
-    """Run EXP-4: shifted Zipf, measure recovery after onset."""
-    H = sum((i + 1) ** (-s) for i in range(N))
+# ── EXP-4: Workload drift recovery ─────────────────────────────────────
 
-    results = {}  # B_swap (or 'no_maint') -> [(onset_K, hit_rate)]
+def run_drift(N, n, s, B, B_swap_list, B_obs_fixed,
+              post_onset, report_every, seed=42):
+    probs_orig = zipf_probs(N, s)
+    shift = N // 2
+    probs_shifted = np.roll(probs_orig, shift)
+    optimal_shifted = sorted(probs_shifted, reverse=True)[:n]
+    optimal_hr = sum(optimal_shifted) * 100.0
+
+    results = {}
 
     configs = [(bsw, True) for bsw in B_swap_list] + [(0, False)]
 
@@ -221,60 +200,53 @@ def run_drift(N, n, s, B_swap_list, B_obs_fixed, shift_offset,
         t0 = time.time()
 
         if maint_on:
-            sim = MaintenanceSimulator(N, n, B_obs_fixed, B_swap)
+            sim = CacheMaintenanceSimulator(N, n, B, B_obs_fixed, B_swap)
         else:
-            sim = MaintenanceSimulator(N, n, B_obs_fixed, 1)
-            sim.B_swap = 999999999
+            sim = NoMaintenanceSimulator(N, n)
 
         z = ZipfSampler(N, s, seed)
         total = B_obs_fixed + post_onset
+        samples = z.sample_batch(total)
 
         data = []
-        samples = z.sample_batch(total)
         for q in range(total):
-            key = (int(samples[q]) + shift_offset) % N
-            if maint_on:
-                sim.on_access(key)
-            else:
-                sim.total_accesses += 1
-                sim.obs_epoch = sim.total_accesses // B_obs_fixed
-
+            key = (int(samples[q]) + shift) % N
+            sim.access(key)
             from_onset = q - B_obs_fixed
             if from_onset >= 0 and from_onset % report_every == 0:
-                hr = theoretical_hit_rate_shifted(
-                    sim.hot_set, N, s, H, shift_offset)
+                hr = hit_rate_shifted(sim.effective_hot_set(), probs_shifted)
                 data.append((from_onset / 1000.0, hr))
 
-        key_label = str(B_swap) if maint_on else "no_maint"
-        results[key_label] = data
-        elapsed = time.time() - t0
-        final_hr = data[-1][1] if data else 0
-        print(f"done ({elapsed:.1f}s, final={final_hr:.2f}%)")
+        results[label] = data
+        dt = time.time() - t0
+        final = data[-1][1] if data else 0
+        print(f"done ({dt:.1f}s, final={final:.1f}%)")
 
-    return results
-
-
-# ── CSV output ──────────────────────────────────────────────────────────
-
-def write_convergence_csv(path, results, optimal):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["queries_K", "B_obs", "hit_rate_pct"])
-        for B_obs, data in sorted(results.items()):
-            for qk, hr in data:
-                w.writerow([f"{qk:.1f}", B_obs, f"{hr:.2f}"])
-        w.writerow([f"# optimal", "", f"{optimal:.2f}"])
-    print(f"  -> {path}")
+    return results, optimal_hr
 
 
-def write_drift_csv(path, results):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["onset_queries_K", "B_swap", "hit_rate_pct"])
-        for label, data in results.items():
-            for qk, hr in data:
-                w.writerow([f"{qk:.1f}", label, f"{hr:.2f}"])
-    print(f"  -> {path}")
+# ── pgfplots output ────────────────────────────────────────────────────
+
+def fmt_coords(data, step=None):
+    pts = data if step is None else data[::step]
+    return " ".join(f"({x:.0f},{y:.1f})" for x, y in pts)
+
+
+def print_convergence(results, optimal, tag=""):
+    print(f"\n% === Convergence{tag} (optimal={optimal:.1f}%) ===")
+    for B_obs in sorted(results.keys()):
+        coords = fmt_coords(results[B_obs])
+        print(f"% B_obs={B_obs}")
+        print(f"\\addplot coordinates {{ {coords} }};")
+    print(f"% optimal line: (0,{optimal:.0f}) (510,{optimal:.0f})")
+
+
+def print_drift(results, tag=""):
+    print(f"\n% === Drift{tag} ===")
+    for label in results:
+        coords = fmt_coords(results[label])
+        print(f"% {label}")
+        print(f"\\addplot coordinates {{ {coords} }};")
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -285,32 +257,35 @@ def main():
 
     n = 1024
     s = 1.0
+    B = 8
     B_obs_list = [16384, 32768, 65536]
     B_swap_convergence = 32
     B_swap_drift_list = [16, 32, 64]
     B_obs_drift = 65536
-    total_queries = 500000
-    report_every = 2000
-    post_onset = 150000
+    total_queries = 500_000
+    report_convergence = 20_000
+    post_onset = 150_000
+    report_drift = 2_000
 
     for logN, tag in [(24, ""), (20, "_N20")]:
         N = 1 << logN
-        shift_offset = N // 2
 
-        print(f"\n=== EXP-3: Convergence N=2^{logN} ===")
-        conv_results, optimal = run_convergence(
-            N, n, s, B_obs_list, B_swap_convergence,
-            total_queries, report_every)
-        write_convergence_csv(
-            os.path.join(outdir, f"dynamic{tag}.csv"), conv_results, optimal)
-        print(f"  Static optimal: {optimal:.2f}%")
+        print(f"\n{'='*60}")
+        print(f"EXP-3{tag}: Convergence  N=2^{logN}, n={n}, B={B}")
+        print(f"{'='*60}")
+        conv, opt = run_convergence(
+            N, n, s, B, B_obs_list, B_swap_convergence,
+            total_queries, report_convergence)
+        print_convergence(conv, opt, tag)
 
-        print(f"\n=== EXP-4: Drift N=2^{logN} ===")
-        drift_results = run_drift(
-            N, n, s, B_swap_drift_list, B_obs_drift,
-            shift_offset, post_onset, report_every)
-        write_drift_csv(
-            os.path.join(outdir, f"drift{tag}.csv"), drift_results)
+        print(f"\n{'='*60}")
+        print(f"EXP-4{tag}: Drift  N=2^{logN}, n={n}, B={B}")
+        print(f"{'='*60}")
+        drift, opt_shifted = run_drift(
+            N, n, s, B, B_swap_drift_list, B_obs_drift,
+            post_onset, report_drift)
+        print_drift(drift, tag)
+        print(f"% shifted optimal: {opt_shifted:.1f}%")
 
 
 if __name__ == "__main__":
