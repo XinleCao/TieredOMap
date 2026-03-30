@@ -255,7 +255,7 @@ def main():
     B = 8
     B_obs_list = [16384, 32768, 65536]
     B_swap_convergence = 32
-    B_swap_drift_list = [16, 32, 64]
+    B_swap_drift_list = [8, 16, 32]
     B_obs_drift = 65536
     total_queries = 500_000
     report_convergence = 20_000
