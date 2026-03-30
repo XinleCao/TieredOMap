@@ -80,16 +80,19 @@ inline int ceil_log2(int n) {
 // Layout: [original_value | epoch_cnt (4B) | epoch_stamp (4B)]
 struct EpochMeta {
     int cnt = 0;
-    int ep = 0;
+    int ep = -1;
+    int fp = 0;
 };
 
-constexpr size_t EPOCH_META_SIZE = 2 * sizeof(int);
+constexpr size_t EPOCH_META_SIZE = 3 * sizeof(int);
 
 inline Bytes encode_with_epoch(const Bytes& value, const EpochMeta& m) {
     Bytes out = value;
     out.resize(value.size() + EPOCH_META_SIZE);
-    std::memcpy(out.data() + value.size(), &m.cnt, sizeof(int));
-    std::memcpy(out.data() + value.size() + sizeof(int), &m.ep, sizeof(int));
+    size_t off = value.size();
+    std::memcpy(out.data() + off, &m.cnt, sizeof(int));
+    std::memcpy(out.data() + off + sizeof(int), &m.ep, sizeof(int));
+    std::memcpy(out.data() + off + 2 * sizeof(int), &m.fp, sizeof(int));
     return out;
 }
 
@@ -100,6 +103,7 @@ inline std::pair<Bytes, EpochMeta> decode_epoch(const Bytes& raw) {
     Bytes value(raw.begin(), raw.begin() + val_len);
     std::memcpy(&m.cnt, raw.data() + val_len, sizeof(int));
     std::memcpy(&m.ep, raw.data() + val_len + sizeof(int), sizeof(int));
+    std::memcpy(&m.fp, raw.data() + val_len + 2 * sizeof(int), sizeof(int));
     return {value, m};
 }
 

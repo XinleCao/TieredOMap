@@ -20,9 +20,7 @@ struct DynConfig {
     int window = 50;
     int observation_window = 64;
     int swap_interval = 64;
-    int promote_threshold = 5;
-    int demote_threshold = 2;
-    int staleness_windows = 3;
+    int cache_size = 8;
     int shift_offset = 0;
     int shift_at = 0;
     std::string outdir = "results";
@@ -44,9 +42,7 @@ DynConfig parse_args(int argc, char** argv) {
         else if (key == "--window") c.window = std::stoi(val);
         else if (key == "--B_obs") c.observation_window = std::stoi(val);
         else if (key == "--B_swap") c.swap_interval = std::stoi(val);
-        else if (key == "--promote_threshold") c.promote_threshold = std::stoi(val);
-        else if (key == "--demote_threshold") c.demote_threshold = std::stoi(val);
-        else if (key == "--staleness") c.staleness_windows = std::stoi(val);
+        else if (key == "--B") c.cache_size = std::stoi(val);
         else if (key == "--shift") c.shift_offset = std::stoi(val);
         else if (key == "--shift_at") c.shift_at = std::stoi(val);
         else if (key == "--outdir") c.outdir = val;
@@ -72,7 +68,8 @@ std::vector<int> make_hot_keys(int n) {
 void exp_hitrate(const DynConfig& cfg) {
     std::cout << "=== Hit Rate Convergence (N=" << cfg.N << " n=" << cfg.n
               << " s=" << cfg.s << " B_obs=" << cfg.observation_window
-              << " B_swap=" << cfg.swap_interval << ") ===\n\n";
+              << " B_swap=" << cfg.swap_interval
+              << " B=" << cfg.cache_size << ") ===\n\n";
 
     auto data = make_data(cfg.N);
     auto hk = make_hot_keys(cfg.n);
@@ -84,9 +81,7 @@ void exp_hitrate(const DynConfig& cfg) {
     tc.maintenance.enabled = true;
     tc.maintenance.observation_window = cfg.observation_window;
     tc.maintenance.swap_interval = cfg.swap_interval;
-    tc.maintenance.promote_threshold = cfg.promote_threshold;
-    tc.maintenance.demote_threshold = cfg.demote_threshold;
-    tc.maintenance.staleness_windows = cfg.staleness_windows;
+    tc.maintenance.cache_size = cfg.cache_size;
 
     TieredOMap tmap(tc);
     tmap.init(data, hk);
@@ -136,9 +131,7 @@ void exp_drift(const DynConfig& cfg) {
     tc.maintenance.enabled = true;
     tc.maintenance.observation_window = cfg.observation_window;
     tc.maintenance.swap_interval = cfg.swap_interval;
-    tc.maintenance.promote_threshold = cfg.promote_threshold;
-    tc.maintenance.demote_threshold = cfg.demote_threshold;
-    tc.maintenance.staleness_windows = cfg.staleness_windows;
+    tc.maintenance.cache_size = cfg.cache_size;
 
     TieredOMap tmap(tc);
     tmap.init(data, hk);
@@ -182,61 +175,52 @@ void exp_sensitivity(const DynConfig& cfg) {
     auto hk = make_hot_keys(cfg.n);
 
     std::vector<int> obs_windows = {32, 64, 128, 256, 512};
-    std::vector<int> promote_thresholds = {3, 5, 10, 20};
-    std::vector<int> staleness_vals = {2, 3, 5, 8};
+    std::vector<int> cache_sizes = {4, 8, 16, 32};
 
     std::ofstream csv(cfg.outdir + "/sensitivity.csv");
-    csv << "B_obs,promote_thresh,staleness,steady_hit_rate,final_hot_size\n";
+    csv << "B_obs,cache_size,steady_hit_rate,final_hot_size\n";
 
     std::cout << std::left
               << std::setw(8) << "B_obs"
-              << std::setw(8) << "theta_p"
-              << std::setw(8) << "delta"
+              << std::setw(8) << "B"
               << std::setw(12) << "hit_rate%"
               << std::setw(10) << "hot_size"
-              << "\n" << std::string(46, '-') << "\n";
+              << "\n" << std::string(38, '-') << "\n";
 
-    for (int B : obs_windows) {
-        for (int tp : promote_thresholds) {
-            for (int st : staleness_vals) {
-                TieredOMapConfig tc;
-                tc.total_keys = cfg.N;
-                tc.hot_set_size = cfg.n;
-                tc.mode = SecurityMode::FullOblivious;
-                tc.maintenance.enabled = true;
-                tc.maintenance.observation_window = B;
-                tc.maintenance.swap_interval = std::min(B, 32);
-                tc.maintenance.promote_threshold = tp;
-                tc.maintenance.demote_threshold = cfg.demote_threshold;
-                tc.maintenance.staleness_windows = st;
+    for (int Bobs : obs_windows) {
+        for (int B : cache_sizes) {
+            TieredOMapConfig tc;
+            tc.total_keys = cfg.N;
+            tc.hot_set_size = cfg.n;
+            tc.mode = SecurityMode::FullOblivious;
+            tc.maintenance.enabled = true;
+            tc.maintenance.observation_window = Bobs;
+            tc.maintenance.swap_interval = std::min(Bobs, 32);
+            tc.maintenance.cache_size = B;
 
-                TieredOMap tmap(tc);
-                tmap.init(data, hk);
+            TieredOMap tmap(tc);
+            tmap.init(data, hk);
 
-                ZipfSampler z(cfg.N, cfg.s, 42);
+            ZipfSampler z(cfg.N, cfg.s, 42);
 
-                // Warm up.
-                for (int i = 0; i < cfg.total_ops / 2; ++i)
-                    tmap.access(z.sample());
+            for (int i = 0; i < cfg.total_ops / 2; ++i)
+                tmap.access(z.sample());
 
-                // Measure steady state.
-                int hits = 0, total = cfg.total_ops / 2;
-                for (int i = 0; i < total; ++i) {
-                    auto r = tmap.access(z.sample());
-                    if (r.found_in_hot) ++hits;
-                }
-                double rate = 100.0 * hits / total;
-
-                csv << B << "," << tp << "," << st << "," << rate << ","
-                    << tmap.hot_set_size() << "\n";
-
-                std::cout << std::setw(8) << B
-                          << std::setw(8) << tp
-                          << std::setw(8) << st
-                          << std::setw(12) << std::setprecision(1) << std::fixed << rate
-                          << std::setw(10) << tmap.hot_set_size()
-                          << "\n";
+            int hits = 0, total = cfg.total_ops / 2;
+            for (int i = 0; i < total; ++i) {
+                auto r = tmap.access(z.sample());
+                if (r.found_in_hot) ++hits;
             }
+            double rate = 100.0 * hits / total;
+
+            csv << Bobs << "," << B << "," << rate << ","
+                << tmap.hot_set_size() << "\n";
+
+            std::cout << std::setw(8) << Bobs
+                      << std::setw(8) << B
+                      << std::setw(12) << std::setprecision(1) << std::fixed << rate
+                      << std::setw(10) << tmap.hot_set_size()
+                      << "\n";
         }
     }
     std::cout << "\n";

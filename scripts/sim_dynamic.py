@@ -53,10 +53,9 @@ class CacheMaintenanceSimulator:
         initial_hot = list(range(n))
         self.cache = set(initial_hot[:B])
         self.I_hot = set(initial_hot[B:])
-        self.I_hot_scan = list(initial_hot[B:])
         self.I_cold = set(range(N)) - set(initial_hot)
 
-        self.ptr = 0
+        self.ptr = -1
         self.st = 'idle'
         self.t = 0
 
@@ -75,56 +74,52 @@ class CacheMaintenanceSimulator:
     def _cache_min_fprev(self):
         return min(self.f_prev[c] for c in self.cache)
 
+    def _cache_max_fprev(self):
+        return max(self.f_prev[c] for c in self.cache)
+
     def access(self, k):
         self.t += 1
         self._update_epoch(k)
 
-        in_cache = k in self.cache
         in_cold = k in self.I_cold
 
-        swap_completed = False
+        # Task 1 (at B_swap boundary): pending insertion + hot demotion scan
+        at_boundary = (self.t % self.B_swap == 0 and self.t > 0
+                       and self.t // self.B_obs > 0)
+        if at_boundary:
+            # Complete pending insertion
+            if self.st == 'hot-pend':
+                best = max(self.cache, key=lambda c: self.f_prev[c])
+                self.cache.remove(best)
+                self.I_hot.add(best)
+                self.st = 'idle'
+            elif self.st == 'cold-pend':
+                worst = min(self.cache, key=lambda c: self.f_prev[c])
+                self.cache.remove(worst)
+                self.I_cold.add(worst)
+                self.st = 'idle'
 
-        # Phase A: complete pending swap from previous access
-        if self.st == 'hot-pend':
-            best = max(self.cache, key=lambda c: self.f_prev[c])
-            self.cache.remove(best)
-            self.I_hot.add(best)
-            self.I_hot_scan.append(best)
-            self.st = 'idle'
-            swap_completed = True
-        elif self.st == 'cold-pend':
-            worst = min(self.cache, key=lambda c: self.f_prev[c])
-            self.cache.remove(worst)
-            self.I_cold.add(worst)
-            self.st = 'idle'
-            swap_completed = True
+            # Hot demotion scan (only when idle)
+            if (self.st == 'idle' and len(self.I_hot) > 0):
+                sorted_hot = sorted(self.I_hot)
+                from bisect import bisect_right
+                pos = bisect_right(sorted_hot, self.ptr)
+                if pos >= len(sorted_hot):
+                    self.ptr = -1
+                    pos = 0
+                scan_key = sorted_hot[pos]
+                self.ptr = scan_key
+                if self.f_prev[scan_key] < self._cache_max_fprev():
+                    self.I_hot.remove(scan_key)
+                    self.cache.add(scan_key)
+                    self.st = 'hot-pend'
 
-        if swap_completed:
-            return
-
-        # Phase B: cold promotion trigger
+        # Reactive cold promotion
         if in_cold and self.st == 'idle' and self.t > self.B_obs:
             if self.f_prev[k] > self._cache_min_fprev():
                 self.I_cold.remove(k)
                 self.cache.add(k)
                 self.st = 'cold-pend'
-                return
-
-        # Phase C: hot scan trigger
-        if (self.st == 'idle'
-                and self.t % self.B_swap == 0
-                and self.t > 0
-                and len(self.I_hot_scan) > 0):
-            idx = self.ptr % len(self.I_hot_scan)
-            scan_key = self.I_hot_scan[idx]
-            self.I_hot.remove(scan_key)
-            self.I_hot_scan.pop(idx)
-            self.cache.add(scan_key)
-            if self.I_hot_scan:
-                self.ptr = idx % len(self.I_hot_scan)
-            else:
-                self.ptr = 0
-            self.st = 'hot-pend'
 
 
 class NoMaintenanceSimulator:
@@ -264,8 +259,8 @@ def main():
     B_obs_drift = 65536
     total_queries = 500_000
     report_convergence = 20_000
-    post_onset = 150_000
-    report_drift = 2_000
+    post_onset = 500_000
+    report_drift = 5_000
 
     for logN, tag in [(24, ""), (20, "_N20")]:
         N = 1 << logN

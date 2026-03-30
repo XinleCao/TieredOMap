@@ -7,6 +7,7 @@
 #include "tiered_omap/oram/path_oram.h"
 #include <deque>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -118,7 +119,12 @@ private:
     struct CachedItem { int key = INVALID_KEY; Bytes data_ref; };
     std::deque<CachedItem> pending_demotions_;
     std::deque<CachedItem> pending_promotions_;
-    int maint_phase_ = 0;  // 0 = scan next, 1 = insert next
+
+    // Cache-based maintenance state (paper Algorithm 2)
+    std::unordered_set<int> cache_keys_;
+    std::unordered_map<int, Bytes> cache_data_refs_;
+    int pending_insert_key_ = INVALID_KEY;
+    Bytes pending_insert_ref_;
 
     TieredOMapConfig config_;
     std::shared_ptr<TcpChannel> channel_;

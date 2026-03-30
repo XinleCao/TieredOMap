@@ -128,9 +128,7 @@ TEST(DaOstMaint, TieredOMapDaAvlMaintenance) {
     tc.maintenance.enabled = true;
     tc.maintenance.observation_window = 128;
     tc.maintenance.swap_interval = 128;
-    tc.maintenance.promote_threshold = 5;
-    tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_windows = 3;
+    tc.maintenance.cache_size = 8;
     TieredOMap tm(tc); tm.init(data, hk);
     ZipfSampler z(N, 1.0, 42);
 
@@ -156,9 +154,7 @@ TEST(DaOstMaint, TieredOMapDaAvlPiggyback) {
     tc.maintenance.piggyback = true;
     tc.maintenance.observation_window = 128;
     tc.maintenance.swap_interval = 128;
-    tc.maintenance.promote_threshold = 5;
-    tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_windows = 3;
+    tc.maintenance.cache_size = 8;
     TieredOMap tm(tc); tm.init(data, hk);
     ZipfSampler z(N, 1.0, 42);
 
@@ -186,9 +182,7 @@ TEST(DaOstMaint, TieredOMapDaBplusPiggyback) {
     tc.maintenance.piggyback = true;
     tc.maintenance.observation_window = 128;
     tc.maintenance.swap_interval = 128;
-    tc.maintenance.promote_threshold = 5;
-    tc.maintenance.demote_threshold = 2;
-    tc.maintenance.staleness_windows = 3;
+    tc.maintenance.cache_size = 8;
     TieredOMap tm(tc); tm.init(data, hk);
     ZipfSampler z(N, 1.0, 42);
 

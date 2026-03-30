@@ -107,6 +107,25 @@ void TieredOMap::init(
     cold_omap_ = make_omap(config_.backend, cold_cap, true);
     hot_omap_->init(hot_refs);
     cold_omap_->init(cold_refs);
+
+    if (maint_) {
+        int B = config_.maintenance.cache_size;
+        int extract_count = std::min(B, static_cast<int>(hot_key_list_.size()));
+        std::vector<CacheEntry> cache_entries;
+        std::vector<int> to_extract(hot_key_list_.begin(),
+                                     hot_key_list_.begin() + extract_count);
+        for (int k : to_extract) {
+            Bytes ref = hot_omap_->search(k);
+            hot_omap_->remove(k);
+            phys_hot_keys_.erase(k);
+            cache_keys_.insert(k);
+            cache_data_refs_[k] = ref;
+            cache_entries.push_back({k, 0});
+        }
+        hot_key_list_.erase(hot_key_list_.begin(),
+                            hot_key_list_.begin() + extract_count);
+        maint_->init_cache(cache_entries);
+    }
 }
 
 AccessResult TieredOMap::access(int key, const Bytes* new_value) {
@@ -122,9 +141,7 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
 
     result.found_in_hot = is_hot_logical;
 
-    bool maint_due = use_epoch && maint_->should_maintain_next();
-    bool pig_active = bplus_piggyback && maint_due && is_hot_physical
-                      && !hot_key_list_.empty();
+    (void)bplus_piggyback;
 
     if (da_piggyback) {
         bool da_can_interleave =
@@ -147,8 +164,7 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         data_oram_.dummy_access();
 
         auto [val, meta] = decode_epoch(raw);
-        bool promote_flag = false;
-        meta = maint_->on_access(key, is_hot_logical, meta, promote_flag);
+        meta = maint_->update_meta(meta);
         Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
         result.value = new_value ? *new_value : val;
         data_access(blk, &wb);
@@ -164,10 +180,11 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             int scan_blk = ref_to_blk(sr.value);
             Bytes scan_raw = data_access(scan_blk);
             auto [sv, sm] = decode_epoch(scan_raw);
-            if (maint_->should_demote(sm))
+            if (maint_->should_demote_cache(sm.fp))
                 da_pending_demotions_.push_back(sr.key);
         }
 
+        maint_->tick();
         if (maint_->should_maintain())
             do_da_maintenance_step();
 
@@ -195,32 +212,62 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         }
 
         // ── Fallback: sequential epoch path (local mode, no channel) ──
-        OmapInterface* target = is_hot_physical ? hot_omap_.get()
-                                                : cold_omap_.get();
-        OmapInterface* other  = is_hot_physical ? cold_omap_.get()
-                                                : hot_omap_.get();
+        bool is_in_cache = cache_keys_.count(key) > 0;
 
-        Bytes ref = target->search(key);
-        int blk = ref_to_blk(ref);
-        Bytes raw = data_access(blk);
+        if (is_in_cache) {
+            Bytes ref = cache_data_refs_[key];
+            int blk = ref_to_blk(ref);
+            Bytes raw = data_access(blk);
+            auto [val, meta] = decode_epoch(raw);
+            meta = maint_->update_meta(meta);
+            Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
+            result.value = new_value ? *new_value : val;
+            data_access(blk, &wb);
+            maint_->update_cache_fp(key, meta.fp);
+            hot_omap_->dummy_access();
+            if (config_.mode == SecurityMode::FullOblivious)
+                cold_omap_->dummy_access();
+            else
+                cold_omap_->partial_dummy_access();
+        } else {
+            OmapInterface* target = is_hot_physical ? hot_omap_.get()
+                                                    : cold_omap_.get();
+            OmapInterface* other  = is_hot_physical ? cold_omap_.get()
+                                                    : hot_omap_.get();
+            Bytes ref = target->search(key);
+            int blk = ref_to_blk(ref);
+            Bytes raw = data_access(blk);
+            auto [val, meta] = decode_epoch(raw);
+            meta = maint_->update_meta(meta);
+            Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
+            result.value = new_value ? *new_value : val;
+            data_access(blk, &wb);
 
-        auto [val, meta] = decode_epoch(raw);
-        bool promote_flag = false;
-        meta = maint_->on_access(key, is_hot_logical, meta, promote_flag);
-        Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
-        result.value = new_value ? *new_value : val;
-        data_access(blk, &wb);
+            if (config_.mode == SecurityMode::FullOblivious)
+                other->dummy_access();
+            else
+                other->partial_dummy_access();
 
-        if (config_.mode == SecurityMode::FullOblivious)
-            other->dummy_access();
-        else
-            other->partial_dummy_access();
+            if (!is_hot_logical && !ref.empty()
+                && maint_->swap_state() == SwapState::Idle
+                && maint_->should_promote(meta.fp)) {
+                cold_omap_->remove(key);
+                CacheEntry evicted = maint_->cache_admit(key, meta.fp, false);
+                pending_insert_key_ = evicted.key;
+                pending_insert_ref_ = cache_data_refs_[evicted.key];
+                cache_keys_.erase(evicted.key);
+                cache_data_refs_.erase(evicted.key);
+                hot_keys_.erase(evicted.key);
+                cache_keys_.insert(key);
+                cache_data_refs_[key] = ref;
+                hot_keys_.insert(key);
+                maint_->set_swap_state(SwapState::ColdPend);
+            }
+        }
 
         result.hot_bw = hot_omap_->last_stats();
 
-        if (promote_flag && !is_hot_logical && !ref.empty())
-            pending_promotions_.push_back({key, ref});
-
+        maint_->tick();
         if (maint_->should_maintain())
             do_maintenance_step();
 
@@ -283,128 +330,108 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
     else
         result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
 
-    if (maint_ && !bplus_piggyback && !da_piggyback && maint_->should_maintain())
-        do_maintenance_step();
-
-    if (pig_active && maint_->has_pending_promotions())
-        do_promotion_standalone();
+    if (maint_ && !bplus_piggyback && !da_piggyback) {
+        maint_->tick();
+        if (maint_->should_maintain())
+            do_maintenance_step();
+    }
 
     return result;
 }
 
 void TieredOMap::do_maintenance_step() {
-    if (hot_key_list_.empty()) return;
+    auto st = maint_->swap_state();
 
-    bool physical = true;
+    // Task 1: Hot demotion scan (only when Idle)
+    if (st == SwapState::Idle && !hot_key_list_.empty()) {
+        auto it = std::upper_bound(
+            hot_key_list_.begin(), hot_key_list_.end(), maint_->scan_ptr());
+        if (it == hot_key_list_.end()) {
+            maint_->reset_scan_ptr();
+            it = hot_key_list_.begin();
+        }
+        int scan_key = *it;
+        maint_->set_scan_ptr(scan_key);
 
-    int idx = maint_->scan_index();
-    if (idx >= static_cast<int>(hot_key_list_.size()))
-        idx = 0;
+        Bytes ref = hot_omap_->search(scan_key);
+        int blk = ref_to_blk(ref);
+        Bytes raw = data_access(blk);
+        auto [val, meta] = decode_epoch(raw);
 
-    int scan_key = hot_key_list_[idx];
-
-    Bytes ref = hot_omap_->search(scan_key);
-    int blk = ref_to_blk(ref);
-    Bytes raw = data_access(blk);
-    auto [val, meta] = decode_epoch(raw);
-    bool demote = maint_->should_demote(meta);
-
-    if (physical) {
-        if (demote) {
+        if (maint_->should_demote_cache(meta.fp)) {
             hot_omap_->remove(scan_key);
-            cold_omap_->insert(scan_key, ref);
+
+            CacheEntry evicted = maint_->cache_admit(scan_key, meta.fp, true);
+            pending_insert_key_ = evicted.key;
+            pending_insert_ref_ = cache_data_refs_[evicted.key];
+
+            phys_hot_keys_.erase(scan_key);
+            {
+                auto eit = std::lower_bound(
+                    hot_key_list_.begin(), hot_key_list_.end(), scan_key);
+                if (eit != hot_key_list_.end() && *eit == scan_key)
+                    hot_key_list_.erase(eit);
+            }
+            cache_keys_.insert(scan_key);
+            cache_data_refs_[scan_key] = ref;
+
+            cache_keys_.erase(evicted.key);
+            cache_data_refs_.erase(evicted.key);
+
+            st = SwapState::HotPend;
+            maint_->set_swap_state(st);
         } else {
             hot_omap_->dummy_access();
-            cold_omap_->dummy_access();
         }
-    } else {
+    } else if (st == SwapState::Idle) {
+        hot_omap_->dummy_access();
+    }
+
+    // Tasks 2 & 3: Pending insertion
+    if (st == SwapState::HotPend) {
+        hot_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        phys_hot_keys_.insert(pending_insert_key_);
+        {
+            auto it = std::lower_bound(
+                hot_key_list_.begin(), hot_key_list_.end(), pending_insert_key_);
+            hot_key_list_.insert(it, pending_insert_key_);
+        }
         cold_omap_->dummy_access();
-    }
-
-    if (demote) {
-        hot_keys_.erase(scan_key);
-        if (physical) phys_hot_keys_.erase(scan_key);
-        auto it = std::lower_bound(
-            hot_key_list_.begin(), hot_key_list_.end(), scan_key);
-        if (it != hot_key_list_.end() && *it == scan_key)
-            hot_key_list_.erase(it);
-    }
-
-    maint_->advance_scan(static_cast<int>(hot_key_list_.size()));
-
-    int promo_key = INVALID_KEY;
-    bool has_promo = maint_->pop_promotion(promo_key);
-    bool do_promote = has_promo
-                      && !hot_keys_.count(promo_key)
-                      && static_cast<int>(hot_keys_.size()) < hot_capacity_;
-
-    if (physical) {
-        if (do_promote) {
-            Bytes cold_ref = cold_omap_->search(promo_key);
-            cold_omap_->remove(promo_key);
-            hot_omap_->insert(promo_key, cold_ref);
-        } else {
-            cold_omap_->dummy_access();
-            cold_omap_->dummy_access();
-            hot_omap_->dummy_access();
-        }
-    }
-
-    if (do_promote) {
-        hot_keys_.insert(promo_key);
-        if (physical) phys_hot_keys_.insert(promo_key);
-        auto it = std::lower_bound(
-            hot_key_list_.begin(), hot_key_list_.end(), promo_key);
-        hot_key_list_.insert(it, promo_key);
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else if (st == SwapState::ColdPend) {
+        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        hot_omap_->dummy_access();
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else {
+        hot_omap_->dummy_access();
+        cold_omap_->dummy_access();
     }
 }
 
 void TieredOMap::do_promotion_standalone() {
-    bool physical = true;
-
-    int promo_key = INVALID_KEY;
-    bool has_promo = maint_->pop_promotion(promo_key);
-    bool do_promote = has_promo
-                      && !hot_keys_.count(promo_key)
-                      && static_cast<int>(hot_keys_.size()) < hot_capacity_;
-
-    if (physical) {
-        if (do_promote) {
-            Bytes cold_ref = cold_omap_->search(promo_key);
-            cold_omap_->remove(promo_key);
-            hot_omap_->insert(promo_key, cold_ref);
-        } else {
-            cold_omap_->dummy_access();
-            cold_omap_->dummy_access();
-            hot_omap_->dummy_access();
-        }
-    }
-
-    if (do_promote) {
-        hot_keys_.insert(promo_key);
-        if (physical) phys_hot_keys_.insert(promo_key);
-        auto it = std::lower_bound(
-            hot_key_list_.begin(), hot_key_list_.end(), promo_key);
-        hot_key_list_.insert(it, promo_key);
-    }
+    // No-op: cold promotion is now reactive (handled during access).
 }
 
 void TieredOMap::do_interleaved_maintenance() {
-    if (hot_key_list_.empty() && pending_demotions_.empty()
-        && pending_promotions_.empty())
-        return;
+    auto st = maint_->swap_state();
 
     bool use_partial = (config_.mode == SecurityMode::TierMembership);
 
-    if (maint_phase_ == 0) {
-        // ── Phase 0: Scan — find demotion candidate in hot OMAP ──
-        if (hot_key_list_.empty()) { maint_phase_ = 1; return; }
+    // Task 1: Hot demotion scan (only when Idle)
+    if (st == SwapState::Idle && !hot_key_list_.empty()) {
+        auto sit = std::upper_bound(
+            hot_key_list_.begin(), hot_key_list_.end(), maint_->scan_ptr());
+        if (sit == hot_key_list_.end()) {
+            maint_->reset_scan_ptr();
+            sit = hot_key_list_.begin();
+        }
+        int scan_key = *sit;
+        maint_->set_scan_ptr(scan_key);
 
-        int idx = maint_->scan_index();
-        if (idx >= static_cast<int>(hot_key_list_.size())) idx = 0;
-        int scan_key = hot_key_list_[idx];
-
-        // Interleaved scan: search hot OMAP + dummy on cold OMAP
         hot_omap_->begin_step_search(scan_key, nullptr);
         if (use_partial)
             cold_omap_->begin_step_partial_dummy();
@@ -419,59 +446,67 @@ void TieredOMap::do_interleaved_maintenance() {
         if (blk >= 0) {
             Bytes raw = data_access(blk);
             auto [val, meta] = decode_epoch(raw);
-            demote = maint_->should_demote(meta);
+            demote = maint_->should_demote_cache(meta.fp);
         }
 
         if (demote) {
             hot_omap_->remove(scan_key);
-            pending_demotions_.push_back({scan_key, ref});
-            hot_keys_.erase(scan_key);
+            CacheEntry evicted = maint_->cache_admit(scan_key, 0, true);
+            pending_insert_key_ = evicted.key;
+            pending_insert_ref_ = cache_data_refs_[evicted.key];
+
             phys_hot_keys_.erase(scan_key);
-            auto it = std::lower_bound(
-                hot_key_list_.begin(), hot_key_list_.end(), scan_key);
-            if (it != hot_key_list_.end() && *it == scan_key)
-                hot_key_list_.erase(it);
+            {
+                auto eit = std::lower_bound(
+                    hot_key_list_.begin(), hot_key_list_.end(), scan_key);
+                if (eit != hot_key_list_.end() && *eit == scan_key)
+                    hot_key_list_.erase(eit);
+            }
+            cache_keys_.insert(scan_key);
+            cache_data_refs_[scan_key] = ref;
+            cache_keys_.erase(evicted.key);
+            cache_data_refs_.erase(evicted.key);
+
+            st = SwapState::HotPend;
+            maint_->set_swap_state(st);
         }
+    }
 
-        maint_->advance_scan(static_cast<int>(hot_key_list_.size()));
-        maint_phase_ = 1;
-
+    // Tasks 2 & 3: Pending insertion
+    if (st == SwapState::HotPend) {
+        hot_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        phys_hot_keys_.insert(pending_insert_key_);
+        {
+            auto it = std::lower_bound(
+                hot_key_list_.begin(), hot_key_list_.end(), pending_insert_key_);
+            hot_key_list_.insert(it, pending_insert_key_);
+        }
+        cold_omap_->dummy_access();
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else if (st == SwapState::ColdPend) {
+        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        hot_omap_->dummy_access();
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
     } else {
-        // ── Phase 1: Insert — complete pending demotions/promotions ──
-        if (!pending_demotions_.empty()) {
-            auto item = pending_demotions_.front();
-            pending_demotions_.pop_front();
-            cold_omap_->insert(item.key, item.data_ref);
-        } else {
-            cold_omap_->dummy_access();
-        }
-
-        if (!pending_promotions_.empty()
-            && static_cast<int>(hot_keys_.size()) < hot_capacity_) {
-            auto item = pending_promotions_.front();
-            pending_promotions_.pop_front();
-            hot_omap_->insert(item.key, item.data_ref);
-            hot_keys_.insert(item.key);
-            phys_hot_keys_.insert(item.key);
-            auto it = std::lower_bound(
-                hot_key_list_.begin(), hot_key_list_.end(), item.key);
-            hot_key_list_.insert(it, item.key);
-        } else {
-            hot_omap_->dummy_access();
-        }
-
-        maint_phase_ = 0;
+        hot_omap_->dummy_access();
+        cold_omap_->dummy_access();
     }
 }
 
 void TieredOMap::do_da_maintenance_step() {
+    // DA path: demotions discovered by piggyback scan, stored in da_pending_demotions_.
+    // Use cache-based logic analogous to do_maintenance_step().
     int dk = INVALID_KEY;
     if (!da_pending_demotions_.empty()) {
         dk = da_pending_demotions_.front();
         da_pending_demotions_.pop_front();
     }
 
-    bool can_demote = (dk != INVALID_KEY) && hot_keys_.count(dk);
+    bool can_demote = (dk != INVALID_KEY) && phys_hot_keys_.count(dk);
     if (can_demote) {
         Bytes ref = hot_omap_->search(dk);
         hot_omap_->remove(dk);
@@ -488,22 +523,15 @@ void TieredOMap::do_da_maintenance_step() {
         cold_omap_->dummy_access();
     }
 
-    int promo_key = INVALID_KEY;
-    bool has_promo = maint_->pop_promotion(promo_key);
-    bool do_promote = has_promo
-                      && !hot_keys_.count(promo_key)
-                      && static_cast<int>(hot_keys_.size()) < hot_capacity_;
-    if (do_promote) {
-        Bytes cold_ref = cold_omap_->search(promo_key);
-        cold_omap_->remove(promo_key);
-        hot_omap_->insert(promo_key, cold_ref);
-        hot_keys_.insert(promo_key);
-        phys_hot_keys_.insert(promo_key);
-        auto it = std::lower_bound(
-            hot_key_list_.begin(), hot_key_list_.end(), promo_key);
-        hot_key_list_.insert(it, promo_key);
+    // Pending insertion for cache-based promotions
+    auto st = maint_->swap_state();
+    if (st == SwapState::ColdPend) {
+        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        hot_omap_->dummy_access();
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
     } else {
-        cold_omap_->dummy_access();
         cold_omap_->dummy_access();
         hot_omap_->dummy_access();
     }
@@ -665,12 +693,11 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                 Bytes sv;
                 if (epoch_mode && maint_) {
                     auto [val, meta] = decode_epoch(b.value);
-                    bool promote_flag = false;
-                    meta = maint_->on_access(key, is_hot_logical, meta, promote_flag);
+                    meta = maint_->update_meta(meta);
                     result.value = new_value ? *new_value : val;
                     sv = encode_with_epoch(result.value, meta);
-                    if (promote_flag && !is_hot_logical && !searcher_ref.empty())
-                        pending_promotions_.push_back({key, searcher_ref});
+                    if (cache_keys_.count(key))
+                        maint_->update_cache_fp(key, meta.fp);
                 } else {
                     result.value = new_value ? *new_value : b.value;
                     sv = new_value ? *new_value : b.value;
@@ -768,8 +795,7 @@ AccessResult TieredOMap::interleaved_da_piggyback(int key, const Bytes* new_valu
     data_oram_.dummy_access();
 
     auto [val, meta] = decode_epoch(raw);
-    bool promote_flag = false;
-    meta = maint_->on_access(key, is_hot_logical, meta, promote_flag);
+    meta = maint_->update_meta(meta);
     Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
     result.value = new_value ? *new_value : val;
 
@@ -778,40 +804,25 @@ AccessResult TieredOMap::interleaved_da_piggyback(int key, const Bytes* new_valu
 
     auto* da_hot = static_cast<DaOstOmap*>(hot_omap_.get());
 
-    if (!is_hot_physical) {
-        da_hot->begin_step_scan();
-        cold_omap_->begin_step_partial_dummy();
-        run_interleaved_loop(da_hot, cold_omap_.get());
-        cold_omap_->step_finish();
-        auto sr = da_hot->step_finish_scan();
+    da_hot->begin_step_scan();
+    cold_omap_->begin_step_partial_dummy();
+    run_interleaved_loop(da_hot, cold_omap_.get());
+    cold_omap_->step_finish();
+    auto sr = da_hot->step_finish_scan();
 
-        if (sr.key != INVALID_KEY && !sr.value.empty()) {
-            int scan_blk = ref_to_blk(sr.value);
-            Bytes scan_raw = data_access(scan_blk);
-            auto [sv, sm] = decode_epoch(scan_raw);
-            if (maint_->should_demote(sm))
-                da_pending_demotions_.push_back(sr.key);
-        }
-    } else {
-        da_hot->begin_step_scan();
-        cold_omap_->begin_step_partial_dummy();
-        run_interleaved_loop(da_hot, cold_omap_.get());
-        cold_omap_->step_finish();
-        auto sr = da_hot->step_finish_scan();
-
-        if (sr.key != INVALID_KEY && !sr.value.empty()) {
-            int scan_blk = ref_to_blk(sr.value);
-            Bytes scan_raw = data_access(scan_blk);
-            auto [sv, sm] = decode_epoch(scan_raw);
-            if (maint_->should_demote(sm))
-                da_pending_demotions_.push_back(sr.key);
-        }
+    if (sr.key != INVALID_KEY && !sr.value.empty()) {
+        int scan_blk = ref_to_blk(sr.value);
+        Bytes scan_raw = data_access(scan_blk);
+        auto [sv, sm] = decode_epoch(scan_raw);
+        if (maint_->should_demote_cache(sm.fp))
+            da_pending_demotions_.push_back(sr.key);
     }
 
     result.hot_bw = hot_omap_->last_stats();
     result.cold_bw = cold_omap_->last_stats();
     auto data_bw = data_oram_.last_stats();
 
+    maint_->tick();
     if (maint_->should_maintain())
         do_da_maintenance_step();
 

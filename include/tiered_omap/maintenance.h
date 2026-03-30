@@ -1,112 +1,126 @@
 #pragma once
 
 #include "tiered_omap/common.h"
-#include <queue>
+#include <algorithm>
+#include <vector>
 
 namespace tiered_omap {
 
 struct MaintenanceConfig {
-    int observation_window = 65536;   // B_obs: frequency estimation window
-    int swap_interval = 32;           // B_swap: maintenance step frequency
-    int promote_threshold = 5;        // θ_p
-    int demote_threshold = 2;         // θ_d
-    int staleness_windows = 1;        // Δ: stale if ep ≤ obs_epoch - Δ
+    int observation_window = 65536;   // B_obs: epoch length for frequency estimation
+    int swap_interval = 32;           // B_swap (= B1 = B2 = B3)
+    int cache_size = 8;               // B: client-side cache capacity
     bool enabled = false;
     bool piggyback = false;
 };
 
-enum class MaintenanceAction { None, Promote, Demote };
-
-struct MaintenanceDecision {
-    MaintenanceAction action = MaintenanceAction::None;
+struct CacheEntry {
     int key = INVALID_KEY;
+    int fp = 0;
 };
+
+enum class SwapState { Idle, HotPend, ColdPend };
 
 class MaintenanceManager {
 public:
     explicit MaintenanceManager(const MaintenanceConfig& cfg)
         : cfg_(cfg) {}
 
-    // Called after each access. Updates epoch metadata and detects promotions.
-    // The observation epoch e_obs = floor(total_accesses / B_obs) controls
-    // frequency resets; the swap counter triggers maintenance every B_swap.
-    EpochMeta on_access(int key, bool is_hot,
-                        const EpochMeta& stored, bool& should_promote) {
-        should_promote = false;
-        EpochMeta updated = stored;
-
-        bool epoch_changed = (updated.ep < obs_epoch_);
-        if (epoch_changed) {
-            prev_freq_ = updated.cnt;
-            updated.cnt = 1;
-            updated.ep = obs_epoch_;
+    // Paper Algorithm 2: UpdateMeta(k, cnt, ep, fp, e)
+    EpochMeta update_meta(const EpochMeta& stored) const {
+        EpochMeta m = stored;
+        if (m.ep < obs_epoch_) {
+            m.fp = (m.ep == obs_epoch_ - 1) ? m.cnt : 0;
+            m.cnt = 1;
+            m.ep = obs_epoch_;
         } else {
-            updated.cnt = updated.cnt + 1;
+            ++m.cnt;
         }
+        return m;
+    }
 
-        if (epoch_changed && !is_hot
-            && prev_freq_ >= cfg_.promote_threshold) {
-            should_promote = true;
-            promotion_queue_.push(key);
-        }
-
+    void tick() {
         ++total_accesses_;
         obs_epoch_ = total_accesses_ / cfg_.observation_window;
-        swap_counter_ = total_accesses_ % cfg_.swap_interval;
-
-        return updated;
     }
 
-    // Maintenance triggers right after a swap boundary (counter wraps to 0).
-    // Skip epoch 0: no reliable frequency data until a full window completes.
     bool should_maintain() const {
-        return swap_counter_ == 0 && total_accesses_ > 0 && obs_epoch_ > 0;
+        return total_accesses_ > 0 && obs_epoch_ > 0
+               && (total_accesses_ % cfg_.swap_interval) == 0;
     }
 
-    // Will the next access trigger maintenance?
     bool should_maintain_next() const {
-        return (total_accesses_ + 1) % cfg_.swap_interval == 0;
+        return ((total_accesses_ + 1) % cfg_.swap_interval) == 0;
     }
 
-    int scan_index() const { return scan_ptr_; }
-
-    void advance_scan(int hot_set_size) {
-        if (hot_set_size > 0)
-            scan_ptr_ = (scan_ptr_ + 1) % hot_set_size;
+    // Cold promotion: x.fp > min(cache.fp)
+    bool should_promote(int fp) const {
+        if (cache_.empty()) return false;
+        int min_fp = cache_[0].fp;
+        for (size_t i = 1; i < cache_.size(); ++i)
+            if (cache_[i].fp < min_fp) min_fp = cache_[i].fp;
+        return fp > min_fp;
     }
 
-    // Demotion: only use the previous completed epoch's data.
-    bool should_demote(const EpochMeta& meta) const {
-        if (meta.ep == obs_epoch_) return false;
-        if (meta.ep == obs_epoch_ - 1)
-            return meta.cnt < cfg_.demote_threshold;
-        return true;
+    // Hot demotion: z.fp < max(cache.fp)
+    bool should_demote_cache(int fp) const {
+        if (cache_.empty()) return false;
+        int max_fp = cache_[0].fp;
+        for (size_t i = 1; i < cache_.size(); ++i)
+            if (cache_[i].fp > max_fp) max_fp = cache_[i].fp;
+        return fp < max_fp;
     }
 
-    bool pop_promotion(int& key) {
-        if (promotion_queue_.empty()) return false;
-        key = promotion_queue_.front();
-        promotion_queue_.pop();
-        return true;
+    // Paper Algorithm 2: CacheAdmit(x, dir).
+    // Adds (key, fp) to B, then evicts one entry:
+    //   from_hot=true  → evict argmax(fp) (returns to OMAP_h)
+    //   from_hot=false → evict argmin(fp) (returns to OMAP_c)
+    CacheEntry cache_admit(int key, int fp, bool from_hot) {
+        cache_.push_back({key, fp});
+        size_t idx = 0;
+        if (from_hot) {
+            for (size_t i = 1; i < cache_.size(); ++i)
+                if (cache_[i].fp > cache_[idx].fp) idx = i;
+        } else {
+            for (size_t i = 1; i < cache_.size(); ++i)
+                if (cache_[i].fp < cache_[idx].fp) idx = i;
+        }
+        CacheEntry evicted = cache_[idx];
+        cache_.erase(cache_.begin() + static_cast<long>(idx));
+        return evicted;
     }
 
-    bool has_pending_promotions() const { return !promotion_queue_.empty(); }
+    SwapState swap_state() const { return swap_state_; }
+    void set_swap_state(SwapState st) { swap_state_ = st; }
+
+    int scan_ptr() const { return scan_ptr_; }
+    void set_scan_ptr(int key) { scan_ptr_ = key; }
+    void reset_scan_ptr() { scan_ptr_ = -1; }
+
+    void init_cache(const std::vector<CacheEntry>& entries) { cache_ = entries; }
+
+    bool is_in_cache(int key) const {
+        for (auto& e : cache_) if (e.key == key) return true;
+        return false;
+    }
+
+    void update_cache_fp(int key, int new_fp) {
+        for (auto& e : cache_)
+            if (e.key == key) { e.fp = new_fp; break; }
+    }
 
     int obs_epoch() const { return obs_epoch_; }
     int total_access_count() const { return total_accesses_; }
-    int swap_count() const { return swap_counter_; }
-    int last_prev_freq() const { return prev_freq_; }
-
     const MaintenanceConfig& config() const { return cfg_; }
+    const std::vector<CacheEntry>& cache() const { return cache_; }
 
 private:
     MaintenanceConfig cfg_;
+    std::vector<CacheEntry> cache_;
+    SwapState swap_state_ = SwapState::Idle;
     int obs_epoch_ = 0;
     int total_accesses_ = 0;
-    int swap_counter_ = 0;
     int scan_ptr_ = 0;
-    int prev_freq_ = 0;
-    std::queue<int> promotion_queue_;
 };
 
 }  // namespace tiered_omap

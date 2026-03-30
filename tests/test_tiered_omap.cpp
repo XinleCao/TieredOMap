@@ -255,49 +255,51 @@ TEST(TieredOMap, SplitORAM_BandwidthSaving) {
 
 TEST(DynamicMaintenance, EpochMetadataEncodeDecode) {
     Bytes val = int_to_bytes(42);
-    EpochMeta m{5, 3};
+    EpochMeta m{5, 3, 7};
     Bytes encoded = encode_with_epoch(val, m);
     auto [decoded_val, decoded_m] = decode_epoch(encoded);
     EXPECT_EQ(bytes_to_int(decoded_val), 42);
     EXPECT_EQ(decoded_m.cnt, 5);
     EXPECT_EQ(decoded_m.ep, 3);
+    EXPECT_EQ(decoded_m.fp, 7);
 }
 
 TEST(DynamicMaintenance, MaintenanceManagerBasic) {
     MaintenanceConfig mcfg;
     mcfg.observation_window = 10;
     mcfg.swap_interval = 10;
-    mcfg.promote_threshold = 3;
-    mcfg.demote_threshold = 1;
-    mcfg.staleness_windows = 2;
+    mcfg.cache_size = 8;
     mcfg.enabled = true;
 
     MaintenanceManager mgr(mcfg);
+    // Seed cache so should_promote compares fp against min cache frequency.
+    std::vector<CacheEntry> seed;
+    for (int i = 0; i < 8; ++i)
+        seed.push_back({i, 1});
+    mgr.init_cache(seed);
 
-    EpochMeta stored{0, 0};
-    bool should_promote = false;
+    EpochMeta stored{};
 
-    // Access a cold key multiple times within same epoch.
     for (int i = 0; i < 5; ++i) {
-        stored = mgr.on_access(100, false, stored, should_promote);
+        stored = mgr.update_meta(stored);
+        mgr.tick();
     }
     EXPECT_EQ(stored.cnt, 5);
-    EXPECT_EQ(stored.ep, 0);  // still within first observation window (5 < B_obs)
+    EXPECT_EQ(stored.ep, 0);
 
-    // The key should have been promoted (prev_freq >= threshold on epoch change).
-    // But we need to cross an epoch boundary for prev_freq to be set.
-    // Let's fill the epoch.
-    EpochMeta dummy{0, 0};
+    EpochMeta dummy{};
     for (int i = 0; i < 5; ++i) {
-        dummy = mgr.on_access(200, true, dummy, should_promote);
+        dummy = mgr.update_meta(dummy);
+        mgr.tick();
     }
-    // Now observation epoch should have advanced (10 accesses / B_obs = 1).
     EXPECT_EQ(mgr.obs_epoch(), 1);
 
-    // Access key 100 again in new epoch.
-    stored = mgr.on_access(100, false, stored, should_promote);
-    // prev_freq should be 5 (from last epoch), which >= promote_threshold=3.
-    EXPECT_TRUE(should_promote);
+    stored = mgr.update_meta(stored);
+    // Crossing epoch: fp becomes prior-epoch count (5).
+    EXPECT_EQ(stored.fp, 5);
+    EXPECT_TRUE(mgr.should_promote(stored.fp))
+        << "cold fp should exceed min cache fp";
+    mgr.tick();
 }
 
 TEST(DynamicMaintenance, PromoteColdKey) {
@@ -309,9 +311,7 @@ TEST(DynamicMaintenance, PromoteColdKey) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 16;
     cfg.maintenance.swap_interval = 16;
-    cfg.maintenance.promote_threshold = 3;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -341,9 +341,7 @@ TEST(DynamicMaintenance, DemoteStaleKey) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 100;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -352,14 +350,14 @@ TEST(DynamicMaintenance, DemoteStaleKey) {
 
     EXPECT_EQ(tmap.hot_set_size(), 4);
 
-    // Only access cold keys for many epochs so hot keys become stale.
     for (int round = 0; round < 200; ++round) {
         tmap.access(16);
     }
 
-    // At least some hot keys should have been demoted by the scan.
-    EXPECT_LT(tmap.hot_set_size(), 4)
-        << "Some stale hot keys should have been demoted";
+    // Cache-based: hot set size stays constant, but composition changes.
+    EXPECT_EQ(tmap.hot_set_size(), 4);
+    EXPECT_TRUE(tmap.hot_keys().count(16))
+        << "Frequently accessed cold key 16 should have been promoted";
 }
 
 // ─── B+ Tree Physical Migration tests ────────────────────────────────────
@@ -375,9 +373,7 @@ TEST(DynamicMaintenance, BPlusPhysicalPromotion) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 16;
     cfg.maintenance.swap_interval = 16;
-    cfg.maintenance.promote_threshold = 3;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -412,9 +408,7 @@ TEST(DynamicMaintenance, BPlusPhysicalDemotion) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 100;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -426,8 +420,9 @@ TEST(DynamicMaintenance, BPlusPhysicalDemotion) {
     for (int round = 0; round < 200; ++round)
         tmap.access(16);
 
-    EXPECT_LT(tmap.hot_set_size(), 4)
-        << "Stale hot keys should have been physically demoted";
+    EXPECT_EQ(tmap.hot_set_size(), 4);
+    EXPECT_TRUE(tmap.hot_keys().count(16))
+        << "Frequently accessed cold key 16 should be promoted";
 
     for (int k = 0; k < N; ++k) {
         auto r = tmap.access(k);
@@ -447,9 +442,7 @@ TEST(DynamicMaintenance, BPlusPhysicalRoundTrip) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 3;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -489,9 +482,7 @@ TEST(Piggyback, BPlusDemotionZeroExtraRounds) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 100;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
     cfg.maintenance.piggyback = true;
 
     TieredOMap tmap(cfg);
@@ -525,9 +516,7 @@ TEST(Piggyback, BPlusValuesPreservedAfterDemotion) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 100;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
     cfg.maintenance.piggyback = true;
 
     TieredOMap tmap(cfg);
@@ -560,9 +549,7 @@ TEST(Piggyback, StandaloneVsPiggybackConsistency) {
         cfg.maintenance.enabled = true;
         cfg.maintenance.observation_window = 8;
         cfg.maintenance.swap_interval = 8;
-        cfg.maintenance.promote_threshold = 100;
-        cfg.maintenance.demote_threshold = 1;
-        cfg.maintenance.staleness_windows = 2;
+        cfg.maintenance.cache_size = 8;
         cfg.maintenance.piggyback = piggyback;
 
         TieredOMap tmap(cfg);
@@ -602,9 +589,7 @@ TEST(DynamicMaintenance, AVLPhysicalPromotion) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 16;
     cfg.maintenance.swap_interval = 16;
-    cfg.maintenance.promote_threshold = 3;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -638,9 +623,7 @@ TEST(DynamicMaintenance, AVLPhysicalDemotion) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 100;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 2;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -652,8 +635,9 @@ TEST(DynamicMaintenance, AVLPhysicalDemotion) {
     for (int round = 0; round < 200; ++round)
         tmap.access(16);
 
-    EXPECT_LT(tmap.hot_set_size(), 4)
-        << "Stale hot keys should have been physically demoted";
+    EXPECT_EQ(tmap.hot_set_size(), 4);
+    EXPECT_TRUE(tmap.hot_keys().count(16))
+        << "Frequently accessed cold key 16 should be promoted";
 
     for (int k = 0; k < N; ++k) {
         auto r = tmap.access(k);
@@ -672,9 +656,7 @@ TEST(DynamicMaintenance, AVLPhysicalRoundTrip) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 8;
     cfg.maintenance.swap_interval = 8;
-    cfg.maintenance.promote_threshold = 3;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 2;
+    cfg.maintenance.cache_size = 8;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);
@@ -707,9 +689,7 @@ TEST(DynamicMaintenance, ValuesPreservedWithEpoch) {
     cfg.maintenance.enabled = true;
     cfg.maintenance.observation_window = 16;
     cfg.maintenance.swap_interval = 16;
-    cfg.maintenance.promote_threshold = 100;
-    cfg.maintenance.demote_threshold = 1;
-    cfg.maintenance.staleness_windows = 100;
+    cfg.maintenance.cache_size = 8;
 
     TieredOMap tmap(cfg);
     auto data = make_data(N);

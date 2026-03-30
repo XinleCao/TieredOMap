@@ -1045,9 +1045,7 @@ static void run_convergence(const Cfg& cfg, int logN, const char* file_tag) {
         tc.maintenance.enabled = true;
         tc.maintenance.observation_window = B_obs;
         tc.maintenance.swap_interval = 32;
-        tc.maintenance.promote_threshold = 5;
-        tc.maintenance.demote_threshold = 2;
-        tc.maintenance.staleness_windows = 1;
+        tc.maintenance.cache_size = 8;
         TieredOMap tm(tc); tm.init(data, hk);
         ZipfSampler z(N, s, 42);
 
@@ -1120,9 +1118,7 @@ static void run_drift(const Cfg& cfg, int logN, const char* file_tag) {
             tc.maintenance.enabled = true;
             tc.maintenance.observation_window = B_obs_fixed;
             tc.maintenance.swap_interval = B_swap;
-            tc.maintenance.promote_threshold = 5;
-            tc.maintenance.demote_threshold = 2;
-            tc.maintenance.staleness_windows = 1;
+            tc.maintenance.cache_size = 8;
         }
         TieredOMap tm(tc); tm.init(data, hk);
         ZipfSampler z(N, s, 42);
@@ -1383,9 +1379,7 @@ static void exp_wan_dynamic(const Cfg& cfg) {
     mc.enabled = true;
     mc.observation_window = 256;
     mc.swap_interval = 256;
-    mc.promote_threshold = 5;
-    mc.demote_threshold = 2;
-    mc.staleness_windows = 3;
+    mc.cache_size = 8;
     mc.piggyback = true;
 
     std::cout << "  N=" << N << " n=" << n << " s=" << cfg.s
