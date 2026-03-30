@@ -53,6 +53,7 @@ struct AccessResult {
     BandwidthStats cold_bw;
     BandwidthStats total_bw;
     int rounds_to_answer = 0;
+    int last_access_fp = 0;
 };
 
 class TieredOMap {
@@ -89,9 +90,10 @@ public:
     static std::unique_ptr<TieredOMap> from_state(
         const uint8_t*& p, std::shared_ptr<TcpChannel> channel);
 
-    // Ordered list of hot keys for sequential scan demotion.
     const std::vector<int>& hot_key_list() const { return hot_key_list_; }
     MaintenanceManager* maintenance_mgr() { return maint_.get(); }
+
+    void enable_maintenance(const MaintenanceConfig& mc);
 
 private:
     Bytes data_access(int blk, const Bytes* new_value = nullptr) {
@@ -99,9 +101,10 @@ private:
         return data_oram_.access(blk, new_value);
     }
 
-    void do_maintenance_step();
-    void do_promotion_standalone();
-    void do_da_maintenance_step();
+    // Staggered maintenance steps (paper B1/B2/B3)
+    void do_scan_step();
+    void do_hot_insert_step();
+    void do_cold_insert_step();
 
     static bool is_da(OmapBackend be) {
         return be == OmapBackend::DaAvl || be == OmapBackend::DaBplus;
@@ -114,11 +117,6 @@ private:
                                     bool epoch_mode = false);
     AccessResult interleaved_da_piggyback(int key, const Bytes* new_value);
     void run_interleaved_loop(OmapInterface* a, OmapInterface* b);
-
-    void do_interleaved_maintenance();
-    struct CachedItem { int key = INVALID_KEY; Bytes data_ref; };
-    std::deque<CachedItem> pending_demotions_;
-    std::deque<CachedItem> pending_promotions_;
 
     // Cache-based maintenance state (paper Algorithm 2)
     std::unordered_set<int> cache_keys_;
@@ -138,7 +136,8 @@ private:
     std::unique_ptr<MaintenanceManager> maint_;
     int hot_capacity_ = 0;
 
-    std::deque<int> da_pending_demotions_;
+    // DA piggyback: pending demotions with (key, fp) from scan
+    std::deque<std::pair<int, int>> da_pending_demotions_;
 };
 
 }  // namespace tiered_omap

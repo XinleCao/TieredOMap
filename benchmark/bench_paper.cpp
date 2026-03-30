@@ -53,6 +53,7 @@ struct Cfg {
     double s = 1.0;
     int n = 1024;
     int max_logN = 20;
+    int min_logN = 0;
     int value_size = 256;
     std::string outdir = "results";
     std::string host;
@@ -77,6 +78,7 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--s") c.s = std::stod(v);
         else if (k == "--n") c.n = std::stoi(v);
         else if (k == "--max_logN") c.max_logN = std::stoi(v);
+        else if (k == "--min_logN") c.min_logN = std::stoi(v);
         else if (k == "--outdir") c.outdir = v;
         else if (k == "--value_size") c.value_size = std::stoi(v);
         else if (k == "--host") c.host = v;
@@ -268,7 +270,10 @@ static std::unique_ptr<TieredOMap> setup_tiered(
         cfg.channel->recv_msg(resp_type, resp);
         if (resp_type != MsgType::OK) throw std::runtime_error("SETUP_BENCH tiered failed");
         const uint8_t* p = resp.data();
-        return bench_setup::restore_tiered(p, cfg.channel);
+        auto tm = bench_setup::restore_tiered(p, cfg.channel);
+        if (maint.enabled)
+            tm->enable_maintenance(maint);
+        return tm;
     }
     auto data = make_data(N, value_size);
     auto hk = make_hot_keys(n);
@@ -1577,7 +1582,7 @@ static void exp_wan_dynamic(const Cfg& cfg) {
 static void exp_paper_wan(const Cfg& cfg) {
     std::cout << "\n=== Paper WAN: Table 1 + Fig 3 (hot/cold separated) ===\n";
     ensure_dir(cfg.outdir);
-    bool appending = !cfg.backend_filter.empty();
+    bool appending = !cfg.backend_filter.empty() || cfg.min_logN > 16;
     std::ofstream csv(cfg.outdir + "/paper_wan.csv",
                       appending ? std::ios::app : std::ios::trunc);
     if (!appending)
@@ -1593,8 +1598,9 @@ static void exp_paper_wan(const Cfg& cfg) {
         {"DaBplus", OmapBackend::DaBplus},
     };
 
+    int start = cfg.min_logN > 0 ? cfg.min_logN : 16;
     std::vector<int> logNs;
-    for (int l = 16; l <= cfg.max_logN; l += 2) logNs.push_back(l);
+    for (int l = start; l <= cfg.max_logN; l += 2) logNs.push_back(l);
 
     for (int logN : logNs) {
         int N = 1 << logN;
@@ -1859,6 +1865,240 @@ static void exp_profile(const Cfg& cfg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp: Dynamic Maintenance Overhead — worst-case single-query overhead
+//   Compare static vs dynamic TieredOMap at B_swap boundary.
+//   Report two time points: hot OMAP done (TP1), all done (TP2).
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_dynamic_overhead(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Dynamic Maintenance Overhead (worst-case) ===\n";
+    ensure_dir(cfg.outdir);
+
+    int logN = cfg.max_logN;
+    int N = 1 << logN;
+    int n = cfg.n;
+    int B_swap = 8;
+    OmapBackend be = OmapBackend::AVL;
+
+    MaintenanceConfig mc;
+    mc.enabled = true;
+    mc.observation_window = B_swap;
+    mc.swap_interval = B_swap;
+    mc.cache_size = 8;
+
+    std::ofstream csv(cfg.outdir + "/dynamic_overhead.csv");
+    csv << "mode,query_type,config,bw_KB,ans_rounds,total_rounds,ans_ms,total_ms\n";
+
+    int warmup_q = ((std::max(50, cfg.warmup) + B_swap - 1) / B_swap) * B_swap;
+    int measure_cycles = 8;
+
+    struct ModeSpec { const char* label; SecurityMode mode; };
+    ModeSpec modes[] = {
+        {"TM", SecurityMode::TierMembership},
+        {"FO", SecurityMode::FullOblivious},
+    };
+
+    struct Sample { double bw, ans, rnd, ams, tms; int cnt; };
+
+    for (auto& ms : modes) {
+        const char* ml = ms.label;
+        SecurityMode m = ms.mode;
+
+        std::unordered_set<int> hot_snapshot;
+        Sample static_hot{}, static_cold{}, dyn_hot{}, dyn_cold{};
+
+        // Phase 1: static measurement (one SETUP_BENCH)
+        {
+            g_progress.config(std::string(ml) + " static setup N=2^" + std::to_string(logN));
+            auto tm_s = setup_tiered(cfg, be, N, n, m, true);
+            g_progress.config_done("ok");
+
+            g_progress.config(std::string(ml) + " static warmup");
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < warmup_q; ++i) tm_s->access(z.sample());
+            hot_snapshot = tm_s->hot_keys();
+            g_progress.config_done("done");
+
+            for (const char* qtype : {"hot", "cold"}) {
+                bool is_hot = (std::string(qtype) == "hot");
+                auto& hk = tm_s->hot_keys();
+                int target = -1;
+                if (is_hot) {
+                    target = *hk.begin();
+                } else {
+                    for (int k = N - 1; k >= 0; --k)
+                        if (!hk.count(k)) { target = k; break; }
+                }
+                Sample& out = is_hot ? static_hot : static_cold;
+                int runs = measure_cycles * 2;
+                g_progress.config(std::string(ml) + " static " + qtype);
+                for (int i = 0; i < runs; ++i) {
+                    auto t0 = Clock::now();
+                    auto r = tm_s->access(target);
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    double frac = r.total_bw.rounds > 0
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    out.bw += r.total_bw.total_bytes();
+                    out.ans += r.rounds_to_answer;
+                    out.rnd += r.total_bw.rounds;
+                    out.ams += elapsed * frac;
+                    out.tms += elapsed;
+                    ++out.cnt;
+                }
+                std::ostringstream ss;
+                ss << "rnd=" << std::fixed << std::setprecision(1) << out.rnd/out.cnt;
+                g_progress.config_done(ss.str());
+            }
+        }
+
+        // Phase 2: dynamic measurement (separate SETUP_BENCH)
+        {
+            g_progress.config(std::string(ml) + " dynamic setup");
+            auto tm_d = setup_tiered(cfg, be, N, n, m, true,
+                                     0, OmapBackend::AVL, false, mc);
+            g_progress.config_done("ok");
+
+            g_progress.config(std::string(ml) + " dynamic warmup");
+            ZipfSampler z(N, cfg.s, 42);
+            for (int i = 0; i < warmup_q; ++i) tm_d->access(z.sample());
+            g_progress.config_done("done");
+
+            for (const char* qtype : {"hot", "cold"}) {
+                bool is_hot = (std::string(qtype) == "hot");
+                auto& hk = tm_d->hot_keys();
+                int target = -1;
+                if (is_hot) {
+                    target = *hk.begin();
+                } else {
+                    for (int k = N - 1; k >= 0; --k)
+                        if (!hk.count(k)) { target = k; break; }
+                }
+                Sample& out = is_hot ? dyn_hot : dyn_cold;
+                g_progress.config(std::string(ml) + " dynamic " + qtype + " boundary");
+                ZipfSampler z_fill(N, cfg.s, 99);
+                for (int cycle = 0; cycle < measure_cycles; ++cycle) {
+                    for (int j = 0; j < B_swap - 1; ++j)
+                        tm_d->access(z_fill.sample());
+                    auto t0 = Clock::now();
+                    auto r = tm_d->access(target);
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    double frac = r.total_bw.rounds > 0
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    out.bw += r.total_bw.total_bytes();
+                    out.ans += r.rounds_to_answer;
+                    out.rnd += r.total_bw.rounds;
+                    out.ams += elapsed * frac;
+                    out.tms += elapsed;
+                    ++out.cnt;
+                }
+                std::ostringstream ss;
+                ss << "rnd=" << std::fixed << std::setprecision(1) << out.rnd/out.cnt;
+                g_progress.config_done(ss.str());
+            }
+        }
+
+        auto write_row = [&](const char* mode_l, const char* qt, const char* conf,
+                             const Sample& s) {
+            csv << mode_l << "," << qt << "," << conf << ","
+                << std::fixed << std::setprecision(2) << s.bw / s.cnt / 1024 << ","
+                << std::setprecision(1) << s.ans / s.cnt << ","
+                << s.rnd / s.cnt << ","
+                << std::setprecision(1) << s.ams / s.cnt << ","
+                << s.tms / s.cnt << "\n";
+        };
+
+        write_row(ml, "hot", "static", static_hot);
+        write_row(ml, "hot", "dynamic_boundary", dyn_hot);
+        write_row(ml, "cold", "static", static_cold);
+        write_row(ml, "cold", "dynamic_boundary", dyn_cold);
+        csv.flush();
+
+        auto pct = [](double a, double b) { return (a - b) / b * 100; };
+        std::cout << "  " << ml << " hot rnd overhead: "
+                  << std::fixed << std::setprecision(1)
+                  << pct(dyn_hot.rnd/dyn_hot.cnt, static_hot.rnd/static_hot.cnt)
+                  << "% (" << dyn_hot.rnd/dyn_hot.cnt << " vs "
+                  << static_hot.rnd/static_hot.cnt << ")\n";
+        std::cout << "  " << ml << " cold rnd overhead: "
+                  << pct(dyn_cold.rnd/dyn_cold.cnt, static_cold.rnd/static_cold.cnt)
+                  << "% (" << dyn_cold.rnd/dyn_cold.cnt << " vs "
+                  << static_cold.rnd/static_cold.cnt << ")\n";
+    }
+
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/dynamic_overhead.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exp: Storage Cost — compute server-side ORAM storage for standard vs tiered
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_storage(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Storage Cost (server-side ORAM trees) ===\n";
+    ensure_dir(cfg.outdir);
+
+    std::ofstream csv(cfg.outdir + "/storage_cost.csv");
+    csv << "logN,config,component,capacity,level,total_nodes,bucket_size,"
+        << "block_size,tree_bytes,tree_MB\n";
+
+    int bs = 4;
+    int n = cfg.n;
+    int value_size = cfg.value_size;
+    int avl_idx_block = AVL_HEADER_SIZE + 4;
+
+    auto tree_info = [&](const char* conf, const char* comp,
+                         int cap, int block_sz) {
+        int lvl = ceil_log2(cap) + 1;
+        long long total_nodes = (1LL << lvl) - 1;
+        long long tree_bytes = total_nodes * bs * (block_sz + 8LL);
+        double tree_mb = tree_bytes / (1024.0 * 1024.0);
+        return std::make_tuple(lvl, total_nodes, tree_bytes, tree_mb);
+    };
+
+    for (int logN = 16; logN <= cfg.max_logN; logN += 2) {
+        int N = 1 << logN;
+        int cold_n = N - n;
+
+        auto emit = [&](const char* conf, const char* comp,
+                        int cap, int block_sz) {
+            auto [lvl, tn, tb, tmb] = tree_info(conf, comp, cap, block_sz);
+            csv << logN << "," << conf << "," << comp << ","
+                << cap << "," << lvl << "," << tn << "," << bs << ","
+                << block_sz << "," << tb << ","
+                << std::fixed << std::setprecision(3) << tmb << "\n";
+            return tb;
+        };
+
+        long long base_total = 0;
+        base_total += emit("baseline", "index_oram", N, avl_idx_block);
+        base_total += emit("baseline", "data_oram", N, value_size);
+
+        long long tiered_total = 0;
+        tiered_total += emit("tiered", "hot_index_oram", n, avl_idx_block);
+        int split_upper_cap = n;
+        tiered_total += emit("tiered", "cold_idx_upper", split_upper_cap, avl_idx_block);
+        tiered_total += emit("tiered", "cold_idx_lower", cold_n, avl_idx_block);
+        tiered_total += emit("tiered", "hot_data_oram", n, value_size);
+        tiered_total += emit("tiered", "cold_data_oram", cold_n, value_size);
+
+        double overhead_pct = 100.0 * (tiered_total - base_total) / base_total;
+        csv << logN << ",overhead_pct,,,,,,," << std::fixed
+            << std::setprecision(3) << overhead_pct << "\n";
+
+        std::cout << "  logN=" << logN
+                  << " baseline=" << std::fixed << std::setprecision(1)
+                  << base_total / (1024.0*1024) << "MB"
+                  << " tiered=" << tiered_total / (1024.0*1024) << "MB"
+                  << " overhead=" << std::setprecision(2) << overhead_pct << "%\n";
+    }
+
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/storage_cost.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1889,6 +2129,8 @@ int main(int argc, char** argv) {
         {"wan_dynamic",     exp_wan_dynamic},
         {"paper_wan",       exp_paper_wan},
         {"profile",         exp_profile},
+        {"dynamic_overhead", exp_dynamic_overhead},
+        {"storage",         exp_storage},
     };
 
     bool all = (cfg.exp == "all");
