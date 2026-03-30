@@ -342,8 +342,30 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
 void TieredOMap::do_maintenance_step() {
     auto st = maint_->swap_state();
 
-    // Task 1: Hot demotion scan (only when Idle)
-    if (st == SwapState::Idle && !hot_key_list_.empty()) {
+    // Staggered scheduling: each boundary does exactly ONE task.
+    // All branches produce 2 hot OMAP ops + 1 cold OMAP op for obliviousness.
+
+    if (st == SwapState::HotPend) {
+        hot_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        phys_hot_keys_.insert(pending_insert_key_);
+        {
+            auto it = std::lower_bound(
+                hot_key_list_.begin(), hot_key_list_.end(), pending_insert_key_);
+            hot_key_list_.insert(it, pending_insert_key_);
+        }
+        hot_omap_->dummy_access();
+        cold_omap_->dummy_access();
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else if (st == SwapState::ColdPend) {
+        hot_omap_->dummy_access();
+        hot_omap_->dummy_access();
+        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else if (!hot_key_list_.empty()) {
         auto it = std::upper_bound(
             hot_key_list_.begin(), hot_key_list_.end(), maint_->scan_ptr());
         if (it == hot_key_list_.end()) {
@@ -374,39 +396,16 @@ void TieredOMap::do_maintenance_step() {
             }
             cache_keys_.insert(scan_key);
             cache_data_refs_[scan_key] = ref;
-
             cache_keys_.erase(evicted.key);
             cache_data_refs_.erase(evicted.key);
 
-            st = SwapState::HotPend;
-            maint_->set_swap_state(st);
+            maint_->set_swap_state(SwapState::HotPend);
         } else {
             hot_omap_->dummy_access();
         }
-    } else if (st == SwapState::Idle) {
-        hot_omap_->dummy_access();
-    }
-
-    // Tasks 2 & 3: Pending insertion
-    if (st == SwapState::HotPend) {
-        hot_omap_->insert(pending_insert_key_, pending_insert_ref_);
-        phys_hot_keys_.insert(pending_insert_key_);
-        {
-            auto it = std::lower_bound(
-                hot_key_list_.begin(), hot_key_list_.end(), pending_insert_key_);
-            hot_key_list_.insert(it, pending_insert_key_);
-        }
         cold_omap_->dummy_access();
-        pending_insert_key_ = INVALID_KEY;
-        pending_insert_ref_.clear();
-        maint_->set_swap_state(SwapState::Idle);
-    } else if (st == SwapState::ColdPend) {
-        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
-        hot_omap_->dummy_access();
-        pending_insert_key_ = INVALID_KEY;
-        pending_insert_ref_.clear();
-        maint_->set_swap_state(SwapState::Idle);
     } else {
+        hot_omap_->dummy_access();
         hot_omap_->dummy_access();
         cold_omap_->dummy_access();
     }
@@ -421,8 +420,29 @@ void TieredOMap::do_interleaved_maintenance() {
 
     bool use_partial = (config_.mode == SecurityMode::TierMembership);
 
-    // Task 1: Hot demotion scan (only when Idle)
-    if (st == SwapState::Idle && !hot_key_list_.empty()) {
+    // Staggered: each boundary does ONE task.
+
+    if (st == SwapState::HotPend) {
+        hot_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        phys_hot_keys_.insert(pending_insert_key_);
+        {
+            auto it = std::lower_bound(
+                hot_key_list_.begin(), hot_key_list_.end(), pending_insert_key_);
+            hot_key_list_.insert(it, pending_insert_key_);
+        }
+        hot_omap_->dummy_access();
+        cold_omap_->dummy_access();
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else if (st == SwapState::ColdPend) {
+        hot_omap_->dummy_access();
+        hot_omap_->dummy_access();
+        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
+        pending_insert_key_ = INVALID_KEY;
+        pending_insert_ref_.clear();
+        maint_->set_swap_state(SwapState::Idle);
+    } else if (!hot_key_list_.empty()) {
         auto sit = std::upper_bound(
             hot_key_list_.begin(), hot_key_list_.end(), maint_->scan_ptr());
         if (sit == hot_key_list_.end()) {
@@ -467,73 +487,51 @@ void TieredOMap::do_interleaved_maintenance() {
             cache_keys_.erase(evicted.key);
             cache_data_refs_.erase(evicted.key);
 
-            st = SwapState::HotPend;
-            maint_->set_swap_state(st);
+            maint_->set_swap_state(SwapState::HotPend);
         }
-    }
-
-    // Tasks 2 & 3: Pending insertion
-    if (st == SwapState::HotPend) {
-        hot_omap_->insert(pending_insert_key_, pending_insert_ref_);
-        phys_hot_keys_.insert(pending_insert_key_);
-        {
-            auto it = std::lower_bound(
-                hot_key_list_.begin(), hot_key_list_.end(), pending_insert_key_);
-            hot_key_list_.insert(it, pending_insert_key_);
-        }
-        cold_omap_->dummy_access();
-        pending_insert_key_ = INVALID_KEY;
-        pending_insert_ref_.clear();
-        maint_->set_swap_state(SwapState::Idle);
-    } else if (st == SwapState::ColdPend) {
-        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
-        hot_omap_->dummy_access();
-        pending_insert_key_ = INVALID_KEY;
-        pending_insert_ref_.clear();
-        maint_->set_swap_state(SwapState::Idle);
     } else {
+        hot_omap_->dummy_access();
         hot_omap_->dummy_access();
         cold_omap_->dummy_access();
     }
 }
 
 void TieredOMap::do_da_maintenance_step() {
-    // DA path: demotions discovered by piggyback scan, stored in da_pending_demotions_.
-    // Use cache-based logic analogous to do_maintenance_step().
-    int dk = INVALID_KEY;
-    if (!da_pending_demotions_.empty()) {
-        dk = da_pending_demotions_.front();
-        da_pending_demotions_.pop_front();
-    }
+    // DA path: staggered — each boundary does ONE task.
+    // All branches: 2 hot + 1 cold OMAP ops.
 
-    bool can_demote = (dk != INVALID_KEY) && phys_hot_keys_.count(dk);
-    if (can_demote) {
-        Bytes ref = hot_omap_->search(dk);
-        hot_omap_->remove(dk);
-        cold_omap_->insert(dk, ref);
-        hot_keys_.erase(dk);
-        phys_hot_keys_.erase(dk);
-        auto it = std::lower_bound(
-            hot_key_list_.begin(), hot_key_list_.end(), dk);
-        if (it != hot_key_list_.end() && *it == dk)
-            hot_key_list_.erase(it);
-    } else {
-        hot_omap_->dummy_access();
-        hot_omap_->dummy_access();
-        cold_omap_->dummy_access();
-    }
-
-    // Pending insertion for cache-based promotions
     auto st = maint_->swap_state();
+
     if (st == SwapState::ColdPend) {
-        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
         hot_omap_->dummy_access();
+        hot_omap_->dummy_access();
+        cold_omap_->insert(pending_insert_key_, pending_insert_ref_);
         pending_insert_key_ = INVALID_KEY;
         pending_insert_ref_.clear();
         maint_->set_swap_state(SwapState::Idle);
     } else {
-        cold_omap_->dummy_access();
-        hot_omap_->dummy_access();
+        int dk = INVALID_KEY;
+        if (!da_pending_demotions_.empty()) {
+            dk = da_pending_demotions_.front();
+            da_pending_demotions_.pop_front();
+        }
+
+        bool can_demote = (dk != INVALID_KEY) && phys_hot_keys_.count(dk);
+        if (can_demote) {
+            Bytes ref = hot_omap_->search(dk);
+            hot_omap_->remove(dk);
+            cold_omap_->insert(dk, ref);
+            hot_keys_.erase(dk);
+            phys_hot_keys_.erase(dk);
+            auto it = std::lower_bound(
+                hot_key_list_.begin(), hot_key_list_.end(), dk);
+            if (it != hot_key_list_.end() && *it == dk)
+                hot_key_list_.erase(it);
+        } else {
+            hot_omap_->dummy_access();
+            hot_omap_->dummy_access();
+            cold_omap_->dummy_access();
+        }
     }
 }
 

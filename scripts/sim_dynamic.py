@@ -83,11 +83,10 @@ class CacheMaintenanceSimulator:
 
         in_cold = k in self.I_cold
 
-        # Task 1 (at B_swap boundary): pending insertion + hot demotion scan
+        # Staggered: each B_swap boundary does ONE task (completion OR scan)
         at_boundary = (self.t % self.B_swap == 0 and self.t > 0
                        and self.t // self.B_obs > 0)
         if at_boundary:
-            # Complete pending insertion
             if self.st == 'hot-pend':
                 best = max(self.cache, key=lambda c: self.f_prev[c])
                 self.cache.remove(best)
@@ -98,9 +97,7 @@ class CacheMaintenanceSimulator:
                 self.cache.remove(worst)
                 self.I_cold.add(worst)
                 self.st = 'idle'
-
-            # Hot demotion scan (only when idle)
-            if (self.st == 'idle' and len(self.I_hot) > 0):
+            elif len(self.I_hot) > 0:
                 sorted_hot = sorted(self.I_hot)
                 from bisect import bisect_right
                 pos = bisect_right(sorted_hot, self.ptr)
