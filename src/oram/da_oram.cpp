@@ -531,7 +531,14 @@ std::vector<StepReadReq> DAOram::step_get_reads() const {
     else
         sid = get_store_id();
 
-    return {{sid, step_.cur_leaf1}, {sid, step_.cur_leaf2}};
+    std::vector<StepReadReq> reads = {{sid, step_.cur_leaf1}, {sid, step_.cur_leaf2}};
+
+    if (pb_step_.active) {
+        reads.push_back({sid, pb_step_.cur_leaf1});
+        reads.push_back({sid, pb_step_.cur_leaf2});
+    }
+
+    return reads;
 }
 
 void DAOram::step_apply_reads(const std::vector<PathData>& results) {
@@ -546,9 +553,14 @@ void DAOram::step_apply_reads(const std::vector<PathData>& results) {
     if (level >= 0) {
         pos_maps_[level].apply_fetched_path(std::move(merged));
     } else {
+        std::unordered_set<int> seen;
+        for (auto& b : stash_) seen.insert(b.key);
         for (auto& [node, bucket] : merged)
             for (auto& block : bucket)
-                if (!block.is_dummy()) stash_.push_back(block);
+                if (!block.is_dummy() && seen.find(block.key) == seen.end()) {
+                    stash_.push_back(block);
+                    seen.insert(block.key);
+                }
     }
 }
 
@@ -558,11 +570,15 @@ void DAOram::step_process() {
     step_.write_level = level;
     step_.write_leaf1 = step_.cur_leaf1;
     step_.write_leaf2 = step_.cur_leaf2;
+    if (pb_step_.active) {
+        pb_step_.write_leaf1 = pb_step_.cur_leaf1;
+        pb_step_.write_leaf2 = pb_step_.cur_leaf2;
+    }
 
+    // ── Main operation ──
     if (level >= 0 && !step_.is_dummy) {
         PathORAM& pm = pos_maps_[level];
 
-        // Compute pos_map keys again.
         std::vector<int> pm_keys;
         int cur = step_.data_key;
         for (int i = 0; i < num_pos_levels_; ++i) {
@@ -613,7 +629,6 @@ void DAOram::step_process() {
         step_.cur_r_new_leaf = r2_new;
 
     } else if (level >= 0 && step_.is_dummy) {
-        // Dummy: nothing to do, just evict.
         int next_lr;
         if (level > 0)
             next_lr = pos_maps_[level - 1].leaf_range();
@@ -637,6 +652,85 @@ void DAOram::step_process() {
         }
     }
 
+    // ── Piggyback operation ──
+    if (pb_step_.active) {
+        if (level >= 0 && !pb_step_.is_dummy) {
+            PathORAM& pm = pos_maps_[level];
+
+            std::vector<int> pb_pm_keys;
+            int cur = pb_step_.data_key;
+            for (int i = 0; i < num_pos_levels_; ++i) {
+                cur = cur / num_ic_;
+                pb_pm_keys.push_back(cur);
+            }
+
+            int pb_target_key = pb_pm_keys[level];
+            Block* pb_target = pm.find_in_stash(pb_target_key);
+            if (!pb_target)
+                throw std::runtime_error(
+                    "DAOram::step_process(pb): block not found at level " +
+                    std::to_string(level));
+
+            CounterBlock pb_tcb = CounterBlock::decode(pb_target->value, num_ic_);
+
+            int pb_next_key, pb_next_off, pb_next_lr, pb_next_total;
+            if (level == 0) {
+                pb_next_key = pb_step_.data_key;
+                pb_next_off = pb_step_.data_key % num_ic_;
+                pb_next_lr = leaf_range();
+                pb_next_total = num_data_;
+            } else {
+                pb_next_key = pb_pm_keys[level - 1];
+                pb_next_off = pb_pm_keys[level - 1] % num_ic_;
+                pb_next_lr = pos_maps_[level - 1].leaf_range();
+                pb_next_total = level_sizes_[level - 1];
+            }
+
+            auto [pb_next_cur, pb_next_new] = update_counter_in(
+                pb_tcb, pb_next_off, pb_next_key, pb_next_lr);
+            int pb_tbase = pb_target_key * num_ic_;
+            auto [pb_r2_key, pb_r2_cur, pb_r2_new] = perform_reset_in(
+                pb_tcb, pb_tbase, pb_next_total, pb_next_lr);
+
+            pb_target->value = pb_tcb.encode();
+            pb_target->leaf = pb_step_.cur_new_leaf;
+
+            if (pb_step_.cur_r_key >= 0) {
+                Block* rb = pm.find_in_stash(pb_step_.cur_r_key);
+                if (rb) rb->leaf = pb_step_.cur_r_new_leaf;
+            }
+
+            pb_step_.cur_leaf1 = pb_next_cur;
+            pb_step_.cur_leaf2 = pb_r2_cur;
+            pb_step_.cur_new_leaf = pb_next_new;
+            pb_step_.cur_r_key = pb_r2_key;
+            pb_step_.cur_r_new_leaf = pb_r2_new;
+
+        } else if (level >= 0 && pb_step_.is_dummy) {
+            int next_lr;
+            if (level > 0)
+                next_lr = pos_maps_[level - 1].leaf_range();
+            else
+                next_lr = leaf_range();
+            pb_step_.cur_leaf1 = SecureRandom::rand_below(std::max(next_lr, 1));
+            pb_step_.cur_leaf2 = SecureRandom::rand_below(std::max(next_lr, 1));
+
+        } else if (level < 0 && !pb_step_.is_dummy) {
+            Block* pb_target = find_in_stash(pb_step_.data_key);
+            if (!pb_target)
+                throw std::runtime_error(
+                    "DAOram::step_process(pb): data key " +
+                    std::to_string(pb_step_.data_key) + " not found");
+            pb_step_.result = pb_target->value;
+            pb_target->leaf = pb_step_.cur_new_leaf;
+
+            if (pb_step_.cur_r_key >= 0) {
+                Block* rb = find_in_stash(pb_step_.cur_r_key);
+                if (rb) rb->leaf = pb_step_.cur_r_new_leaf;
+            }
+        }
+    }
+
     step_.round++;
     if (step_.round > num_pos_levels_)
         step_.done = true;
@@ -645,13 +739,17 @@ void DAOram::step_process() {
 std::vector<StepWriteReq> DAOram::step_get_writes() {
     int level = step_.write_level;
 
+    std::vector<int> leaves = {step_.write_leaf1, step_.write_leaf2};
+    if (pb_step_.active) {
+        leaves.push_back(pb_step_.write_leaf1);
+        leaves.push_back(pb_step_.write_leaf2);
+    }
+
     if (level >= 0) {
-        auto data = pos_maps_[level].prepare_eviction_paths(
-            {step_.write_leaf1, step_.write_leaf2});
+        auto data = pos_maps_[level].prepare_eviction_paths(leaves);
         return {{pos_maps_[level].get_store_id(), std::move(data)}};
     } else {
-        auto data = prepare_eviction_data(
-            {step_.write_leaf1, step_.write_leaf2});
+        auto data = prepare_eviction_data(leaves);
         return {{get_store_id(), std::move(data)}};
     }
 }
@@ -671,6 +769,80 @@ Bytes DAOram::step_finish(const Bytes* new_value) {
 
 void DAOram::step_finish_dummy() {
     step_.active = false;
+}
+
+// ─── DAOram piggyback access ─────────────────────────────────────────────────
+
+void DAOram::begin_piggyback_access(int key) {
+    pb_step_ = PBStepState{};
+    pb_step_.active = true;
+    pb_step_.data_key = key;
+
+    int managed_key, on_chip_offset, on_chip_group;
+    int managed_lr, managed_total;
+
+    std::vector<int> pm_keys;
+    int cur = key;
+    for (int i = 0; i < num_pos_levels_; ++i) {
+        cur = cur / num_ic_;
+        pm_keys.push_back(cur);
+    }
+
+    if (num_pos_levels_ > 0) {
+        managed_key = pm_keys.back();
+        on_chip_group = managed_key / num_ic_;
+        on_chip_offset = managed_key % num_ic_;
+        managed_lr = pos_maps_.back().leaf_range();
+        managed_total = level_sizes_.back();
+    } else {
+        managed_key = key;
+        on_chip_group = key / num_ic_;
+        on_chip_offset = key % num_ic_;
+        managed_lr = leaf_range();
+        managed_total = num_data_;
+    }
+
+    auto& oc_cb = on_chip_[on_chip_group];
+    auto [cur_leaf, new_leaf] = update_counter_in(
+        oc_cb, on_chip_offset, managed_key, managed_lr);
+    int base = on_chip_group * num_ic_;
+    auto [r_key, r_cur, r_new] = perform_reset_in(
+        oc_cb, base, managed_total, managed_lr);
+
+    pb_step_.cur_leaf1 = cur_leaf;
+    pb_step_.cur_leaf2 = r_cur;
+    pb_step_.cur_new_leaf = new_leaf;
+    pb_step_.cur_r_key = r_key;
+    pb_step_.cur_r_new_leaf = r_new;
+}
+
+void DAOram::begin_piggyback_dummy() {
+    pb_step_ = PBStepState{};
+    pb_step_.active = true;
+    pb_step_.is_dummy = true;
+
+    if (num_pos_levels_ > 0) {
+        int lr = pos_maps_.back().leaf_range();
+        pb_step_.cur_leaf1 = SecureRandom::rand_below(std::max(lr, 1));
+        pb_step_.cur_leaf2 = SecureRandom::rand_below(std::max(lr, 1));
+    } else {
+        pb_step_.cur_leaf1 = SecureRandom::rand_below(std::max(leaf_range(), 1));
+        pb_step_.cur_leaf2 = SecureRandom::rand_below(std::max(leaf_range(), 1));
+    }
+}
+
+Bytes DAOram::piggyback_finish(const Bytes* new_value) {
+    if (new_value && !pb_step_.is_dummy) {
+        Block* target = find_in_stash(pb_step_.data_key);
+        if (target) target->value = *new_value;
+    }
+    Bytes result = std::move(pb_step_.result);
+    pb_step_.active = false;
+    return result;
+}
+
+void DAOram::piggyback_finish_dummy() {
+    pb_step_.active = false;
 }
 
 // ─── Store IDs ──────────────────────────────────────────────────────────────

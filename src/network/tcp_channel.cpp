@@ -82,6 +82,14 @@ TcpChannel TcpChannel::accept(int server_fd) {
     return TcpChannel(fd);
 }
 
+void TcpChannel::set_recv_timeout(int seconds) {
+    if (fd_ < 0) return;
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 void TcpChannel::send_raw(const uint8_t* data, size_t len) {
     size_t sent = 0;
     while (sent < len) {

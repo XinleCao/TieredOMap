@@ -803,6 +803,7 @@ void AVLOmap::begin_step_search(int key, const Bytes* update) {
     last_bw_.reset();
     reset_op_counts();
     local_.clear();
+    pb_ = PBState{};
 
     ss_ = StepState{};
     ss_.key = key;
@@ -829,6 +830,7 @@ void AVLOmap::begin_step_dummy() {
     last_bw_.reset();
     reset_op_counts();
     local_.clear();
+    pb_ = PBState{};
 
     ss_ = StepState{};
     ss_.is_dummy = true;
@@ -842,45 +844,125 @@ void AVLOmap::begin_step_dummy() {
         ss_.dummy_split_boundary = ss_.budget;
 }
 
+void AVLOmap::begin_step_partial_dummy() {
+    if (split_depth_ <= 0) {
+        begin_step_dummy();
+        return;
+    }
+    last_bw_.reset();
+    reset_op_counts();
+    local_.clear();
+    pb_ = PBState{};
+
+    int eff_split = std::min(split_depth_, 3 * max_height_);
+    ss_ = StepState{};
+    ss_.is_dummy = true;
+    ss_.budget = eff_split + 1;
+    ss_.phase = StepPhase::PAD;
+    ss_.pad_remaining = eff_split + 1;
+    ss_.dummy_step = 0;
+    ss_.dummy_split_boundary = eff_split;
+}
+
 OramStepRound AVLOmap::step_next_round() {
     OramStepRound r;
-    if (ss_.phase == StepPhase::DONE)
-        return r;
+    ss_.round_read = (ss_.phase != StepPhase::DONE);
+    pb_.round_read = (pb_.active && pb_.phase != StepPhase::DONE);
 
-    PathORAM* oram = nullptr;
-    int leaf = INVALID_LEAF;
-
-    if (ss_.phase == StepPhase::TRAVERSE) {
-        oram = &oram_for_depth(ss_.depth);
-        leaf = ss_.cur_leaf;
-    } else {
-        if (split_depth_ > 0) {
-            oram = (ss_.dummy_step < ss_.dummy_split_boundary)
-                       ? &upper_oram_ : &oram_;
+    // ── Main operation read ──
+    if (ss_.round_read) {
+        PathORAM* oram = nullptr;
+        int leaf = INVALID_LEAF;
+        if (ss_.phase == StepPhase::TRAVERSE) {
+            oram = &oram_for_depth(ss_.depth);
+            leaf = ss_.cur_leaf;
         } else {
-            oram = &oram_;
+            if (split_depth_ > 0)
+                oram = (ss_.dummy_step < ss_.dummy_split_boundary)
+                           ? &upper_oram_ : &oram_;
+            else
+                oram = &oram_;
+            leaf = oram->random_leaf();
         }
-        leaf = oram->random_leaf();
+        ss_.cur_round_oram = oram;
+        ss_.cur_round_leaf = leaf;
+        r.reads.push_back({oram->get_store_id(), leaf});
     }
-    ss_.cur_round_oram = oram;
-    ss_.cur_round_leaf = leaf;
-    r.reads.push_back({oram->get_store_id(), leaf});
+
+    // ── Piggyback operation read ──
+    if (pb_.round_read) {
+        PathORAM* oram = nullptr;
+        int leaf = INVALID_LEAF;
+        if (pb_.phase == StepPhase::TRAVERSE) {
+            pb_.node_in_local = false;
+            for (auto& ln : local_)
+                if (ln.key == pb_.cur_key) { pb_.node_in_local = true; break; }
+            oram = &oram_for_depth(pb_.depth);
+            leaf = pb_.node_in_local ? oram->random_leaf() : pb_.cur_leaf;
+        } else {
+            if (split_depth_ > 0)
+                oram = (pb_.dummy_step < pb_.dummy_split_boundary)
+                           ? &upper_oram_ : &oram_;
+            else
+                oram = &oram_;
+            leaf = oram->random_leaf();
+        }
+        pb_.cur_round_oram = oram;
+        pb_.cur_round_leaf = leaf;
+        r.reads.push_back({oram->get_store_id(), leaf});
+    }
+
     return r;
 }
 
 void AVLOmap::step_apply_reads(const std::vector<PathData>& results) {
-    if (!results.empty() && ss_.cur_round_oram)
-        ss_.cur_round_oram->apply_fetched_path(
-            std::unordered_map<int, std::vector<Block>>(results[0]));
+    if (ss_.round_read && pb_.round_read && results.size() >= 2) {
+        if (ss_.cur_round_oram == pb_.cur_round_oram) {
+            PathData merged(results[0]);
+            for (auto& [nid, blocks] : results[1])
+                if (merged.find(nid) == merged.end())
+                    merged[nid] = blocks;
+            ss_.cur_round_oram->apply_fetched_path(std::move(merged));
+        } else {
+            ss_.cur_round_oram->apply_fetched_path(PathData(results[0]));
+            pb_.cur_round_oram->apply_fetched_path(PathData(results[1]));
+        }
+    } else if (ss_.round_read && !results.empty()) {
+        ss_.cur_round_oram->apply_fetched_path(PathData(results[0]));
+    } else if (pb_.round_read && !results.empty()) {
+        pb_.cur_round_oram->apply_fetched_path(PathData(results[0]));
+    }
 }
 
 std::vector<StepWriteReq> AVLOmap::step_prepare_writes() {
-    if (!ss_.cur_round_oram) return {};
-    return {{ss_.cur_round_oram->get_store_id(),
-             ss_.cur_round_oram->prepare_eviction(ss_.cur_round_leaf)}};
+    std::vector<StepWriteReq> writes;
+
+    if (!ss_.round_read && !pb_.round_read)
+        return writes;
+
+    if (ss_.round_read && pb_.round_read) {
+        if (ss_.cur_round_oram == pb_.cur_round_oram) {
+            writes.push_back({ss_.cur_round_oram->get_store_id(),
+                              ss_.cur_round_oram->prepare_eviction_paths(
+                                  {ss_.cur_round_leaf, pb_.cur_round_leaf})});
+        } else {
+            writes.push_back({ss_.cur_round_oram->get_store_id(),
+                              ss_.cur_round_oram->prepare_eviction(ss_.cur_round_leaf)});
+            writes.push_back({pb_.cur_round_oram->get_store_id(),
+                              pb_.cur_round_oram->prepare_eviction(pb_.cur_round_leaf)});
+        }
+    } else if (ss_.round_read) {
+        writes.push_back({ss_.cur_round_oram->get_store_id(),
+                          ss_.cur_round_oram->prepare_eviction(ss_.cur_round_leaf)});
+    } else {
+        writes.push_back({pb_.cur_round_oram->get_store_id(),
+                          pb_.cur_round_oram->prepare_eviction(pb_.cur_round_leaf)});
+    }
+    return writes;
 }
 
 void AVLOmap::step_process() {
+    // ── Main operation ──
     if (ss_.phase == StepPhase::TRAVERSE) {
         Block block = ss_.cur_round_oram->extract_from_stash(ss_.cur_key);
         AVLNodeData nd = AVLNodeData::decode(block.value);
@@ -951,15 +1033,454 @@ void AVLOmap::step_process() {
         if (ss_.pad_remaining <= 0)
             ss_.phase = StepPhase::DONE;
     }
+
+    // ── Piggyback operation ──
+    if (!pb_.active || pb_.phase == StepPhase::DONE)
+        return;
+
+    if (pb_.phase == StepPhase::TRAVERSE) {
+        int local_idx = -1;
+        if (pb_.node_in_local) {
+            for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+                if (local_[i].key == pb_.cur_key) { local_idx = i; break; }
+            if (local_idx < 0) {
+                // Main flushed local_; re-extract from stash
+                PathORAM& po = oram_for_depth(pb_.depth);
+                Block block = po.extract_from_stash(pb_.cur_key);
+                AVLNodeData nd = AVLNodeData::decode(block.value);
+                int parent = INVALID_KEY;
+                for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+                    if (local_[i].avl.l_key == pb_.cur_key ||
+                        local_[i].avl.r_key == pb_.cur_key) {
+                        parent = local_[i].key; break;
+                    }
+                }
+                local_.push_back({pb_.cur_key, block.leaf, nd, parent, pb_.depth});
+                local_idx = static_cast<int>(local_.size()) - 1;
+            }
+        } else {
+            // Main op may have added this node to local_ in the same round
+            for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+                if (local_[i].key == pb_.cur_key) { local_idx = i; break; }
+            if (local_idx < 0) {
+                Block block = pb_.cur_round_oram->extract_from_stash(pb_.cur_key);
+                AVLNodeData nd = AVLNodeData::decode(block.value);
+                int parent = INVALID_KEY;
+                for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+                    if (local_[i].avl.l_key == pb_.cur_key ||
+                        local_[i].avl.r_key == pb_.cur_key) {
+                        parent = local_[i].key; break;
+                    }
+                }
+                local_.push_back({pb_.cur_key, block.leaf, nd, parent, pb_.depth});
+                local_idx = static_cast<int>(local_.size()) - 1;
+            }
+        }
+        pb_.ops++;
+        if (split_depth_ > 0) {
+            if (pb_.depth < split_depth_) ++upper_op_count_;
+            else ++lower_op_count_;
+        } else {
+            ++op_count_;
+        }
+
+        if (local_idx >= 0) {
+            auto& node = local_[local_idx];
+            bool found = (pb_.key == pb_.cur_key);
+            bool end_pb = false;
+
+            if (pb_.is_insert) {
+                if (found) {
+                    node.avl.data = pb_.insert_value;
+                    end_pb = true;
+                } else if (pb_.key < pb_.cur_key) {
+                    if (node.avl.l_key == INVALID_KEY) {
+                        AVLNodeData new_nd;
+                        new_nd.data = pb_.insert_value;
+                        int cd = pb_.depth + 1;
+                        PathORAM& co = oram_for_depth(cd);
+                        int nlf = co.random_leaf();
+                        co.set_leaf(pb_.key, nlf);
+                        node.avl.l_key = pb_.key;
+                        node.avl.l_leaf = nlf;
+                        node.avl.l_height = 1;
+                        local_.push_back({pb_.key, nlf, new_nd, pb_.cur_key, cd});
+                        end_pb = true;
+                    } else {
+                        pb_.cur_key = node.avl.l_key;
+                        pb_.cur_leaf = node.avl.l_leaf;
+                    }
+                } else {
+                    if (node.avl.r_key == INVALID_KEY) {
+                        AVLNodeData new_nd;
+                        new_nd.data = pb_.insert_value;
+                        int cd = pb_.depth + 1;
+                        PathORAM& co = oram_for_depth(cd);
+                        int nlf = co.random_leaf();
+                        co.set_leaf(pb_.key, nlf);
+                        node.avl.r_key = pb_.key;
+                        node.avl.r_leaf = nlf;
+                        node.avl.r_height = 1;
+                        local_.push_back({pb_.key, nlf, new_nd, pb_.cur_key, cd});
+                        end_pb = true;
+                    } else {
+                        pb_.cur_key = node.avl.r_key;
+                        pb_.cur_leaf = node.avl.r_leaf;
+                    }
+                }
+                if (!end_pb && (pb_.cur_key == INVALID_KEY ||
+                                pb_.depth >= max_height_ - 1))
+                    end_pb = true;
+            } else {
+                if (found) pb_.result = node.avl.data;
+                end_pb = found || pb_.depth >= max_height_ - 1;
+                if (!found && !end_pb) {
+                    if (pb_.key < pb_.cur_key) {
+                        pb_.cur_key = node.avl.l_key;
+                        pb_.cur_leaf = node.avl.l_leaf;
+                    } else {
+                        pb_.cur_key = node.avl.r_key;
+                        pb_.cur_leaf = node.avl.r_leaf;
+                    }
+                    if (pb_.cur_key == INVALID_KEY) end_pb = true;
+                }
+            }
+
+            pb_.depth++;
+            if (end_pb) {
+                if (pb_.is_insert) {
+                    update_heights();
+                    rebalance();
+                }
+                pb_.traverse_done = true;
+                pb_.phase = StepPhase::PAD;
+                pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+                pb_.dummy_step = 0;
+                pb_.dummy_split_boundary = pb_.pad_remaining;
+                if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+            }
+        }
+    } else if (pb_.phase == StepPhase::PAD) {
+        pb_.ops++;
+        if (split_depth_ > 0) {
+            if (pb_.dummy_step < pb_.dummy_split_boundary)
+                ++upper_op_count_;
+            else
+                ++lower_op_count_;
+        } else {
+            ++op_count_;
+        }
+        pb_.dummy_step++;
+        pb_.pad_remaining--;
+        if (pb_.pad_remaining <= 0) pb_.phase = StepPhase::DONE;
+    }
 }
 
 bool AVLOmap::step_done() const {
+    if (pb_.active && pb_.phase != StepPhase::DONE)
+        return false;
     return ss_.phase == StepPhase::DONE;
 }
 
 Bytes AVLOmap::step_finish() {
     finalize_bw();
     return ss_.result;
+}
+
+// ─── Piggyback step interface ───────────────────────────────────────────────
+
+void AVLOmap::begin_piggyback_search(int key) {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.key = key;
+    pb_.budget = 3 * max_height_;
+
+    if (root_key_ == INVALID_KEY) {
+        pb_.phase = StepPhase::PAD;
+        pb_.pad_remaining = pb_.budget;
+        pb_.traverse_done = true;
+        if (split_depth_ > 0)
+            pb_.dummy_split_boundary = std::min(split_depth_, pb_.budget);
+        else
+            pb_.dummy_split_boundary = pb_.budget;
+        if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+    } else {
+        pb_.phase = StepPhase::TRAVERSE;
+        pb_.cur_key = root_key_;
+        pb_.cur_leaf = root_leaf_;
+        pb_.depth = 0;
+    }
+}
+
+void AVLOmap::begin_piggyback_insert(int key, const Bytes& value) {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.key = key;
+    pb_.is_insert = true;
+    pb_.insert_value = value;
+    pb_.budget = 3 * max_height_;
+
+    if (root_key_ == INVALID_KEY) {
+        AVLNodeData nd;
+        nd.data = value;
+        PathORAM& root_oram = oram_for_depth(0);
+        int leaf = root_oram.random_leaf();
+        root_oram.set_leaf(key, leaf);
+        local_.push_back({key, leaf, nd, INVALID_KEY, 0});
+        root_key_ = key;
+        root_leaf_ = leaf;
+        pb_.phase = StepPhase::PAD;
+        pb_.pad_remaining = pb_.budget;
+        pb_.traverse_done = true;
+        if (split_depth_ > 0)
+            pb_.dummy_split_boundary = std::min(split_depth_, pb_.budget);
+        else
+            pb_.dummy_split_boundary = pb_.budget;
+        if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+    } else {
+        pb_.phase = StepPhase::TRAVERSE;
+        pb_.cur_key = root_key_;
+        pb_.cur_leaf = root_leaf_;
+        pb_.depth = 0;
+    }
+}
+
+void AVLOmap::begin_piggyback_dummy() {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.phase = StepPhase::PAD;
+    pb_.budget = 3 * max_height_;
+    pb_.pad_remaining = pb_.budget;
+    pb_.traverse_done = true;
+    pb_.dummy_step = 0;
+    if (split_depth_ > 0)
+        pb_.dummy_split_boundary = std::min(split_depth_, pb_.budget);
+    else
+        pb_.dummy_split_boundary = pb_.budget;
+    if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+}
+
+Bytes AVLOmap::finish_piggyback() {
+    return pb_.result;
+}
+
+bool AVLOmap::piggyback_needs_decision() const {
+    return pb_.active && pb_.traverse_done && !pb_.result.empty();
+}
+
+Bytes AVLOmap::piggyback_get_traverse_result() {
+    return pb_.result;
+}
+
+void AVLOmap::piggyback_commit_remove() {
+    // Removal is handled externally (separate OMAP call).
+    // The pb continues padding within its 3h budget.
+}
+
+void AVLOmap::piggyback_commit_noop() {
+    // Nothing to do — pb is already padding.
+}
+
+// ─── Non-step piggyback ─────────────────────────────────────────────────────
+
+Bytes AVLOmap::search_piggyback(int key, const Bytes* update,
+                                int extra_key, char extra_op,
+                                const Bytes* extra_value,
+                                Bytes* extra_result) {
+    last_bw_.reset();
+    reset_op_counts();
+
+    int budget = 3 * max_height_;
+    Bytes main_result;
+
+    if (root_key_ == INVALID_KEY) {
+        pad_to_budget(budget);
+        int saved_u = upper_op_count_, saved_l = lower_op_count_;
+        int saved_o = op_count_;
+        reset_op_counts();
+        pad_to_budget(budget);
+        upper_op_count_ += saved_u;
+        lower_op_count_ += saved_l;
+        op_count_ += saved_o;
+        finalize_bw();
+        return {};
+    }
+
+    // ── Phase A: main search ──
+    local_.clear();
+    int cur_key = root_key_;
+    int cur_leaf = root_leaf_;
+
+    for (int d = 0; d < max_height_; ++d) {
+        if (cur_key == INVALID_KEY) break;
+        int parent = local_.empty() ? INVALID_KEY : local_.back().key;
+        move_to_local(cur_key, cur_leaf, parent, d);
+        auto& node = local_.back();
+        if (key == cur_key) {
+            main_result = node.avl.data;
+            if (update) node.avl.data = *update;
+            break;
+        }
+        if (key < cur_key) {
+            cur_key = node.avl.l_key; cur_leaf = node.avl.l_leaf;
+        } else {
+            cur_key = node.avl.r_key; cur_leaf = node.avl.r_leaf;
+        }
+    }
+
+    reassign_leaves();
+    flush_local_to_stash();
+    pad_to_budget(budget);
+
+    int saved_u = upper_op_count_, saved_l = lower_op_count_;
+    int saved_o = op_count_;
+    reset_op_counts();
+
+    // ── Phase B: extra operation ──
+    local_.clear();
+    cur_key = root_key_;
+    cur_leaf = root_leaf_;
+    Bytes pb_result;
+    int pb_target_idx = -1;
+
+    if (extra_op == 's' || extra_op == 'd') {
+        for (int d = 0; d < max_height_; ++d) {
+            if (cur_key == INVALID_KEY) break;
+            int parent = local_.empty() ? INVALID_KEY : local_.back().key;
+            move_to_local(cur_key, cur_leaf, parent, d);
+            auto& node = local_.back();
+            if (extra_key == cur_key) {
+                pb_result = node.avl.data;
+                pb_target_idx = static_cast<int>(local_.size()) - 1;
+                break;
+            }
+            if (extra_key < cur_key) {
+                cur_key = node.avl.l_key; cur_leaf = node.avl.l_leaf;
+            } else {
+                cur_key = node.avl.r_key; cur_leaf = node.avl.r_leaf;
+            }
+        }
+
+        if (extra_result) *extra_result = pb_result;
+
+        if (extra_op == 'd' && pb_target_idx >= 0) {
+            auto& tgt = local_[pb_target_idx];
+            bool two_child = tgt.avl.l_key != INVALID_KEY &&
+                             tgt.avl.r_key != INVALID_KEY;
+            if (two_child) {
+                int sk = tgt.avl.r_key, sl = tgt.avl.r_leaf;
+                for (int sd = tgt.depth + 1; sd < max_height_; ++sd) {
+                    int sp = local_.back().key;
+                    move_to_local(sk, sl, sp, sd);
+                    int si = static_cast<int>(local_.size()) - 1;
+                    if (local_[si].avl.l_key == INVALID_KEY) break;
+                    sk = local_[si].avl.l_key;
+                    sl = local_[si].avl.l_leaf;
+                }
+                int succ_idx = static_cast<int>(local_.size()) - 1;
+                int old_key = local_[pb_target_idx].key;
+                local_[pb_target_idx].key = local_[succ_idx].key;
+                local_[pb_target_idx].avl.data = local_[succ_idx].avl.data;
+                int par = local_[pb_target_idx].parent_key;
+                if (par != INVALID_KEY) {
+                    for (auto& p : local_) {
+                        if (p.key != par) continue;
+                        if (p.avl.l_key == old_key) p.avl.l_key = local_[pb_target_idx].key;
+                        else if (p.avl.r_key == old_key) p.avl.r_key = local_[pb_target_idx].key;
+                        break;
+                    }
+                }
+                if (root_key_ == old_key) root_key_ = local_[pb_target_idx].key;
+                for (auto& c : local_)
+                    if (c.parent_key == old_key) c.parent_key = local_[pb_target_idx].key;
+                pb_target_idx = succ_idx;
+            }
+            int dk = local_[pb_target_idx].key;
+            int ck = (local_[pb_target_idx].avl.l_key != INVALID_KEY)
+                         ? local_[pb_target_idx].avl.l_key
+                         : local_[pb_target_idx].avl.r_key;
+            int cl = (local_[pb_target_idx].avl.l_key != INVALID_KEY)
+                         ? local_[pb_target_idx].avl.l_leaf
+                         : local_[pb_target_idx].avl.r_leaf;
+            int ch = (local_[pb_target_idx].avl.l_key != INVALID_KEY)
+                         ? local_[pb_target_idx].avl.l_height
+                         : local_[pb_target_idx].avl.r_height;
+            if (ck == INVALID_KEY) ch = 0;
+            int dp = local_[pb_target_idx].parent_key;
+            if (dp != INVALID_KEY) {
+                for (auto& p : local_) {
+                    if (p.key != dp) continue;
+                    if (p.avl.l_key == dk)      { p.avl.l_key = ck; p.avl.l_leaf = cl; p.avl.l_height = ch; }
+                    else if (p.avl.r_key == dk) { p.avl.r_key = ck; p.avl.r_leaf = cl; p.avl.r_height = ch; }
+                    break;
+                }
+            } else {
+                root_key_ = ck;
+                root_leaf_ = (ck != INVALID_KEY) ? cl : INVALID_LEAF;
+            }
+            local_.erase(local_.begin() + pb_target_idx);
+            update_heights();
+            rebalance();
+        }
+        reassign_leaves();
+        flush_local_to_stash();
+    } else if (extra_op == 'i' && extra_value) {
+        // Insert extra_key (reuse insert logic)
+        if (root_key_ == INVALID_KEY) {
+            AVLNodeData nd; nd.data = *extra_value;
+            PathORAM& roram = oram_for_depth(0);
+            int leaf = roram.random_leaf();
+            roram.set_leaf(extra_key, leaf);
+            roram.add_to_stash({extra_key, leaf, nd.encode()});
+            root_key_ = extra_key; root_leaf_ = leaf;
+        } else {
+            for (int d = 0; d < max_height_; ++d) {
+                if (cur_key == INVALID_KEY) break;
+                int parent = local_.empty() ? INVALID_KEY : local_.back().key;
+                move_to_local(cur_key, cur_leaf, parent, d);
+                auto& node = local_.back();
+                if (extra_key < cur_key) {
+                    if (node.avl.l_key == INVALID_KEY) {
+                        AVLNodeData nd; nd.data = *extra_value;
+                        int cd = d + 1;
+                        PathORAM& co = oram_for_depth(cd);
+                        int nl = co.random_leaf();
+                        co.set_leaf(extra_key, nl);
+                        node.avl.l_key = extra_key; node.avl.l_leaf = nl;
+                        node.avl.l_height = 1;
+                        local_.push_back({extra_key, nl, nd, cur_key, cd});
+                        break;
+                    }
+                    cur_key = node.avl.l_key; cur_leaf = node.avl.l_leaf;
+                } else {
+                    if (node.avl.r_key == INVALID_KEY) {
+                        AVLNodeData nd; nd.data = *extra_value;
+                        int cd = d + 1;
+                        PathORAM& co = oram_for_depth(cd);
+                        int nl = co.random_leaf();
+                        co.set_leaf(extra_key, nl);
+                        node.avl.r_key = extra_key; node.avl.r_leaf = nl;
+                        node.avl.r_height = 1;
+                        local_.push_back({extra_key, nl, nd, cur_key, cd});
+                        break;
+                    }
+                    cur_key = node.avl.r_key; cur_leaf = node.avl.r_leaf;
+                }
+            }
+            update_heights();
+            rebalance();
+            reassign_leaves();
+            flush_local_to_stash();
+        }
+    }
+
+    pad_to_budget(budget);
+    upper_op_count_ += saved_u;
+    lower_op_count_ += saved_l;
+    op_count_ += saved_o;
+
+    finalize_bw();
+    return main_result;
 }
 
 // ─── State export / import ─────────────────────────────────────────────────

@@ -54,6 +54,15 @@ struct AccessResult {
     BandwidthStats total_bw;
     int rounds_to_answer = 0;
     int last_access_fp = 0;
+    Bytes scan_ref;
+    Bytes cold_ref;
+    bool hot_insert_done = false;
+    bool cold_insert_done = false;
+    bool cold_decision_handled = false;
+    bool cold_promotion_done = false;
+    bool scan_decision_handled = false;
+    bool scan_demoted = false;
+    int  scan_fp = 0;
 };
 
 class TieredOMap {
@@ -85,6 +94,9 @@ public:
     PathORAM& data_oram() { return data_oram_; }
     const TieredOMapConfig& config() const { return config_; }
     const std::unordered_set<int>& hot_keys() const { return hot_keys_; }
+    void set_debug_access(bool v) { debug_access_ = v; }
+    void set_force_cold_dummy_pb(bool v) { force_cold_dummy_pb_ = v; }
+    bool has_channel() const { return channel_ != nullptr; }
 
     Bytes export_state() const;
     static std::unique_ptr<TieredOMap> from_state(
@@ -114,7 +126,13 @@ private:
 
     AccessResult interleaved_access(int key, const Bytes* new_value,
                                     bool use_partial_dummy = false,
-                                    bool epoch_mode = false);
+                                    bool epoch_mode = false,
+                                    int scan_key = INVALID_KEY,
+                                    int hot_insert_key = INVALID_KEY,
+                                    int cold_insert_key = INVALID_KEY,
+                                    bool hot_dummy_pb = false,
+                                    bool cold_dummy_pb = false);
+    int next_scan_key();
     AccessResult interleaved_da_piggyback(int key, const Bytes* new_value);
     void run_interleaved_loop(OmapInterface* a, OmapInterface* b);
 
@@ -138,6 +156,8 @@ private:
 
     // DA piggyback: pending demotions with (key, fp) from scan
     std::deque<std::pair<int, int>> da_pending_demotions_;
+    bool debug_access_ = false;
+    bool force_cold_dummy_pb_ = false;
 };
 
 }  // namespace tiered_omap

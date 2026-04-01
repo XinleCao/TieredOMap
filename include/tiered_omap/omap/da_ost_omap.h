@@ -60,6 +60,19 @@ public:
     static std::unique_ptr<DaOstOmap> from_state(
         const uint8_t*& p, std::shared_ptr<TcpChannel> channel);
 
+    // ── Mid-access decision interface (delegates to inner ODS) ──
+    void set_step_decision_enabled(bool enable) override;
+    bool step_needs_decision() const override;
+    Bytes step_get_traverse_result() override;
+    void step_commit_remove() override;
+    void step_commit_noop() override;
+
+    // ── Piggyback interface (concurrent second operation on this OMAP) ──
+    void begin_piggyback_insert(int key, const Bytes& value) override;
+    void begin_piggyback_search(int key) override;
+    void begin_piggyback_dummy() override;
+    Bytes finish_piggyback() override;
+
     // Two-pointer piggyback scan: scans one DAORAM position per call.
     // Returns the root key and its stored value if the position is non-empty.
     ScanResult piggyback_scan_step();
@@ -127,7 +140,21 @@ private:
     };
     StepState ss_;
 
+    struct PBState {
+        bool active = false;
+        bool is_insert = false;
+        bool is_dummy = false;
+        int key = INVALID_KEY;
+        Bytes insert_value;
+        int pos = -1;
+        int saved_main_root_key = INVALID_KEY;
+        int saved_main_root_leaf = INVALID_LEAF;
+        Bytes result;
+    };
+    PBState pb_;
+
     OmapInterface& ods_omap();
+    const OmapInterface& ods_omap() const;
     PathORAM& ods_oram();
 
     BandwidthStats last_bw_;

@@ -323,7 +323,7 @@ void BPlusOmap::move_to_sibling_cache(int id, int leaf,
 
 int BPlusOmap::split_upper_budget() const {
     if (split_depth_ <= 0) return 0;
-    return std::min(2 * split_depth_ - 1, 2 * max_height_);
+    return std::min(2 * split_depth_ - 1, 3 * max_height_);
 }
 
 void BPlusOmap::do_dummy_ops(int count) {
@@ -334,7 +334,7 @@ void BPlusOmap::do_dummy_ops(int count) {
 }
 
 void BPlusOmap::pad_to_budget() {
-    int budget = 2 * max_height_;
+    int budget = 3 * max_height_;
     if (split_depth_ > 0) {
         int ub = split_upper_budget();
         int upper_pad = std::max(0, ub - upper_op_count_);
@@ -895,7 +895,7 @@ void BPlusOmap::partial_dummy_access() {
     last_bw_.reset();
     op_count_ = 0; upper_op_count_ = 0; lower_op_count_ = 0;
 
-    int eff_split = std::min(split_depth_, 2 * max_height_);
+    int eff_split = std::min(split_depth_, 3 * max_height_);
     for (int i = 0; i < eff_split; ++i)
         upper_oram_.dummy_access();
     upper_op_count_ = eff_split;
@@ -915,11 +915,12 @@ void BPlusOmap::begin_step_search(int key, const Bytes* update) {
     op_count_ = 0; upper_op_count_ = 0; lower_op_count_ = 0;
     local_.clear();
     sibling_cache_.clear();
+    pb_ = PBState{};
 
     ss_ = StepState{};
     ss_.key = key;
     ss_.update = update;
-    ss_.budget = 2 * max_height_;
+    ss_.budget = 3 * max_height_;
 
     if (root_id_ == INVALID_KEY) {
         ss_.phase = StepPhase::PAD;
@@ -937,10 +938,11 @@ void BPlusOmap::begin_step_dummy() {
     op_count_ = 0; upper_op_count_ = 0; lower_op_count_ = 0;
     local_.clear();
     sibling_cache_.clear();
+    pb_ = PBState{};
 
     ss_ = StepState{};
     ss_.is_dummy = true;
-    ss_.budget = 2 * max_height_;
+    ss_.budget = 3 * max_height_;
     ss_.phase = StepPhase::PAD;
     ss_.pad_remaining = ss_.budget;
     if (split_depth_ > 0)
@@ -956,8 +958,9 @@ void BPlusOmap::begin_step_partial_dummy() {
     op_count_ = 0; upper_op_count_ = 0; lower_op_count_ = 0;
     local_.clear();
     sibling_cache_.clear();
+    pb_ = PBState{};
 
-    int eff_split = std::min(split_depth_, 2 * max_height_);
+    int eff_split = std::min(split_depth_, 3 * max_height_);
     ss_ = StepState{};
     ss_.is_dummy = true;
     ss_.budget = eff_split + 1;
@@ -968,39 +971,89 @@ void BPlusOmap::begin_step_partial_dummy() {
 
 OramStepRound BPlusOmap::step_next_round() {
     OramStepRound r;
-    if (ss_.phase == StepPhase::DONE)
-        return r;
+    ss_.round_read = (ss_.phase != StepPhase::DONE && ss_.phase != StepPhase::DECISION);
+    pb_.round_read = (pb_.active && pb_.phase != StepPhase::DONE
+                      && pb_.phase != StepPhase::DECISION);
 
-    int depth = ss_.depth;
-    int leaf = INVALID_LEAF;
-    if (ss_.phase == StepPhase::TRAVERSE_TARGET) {
-        leaf = ss_.cur_leaf;
-        ss_.cur_round_depth = depth;
-    } else if (ss_.phase == StepPhase::TRAVERSE_SIBLING) {
-        int sib_depth = depth + 1;
-        PathORAM& so = oram_for_depth(sib_depth);
-        leaf = ss_.sibling_is_dummy ? so.random_leaf() : ss_.sib_leaf;
-        ss_.cur_round_depth = sib_depth;
-    } else {
-        if (ss_.partial_upper_pad > 0) {
-            leaf = upper_oram_.random_leaf();
-            ss_.cur_round_depth = 0;
+    // ── Main operation ──
+    if (ss_.round_read) {
+        int depth = ss_.depth;
+        int leaf = INVALID_LEAF;
+        if (ss_.phase == StepPhase::TRAVERSE_TARGET) {
+            leaf = ss_.cur_leaf;
+            ss_.cur_round_depth = depth;
+        } else if (ss_.phase == StepPhase::TRAVERSE_SIBLING) {
+            int sib_depth = depth + 1;
+            PathORAM& so = oram_for_depth(sib_depth);
+            leaf = ss_.sibling_is_dummy ? so.random_leaf() : ss_.sib_leaf;
+            ss_.cur_round_depth = sib_depth;
         } else {
-            leaf = oram_.random_leaf();
-            ss_.cur_round_depth = split_depth_;
+            if (ss_.partial_upper_pad > 0) {
+                leaf = upper_oram_.random_leaf();
+                ss_.cur_round_depth = 0;
+            } else {
+                leaf = oram_.random_leaf();
+                ss_.cur_round_depth = split_depth_;
+            }
         }
+        ss_.cur_round_leaf = leaf;
+        PathORAM& ro = oram_for_depth(ss_.cur_round_depth);
+        r.reads.push_back({ro.get_store_id(), leaf});
     }
-    ss_.cur_round_leaf = leaf;
-    PathORAM& ro = oram_for_depth(ss_.cur_round_depth);
-    r.reads.push_back({ro.get_store_id(), leaf});
+
+    // ── Piggyback operation ──
+    if (pb_.round_read) {
+        int leaf = INVALID_LEAF;
+        if (pb_.phase == StepPhase::TRAVERSE_TARGET) {
+            pb_.node_in_local = false;
+            for (auto& ln : local_)
+                if (ln.id == pb_.cur_id) { pb_.node_in_local = true; break; }
+            PathORAM& po = oram_for_depth(pb_.depth);
+            leaf = pb_.node_in_local ? po.random_leaf() : pb_.cur_leaf;
+            pb_.cur_round_depth = pb_.depth;
+        } else if (pb_.phase == StepPhase::TRAVERSE_SIBLING) {
+            int sib_depth = pb_.depth + 1;
+            PathORAM& so = oram_for_depth(sib_depth);
+            leaf = pb_.sibling_is_dummy ? so.random_leaf() : pb_.sib_leaf;
+            pb_.cur_round_depth = sib_depth;
+        } else {
+            if (pb_.partial_upper_pad > 0) {
+                leaf = upper_oram_.random_leaf();
+                pb_.cur_round_depth = 0;
+            } else {
+                leaf = oram_.random_leaf();
+                pb_.cur_round_depth = split_depth_;
+            }
+        }
+        pb_.cur_round_leaf = leaf;
+        PathORAM& po = oram_for_depth(pb_.cur_round_depth);
+        r.reads.push_back({po.get_store_id(), leaf});
+    }
+
     return r;
 }
 
 void BPlusOmap::step_apply_reads(const std::vector<PathData>& results) {
-    PathORAM& ro = oram_for_depth(ss_.cur_round_depth);
-    if (!results.empty())
-        ro.apply_fetched_path(
-            std::unordered_map<int, std::vector<Block>>(results[0]));
+    if (ss_.round_read && pb_.round_read && results.size() >= 2) {
+        PathORAM& main_oram = oram_for_depth(ss_.cur_round_depth);
+        PathORAM& pb_oram = oram_for_depth(pb_.cur_round_depth);
+        if (&main_oram == &pb_oram) {
+            PathData merged(results[0]);
+            for (auto& [nid, blocks] : results[1])
+                if (merged.find(nid) == merged.end())
+                    merged[nid] = blocks;
+            main_oram.apply_fetched_path(std::move(merged));
+        } else {
+            main_oram.apply_fetched_path(PathData(results[0]));
+            pb_oram.apply_fetched_path(PathData(results[1]));
+        }
+    } else if (ss_.round_read && !results.empty()) {
+        oram_for_depth(ss_.cur_round_depth)
+            .apply_fetched_path(PathData(results[0]));
+    } else if (pb_.round_read && !results.empty()) {
+        oram_for_depth(pb_.cur_round_depth)
+            .apply_fetched_path(PathData(results[0]));
+    }
 }
 
 void BPlusOmap::step_process() {
@@ -1069,14 +1122,18 @@ void BPlusOmap::step_process() {
             ++lower_op_count_;
 
         if (ss_.leaf_reached || ss_.next_id == INVALID_KEY) {
-            reassign_all_leaves();
-            flush_all_to_stash();
-            ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
-            if (split_depth_ > 0)
-                ss_.partial_upper_pad = std::max(0,
-                    split_upper_budget() - upper_op_count_);
-            ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::PAD
-                                                : StepPhase::DONE;
+            if (ss_.decision_enabled && !ss_.result.empty()) {
+                ss_.phase = StepPhase::DECISION;
+            } else {
+                reassign_all_leaves();
+                flush_all_to_stash();
+                ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
+                if (split_depth_ > 0)
+                    ss_.partial_upper_pad = std::max(0,
+                        split_upper_budget() - upper_op_count_);
+                ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::PAD
+                                                    : StepPhase::DONE;
+            }
         } else {
             ss_.cur_id = ss_.next_id;
             ss_.cur_leaf = ss_.next_leaf;
@@ -1097,21 +1154,399 @@ void BPlusOmap::step_process() {
         if (ss_.pad_remaining <= 0)
             ss_.phase = StepPhase::DONE;
     }
+
+    // ── Piggyback operation ──
+    if (!pb_.active || pb_.phase == StepPhase::DONE)
+        return;
+
+    if (pb_.phase == StepPhase::TRAVERSE_TARGET) {
+        int local_idx = -1;
+        if (pb_.node_in_local) {
+            for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+                if (local_[i].id == pb_.cur_id) { local_idx = i; break; }
+            if (local_idx < 0) {
+                // Main flushed local_; re-extract from stash
+                PathORAM& po = oram_for_depth(pb_.depth);
+                Block block = po.extract_from_stash(pb_.cur_id);
+                BPlusNode nd = BPlusNode::decode(block.value);
+                int parent = INVALID_KEY;
+                for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+                    for (int c = 0; c < static_cast<int>(local_[i].node.child_ids.size()); ++c)
+                        if (local_[i].node.child_ids[c] == pb_.cur_id) { parent = local_[i].id; break; }
+                    if (parent != INVALID_KEY) break;
+                }
+                local_.push_back({pb_.cur_id, block.leaf, nd, parent, pb_.depth});
+                local_idx = static_cast<int>(local_.size()) - 1;
+            }
+        } else {
+            // Main op may have added this node to local_ earlier in the same round
+            for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+                if (local_[i].id == pb_.cur_id) { local_idx = i; break; }
+            if (local_idx < 0) {
+                PathORAM& po = oram_for_depth(pb_.depth);
+                Block block = po.extract_from_stash(pb_.cur_id);
+                BPlusNode nd = BPlusNode::decode(block.value);
+                int parent = INVALID_KEY;
+                for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+                    for (int c = 0; c < static_cast<int>(local_[i].node.child_ids.size()); ++c)
+                        if (local_[i].node.child_ids[c] == pb_.cur_id) { parent = local_[i].id; break; }
+                    if (parent != INVALID_KEY) break;
+                }
+                local_.push_back({pb_.cur_id, block.leaf, nd, parent, pb_.depth});
+                local_idx = static_cast<int>(local_.size()) - 1;
+            }
+        }
+        pb_.ops++;
+        ++op_count_;
+        if (split_depth_ > 0 && pb_.depth < split_depth_)
+            ++upper_op_count_;
+        else
+            ++lower_op_count_;
+
+        if (local_idx >= 0) {
+            auto& ln = local_[local_idx];
+            if (ln.node.is_leaf) {
+                if (pb_.is_insert) {
+                    auto it = std::lower_bound(ln.node.keys.begin(),
+                                               ln.node.keys.end(), pb_.key);
+                    int pos = static_cast<int>(it - ln.node.keys.begin());
+                    ln.node.keys.insert(it, pb_.key);
+                    if (ln.node.is_index_leaf) {
+                        ln.node.child_ids.insert(
+                            ln.node.child_ids.begin() + pos,
+                            bytes_to_int(pb_.insert_value));
+                    } else {
+                        ln.node.values.insert(
+                            ln.node.values.begin() + pos, pb_.insert_value);
+                    }
+                    if (static_cast<int>(ln.node.keys.size()) > max_leaf_keys()) {
+                        int new_id = split_leaf(local_[local_idx]);
+                        int parent_id = local_[local_idx].parent_id;
+                        int new_depth = local_[local_idx].depth;
+                        PathORAM& new_o = oram_for_depth(new_depth);
+                        if (parent_id != INVALID_KEY) {
+                            for (auto& p : local_) {
+                                if (p.id == parent_id && !p.node.is_leaf) {
+                                    int ci2 = find_child_index(
+                                        p.node, local_[local_idx].node.keys.back());
+                                    int sep_key = local_.back().node.keys[0];
+                                    p.node.keys.insert(
+                                        p.node.keys.begin() + ci2, sep_key);
+                                    int nlf = new_o.get_leaf(new_id);
+                                    p.node.child_ids.insert(
+                                        p.node.child_ids.begin() + ci2 + 1, new_id);
+                                    p.node.child_leaves.insert(
+                                        p.node.child_leaves.begin() + ci2 + 1, nlf);
+                                    break;
+                                }
+                            }
+                        } else {
+                            int sep_key = local_.back().node.keys[0];
+                            int old_id = local_[local_idx].id;
+                            int old_leaf = local_[local_idx].leaf;
+                            BPlusNode new_root;
+                            new_root.is_leaf = false;
+                            new_root.keys = {sep_key};
+                            new_root.child_ids = {old_id, new_id};
+                            new_root.child_leaves = {old_leaf, new_o.get_leaf(new_id)};
+                            int rid = next_block_id_++;
+                            PathORAM& root_o = oram_for_depth(0);
+                            int rlf = root_o.random_leaf();
+                            root_o.set_leaf(rid, rlf);
+                            local_.push_back({rid, rlf, new_root, INVALID_KEY, 0});
+                            root_id_ = rid;
+                        }
+                    }
+                } else {
+                    int idx = find_leaf_index(ln.node, pb_.key);
+                    if (idx >= 0) {
+                        if (ln.node.is_index_leaf)
+                            pb_.result = int_to_bytes(ln.node.child_ids[idx]);
+                        else
+                            pb_.result = ln.node.values[idx];
+                    }
+                }
+                pb_.leaf_reached = true;
+                pb_.sibling_is_dummy = true;
+                pb_.phase = StepPhase::TRAVERSE_SIBLING;
+            } else {
+                int ci = find_child_index(ln.node, pb_.key);
+                int num_ch = static_cast<int>(ln.node.child_ids.size());
+                int sib_idx = (ci > 0) ? ci - 1
+                                       : ((ci + 1 < num_ch) ? ci + 1 : -1);
+                pb_.next_id = ln.node.child_ids[ci];
+                pb_.next_leaf = ln.node.child_leaves[ci];
+                if (pb_.node_in_local && local_idx >= 0) {
+                    pb_.sibling_is_dummy = true;
+                } else if (sib_idx >= 0) {
+                    pb_.sibling_is_dummy = false;
+                    pb_.sib_id = ln.node.child_ids[sib_idx];
+                    pb_.sib_leaf = ln.node.child_leaves[sib_idx];
+                    pb_.sib_parent_idx = local_idx;
+                    pb_.sib_child_idx = sib_idx;
+                } else {
+                    pb_.sibling_is_dummy = true;
+                }
+                pb_.phase = StepPhase::TRAVERSE_SIBLING;
+            }
+        }
+    } else if (pb_.phase == StepPhase::TRAVERSE_SIBLING) {
+        int sib_depth = pb_.depth + 1;
+        if (!pb_.sibling_is_dummy) {
+            PathORAM& so = oram_for_depth(sib_depth);
+            Block block = so.extract_from_stash(pb_.sib_id);
+            BPlusNode nd = BPlusNode::decode(block.value);
+            sibling_cache_.push_back({pb_.sib_id, block.leaf, nd,
+                                      pb_.sib_parent_idx, pb_.sib_child_idx,
+                                      sib_depth});
+        }
+        pb_.ops++;
+        {
+            int pb_sib_depth = pb_.depth + 1;
+            ++op_count_;
+            if (split_depth_ > 0 && pb_sib_depth < split_depth_)
+                ++upper_op_count_;
+            else
+                ++lower_op_count_;
+        }
+
+        if (pb_.leaf_reached || pb_.next_id == INVALID_KEY) {
+            pb_.traverse_done = true;
+            if (pb_.decision_enabled && !pb_.result.empty()) {
+                pb_.phase = StepPhase::DECISION;
+            } else {
+                pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+                if (split_depth_ > 0)
+                    pb_.partial_upper_pad = pb_.pad_remaining;
+                pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD
+                                                    : StepPhase::DONE;
+            }
+        } else {
+            pb_.cur_id = pb_.next_id;
+            pb_.cur_leaf = pb_.next_leaf;
+            pb_.depth++;
+            pb_.phase = StepPhase::TRAVERSE_TARGET;
+        }
+    } else if (pb_.phase == StepPhase::PAD) {
+        pb_.ops++;
+        ++op_count_;
+        if (pb_.partial_upper_pad > 0) {
+            pb_.partial_upper_pad--;
+            ++upper_op_count_;
+        } else {
+            ++lower_op_count_;
+        }
+        pb_.pad_remaining--;
+        if (pb_.pad_remaining <= 0) pb_.phase = StepPhase::DONE;
+    }
 }
 
 std::vector<StepWriteReq> BPlusOmap::step_prepare_writes() {
-    PathORAM& ro = oram_for_depth(ss_.cur_round_depth);
-    return {{ro.get_store_id(),
-             ro.prepare_eviction(ss_.cur_round_leaf)}};
+    std::vector<StepWriteReq> writes;
+
+    if (!ss_.round_read && !pb_.round_read)
+        return writes;
+
+    if (ss_.round_read && pb_.round_read) {
+        PathORAM& main_oram = oram_for_depth(ss_.cur_round_depth);
+        PathORAM& pb_oram = oram_for_depth(pb_.cur_round_depth);
+        if (&main_oram == &pb_oram) {
+            writes.push_back({main_oram.get_store_id(),
+                              main_oram.prepare_eviction_paths(
+                                  {ss_.cur_round_leaf, pb_.cur_round_leaf})});
+        } else {
+            writes.push_back({main_oram.get_store_id(),
+                              main_oram.prepare_eviction(ss_.cur_round_leaf)});
+            writes.push_back({pb_oram.get_store_id(),
+                              pb_oram.prepare_eviction(pb_.cur_round_leaf)});
+        }
+    } else if (ss_.round_read) {
+        PathORAM& ro = oram_for_depth(ss_.cur_round_depth);
+        writes.push_back({ro.get_store_id(),
+                          ro.prepare_eviction(ss_.cur_round_leaf)});
+    } else {
+        PathORAM& po = oram_for_depth(pb_.cur_round_depth);
+        writes.push_back({po.get_store_id(),
+                          po.prepare_eviction(pb_.cur_round_leaf)});
+    }
+    return writes;
 }
 
 bool BPlusOmap::step_done() const {
+    if (pb_.active && pb_.phase != StepPhase::DONE)
+        return false;
     return ss_.phase == StepPhase::DONE;
 }
 
 Bytes BPlusOmap::step_finish() {
     finalize_bw();
     return ss_.result;
+}
+
+// ─── Piggyback step interface ───────────────────────────────────────────────
+
+void BPlusOmap::begin_piggyback_search(int key) {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.key = key;
+    pb_.budget = 3 * max_height_;
+    if (root_id_ == INVALID_KEY) {
+        pb_.phase = StepPhase::PAD;
+        pb_.pad_remaining = pb_.budget;
+        pb_.traverse_done = true;
+        if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+    } else {
+        pb_.phase = StepPhase::TRAVERSE_TARGET;
+        pb_.cur_id = root_id_;
+        pb_.cur_leaf = root_leaf_;
+        pb_.depth = 0;
+    }
+}
+
+void BPlusOmap::begin_piggyback_insert(int key, const Bytes& value) {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.key = key;
+    pb_.is_insert = true;
+    pb_.insert_value = value;
+    pb_.budget = 3 * max_height_;
+    if (root_id_ == INVALID_KEY) {
+        BPlusNode leaf;
+        leaf.is_leaf = true;
+        if (index_mode_) {
+            leaf.is_index_leaf = true;
+            leaf.keys = {key};
+            leaf.child_ids = {bytes_to_int(value)};
+        } else {
+            leaf.keys = {key};
+            leaf.values = {value};
+        }
+        int id = next_block_id_++;
+        PathORAM& ro = oram_for_depth(0);
+        int lf = ro.random_leaf();
+        ro.set_leaf(id, lf);
+        local_.push_back({id, lf, leaf, INVALID_KEY, 0});
+        root_id_ = id;
+        root_leaf_ = lf;
+        pb_.phase = StepPhase::PAD;
+        pb_.pad_remaining = pb_.budget;
+        pb_.traverse_done = true;
+        if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+    } else {
+        pb_.phase = StepPhase::TRAVERSE_TARGET;
+        pb_.cur_id = root_id_;
+        pb_.cur_leaf = root_leaf_;
+        pb_.depth = 0;
+    }
+}
+
+void BPlusOmap::begin_piggyback_dummy() {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.phase = StepPhase::PAD;
+    pb_.budget = 3 * max_height_;
+    pb_.pad_remaining = pb_.budget;
+    pb_.traverse_done = true;
+    if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
+}
+
+Bytes BPlusOmap::finish_piggyback() { return pb_.result; }
+
+bool BPlusOmap::piggyback_needs_decision() const {
+    return pb_.active && pb_.phase == StepPhase::DECISION;
+}
+
+Bytes BPlusOmap::piggyback_get_traverse_result() { return pb_.result; }
+
+// ─── Mid-access decision interface ─────────────────────────────────────────
+
+void BPlusOmap::set_step_decision_enabled(bool enable) {
+    ss_.decision_enabled = enable;
+}
+
+bool BPlusOmap::step_needs_decision() const {
+    return ss_.phase == StepPhase::DECISION;
+}
+
+Bytes BPlusOmap::step_get_traverse_result() {
+    return ss_.result;
+}
+
+void BPlusOmap::step_commit_remove() {
+    if (ss_.phase != StepPhase::DECISION) return;
+    if (!local_.empty() && local_.back().node.is_leaf) {
+        int idx = find_leaf_index(local_.back().node, ss_.key);
+        if (idx >= 0) {
+            local_.back().node.keys.erase(local_.back().node.keys.begin() + idx);
+            if (local_.back().node.is_index_leaf)
+                local_.back().node.child_ids.erase(local_.back().node.child_ids.begin() + idx);
+            else
+                local_.back().node.values.erase(local_.back().node.values.begin() + idx);
+        }
+        handle_delete_underflow();
+    }
+    reassign_all_leaves();
+    flush_all_to_stash();
+    ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
+    if (split_depth_ > 0)
+        ss_.partial_upper_pad = std::max(0,
+            split_upper_budget() - upper_op_count_);
+    ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::PAD : StepPhase::DONE;
+}
+
+void BPlusOmap::step_commit_noop() {
+    if (ss_.phase != StepPhase::DECISION) return;
+    reassign_all_leaves();
+    flush_all_to_stash();
+    ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
+    if (split_depth_ > 0)
+        ss_.partial_upper_pad = std::max(0,
+            split_upper_budget() - upper_op_count_);
+    ss_.phase = (ss_.pad_remaining > 0) ? StepPhase::PAD : StepPhase::DONE;
+}
+
+void BPlusOmap::set_piggyback_decision_enabled(bool enable) {
+    pb_.decision_enabled = enable;
+}
+
+void BPlusOmap::piggyback_commit_remove() {
+    if (pb_.phase != StepPhase::DECISION) return;
+    if (!local_.empty()) {
+        int leaf_idx = -1;
+        for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
+            if (local_[i].node.is_leaf) { leaf_idx = i; break; }
+        }
+        if (leaf_idx >= 0) {
+            int idx = find_leaf_index(local_[leaf_idx].node, pb_.key);
+            if (idx >= 0) {
+                local_[leaf_idx].node.keys.erase(
+                    local_[leaf_idx].node.keys.begin() + idx);
+                if (local_[leaf_idx].node.is_index_leaf)
+                    local_[leaf_idx].node.child_ids.erase(
+                        local_[leaf_idx].node.child_ids.begin() + idx);
+                else
+                    local_[leaf_idx].node.values.erase(
+                        local_[leaf_idx].node.values.begin() + idx);
+            }
+            handle_delete_underflow();
+        }
+    }
+    reassign_all_leaves();
+    flush_all_to_stash();
+    pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+    if (split_depth_ > 0)
+        pb_.partial_upper_pad = pb_.pad_remaining;
+    pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD : StepPhase::DONE;
+}
+
+void BPlusOmap::piggyback_commit_noop() {
+    if (pb_.phase != StepPhase::DECISION) return;
+    reassign_all_leaves();
+    flush_all_to_stash();
+    pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+    if (split_depth_ > 0)
+        pb_.partial_upper_pad = pb_.pad_remaining;
+    pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD : StepPhase::DONE;
 }
 
 Bytes BPlusOmap::search_piggyback(int key, const Bytes* update,
@@ -1122,7 +1557,7 @@ Bytes BPlusOmap::search_piggyback(int key, const Bytes* update,
     op_count_ = 0;
 
     if (root_id_ == INVALID_KEY) {
-        do_dummy_ops(2 * max_height_);
+        do_dummy_ops(3 * max_height_);
         finalize_bw();
         return {};
     }
@@ -1150,7 +1585,7 @@ Bytes BPlusOmap::search_piggyback(int key, const Bytes* update,
     int main_ops = op_count_;
 
     // Phase 2: piggyback — traverse for extra_key within remaining budget.
-    int budget = 2 * max_height_ - main_ops;
+    int budget = 3 * max_height_ - main_ops;
     if (extra_key != INVALID_KEY && budget > 0) {
         traverse_with_siblings(extra_key);
         int extra_ops_used = op_count_ - main_ops;
@@ -1238,7 +1673,7 @@ Bytes BPlusOmap::search_piggyback(int key, const Bytes* update,
     }
 
     // Phase 3: pad remaining budget with dummies.
-    do_dummy_ops(std::max(0, 2 * max_height_ - op_count_));
+    do_dummy_ops(std::max(0, 3 * max_height_ - op_count_));
     finalize_bw();
     return result;
 }

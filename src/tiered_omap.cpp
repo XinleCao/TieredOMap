@@ -84,7 +84,7 @@ void TieredOMap::init(
     int n = static_cast<int>(hot_refs.size());
     int N_cold = static_cast<int>(cold_refs.size());
 
-    int hot_cap = use_epoch ? std::max(n * 2, n + 64) : std::max(n, 1);
+    int hot_cap = std::max(n, 1);
     int cold_cap = use_epoch ? std::max(N_cold, config_.total_keys) : std::max(N_cold, 1);
     hot_capacity_ = hot_cap;
 
@@ -163,15 +163,84 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
 
     if (use_epoch) {
         // ── Epoch-aware access with dynamic maintenance ──
-        bool is_in_cache = cache_keys_.count(key) > 0;
+        maint_->tick();
+        bool scan_piggybacked = false;
+        bool hot_ins_piggybacked = false;
+        bool cold_ins_piggybacked = false;
+        bool hot_dummy_pb = false;
+        bool cold_dummy_pb = false;
+
+        bool is_pending = (key == pending_insert_key_);
+        bool is_in_cache = !is_pending && cache_keys_.count(key) > 0;
         bool can_interleave =
             channel_ &&
             hot_omap_->supports_interleaved() &&
             cold_omap_->supports_interleaved();
 
-        if (can_interleave && !is_in_cache) {
+        if (debug_access_) {
+            fprintf(stderr, "[DBG-PATH] key=%d is_pending=%d is_in_cache=%d "
+                    "can_interleave=%d(ch=%d h=%d c=%d) is_hot_log=%d is_hot_phys=%d\n",
+                    key, (int)is_pending, (int)is_in_cache,
+                    (int)can_interleave, (channel_ != nullptr),
+                    (int)hot_omap_->supports_interleaved(),
+                    (int)cold_omap_->supports_interleaved(),
+                    (int)is_hot_logical, (int)is_hot_physical);
+        }
+        if (is_pending) {
+            // Pending entry: between scan eviction and B2 insertion.
+            // Serve from local; treat as logically in hot OMAP.
+            result.found_in_hot = true;
+            int blk = ref_to_blk(pending_insert_ref_);
+            Bytes raw = data_access(blk);
+            auto [val, meta] = decode_epoch(raw);
+            meta = maint_->update_meta(meta);
+            Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
+            result.value = new_value ? *new_value : val;
+            result.last_access_fp = meta.fp;
+            data_access(blk, &wb);
+            hot_omap_->dummy_access();
+            if (config_.mode == SecurityMode::FullOblivious)
+                cold_omap_->dummy_access();
+            else
+                cold_omap_->partial_dummy_access();
+        } else if (can_interleave && !is_in_cache) {
             bool use_partial = (config_.mode == SecurityMode::TierMembership);
-            auto ir = interleaved_access(key, new_value, use_partial, true);
+            bool do_pb = config_.maintenance.piggyback;
+
+            int scan_key = INVALID_KEY;
+            int hot_ins_key = INVALID_KEY;
+            int cold_ins_key = INVALID_KEY;
+
+            if (do_pb) {
+                bool do_scan = maint_->should_scan()
+                               && !is_da_hot()
+                               && maint_->swap_state() == SwapState::Idle;
+                scan_key = do_scan ? next_scan_key() : INVALID_KEY;
+                if (scan_key != INVALID_KEY) scan_piggybacked = true;
+
+                bool can_pb_hot = is_hot_physical || !use_partial;
+                bool can_pb_cold = !is_hot_physical || !use_partial;
+
+                if (maint_->should_hot_insert()) {
+                    if (maint_->swap_state() == SwapState::HotPend
+                        && pending_insert_key_ != INVALID_KEY)
+                        hot_ins_key = pending_insert_key_;
+                    else if (can_pb_hot)
+                        hot_dummy_pb = true;
+                }
+
+                if (maint_->should_cold_insert()) {
+                    if (maint_->swap_state() == SwapState::ColdPend
+                        && pending_insert_key_ != INVALID_KEY)
+                        cold_ins_key = pending_insert_key_;
+                    else if (can_pb_cold)
+                        cold_dummy_pb = true;
+                }
+            }
+
+            auto ir = interleaved_access(key, new_value, use_partial, true,
+                                         scan_key, hot_ins_key, cold_ins_key,
+                                         hot_dummy_pb, cold_dummy_pb);
             result.value = ir.value;
             result.found_in_hot = ir.found_in_hot;
             result.hot_bw = ir.hot_bw;
@@ -179,9 +248,75 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             result.total_bw = ir.total_bw;
             result.rounds_to_answer = ir.rounds_to_answer;
             result.last_access_fp = ir.last_access_fp;
+            if (debug_access_) {
+                fprintf(stderr, "[DBG] key=%d pb=%d scan=%d hins=%d cins=%d hdpb=%d cdpb=%d "
+                        "ir_rnd=%d ir_rta=%d ir_bw=%.0f\n",
+                        key, (int)do_pb, scan_key, hot_ins_key, cold_ins_key,
+                        (int)hot_dummy_pb, (int)cold_dummy_pb,
+                        (int)ir.total_bw.rounds, ir.rounds_to_answer,
+                        ir.total_bw.total_bytes() / 1024.0);
+            }
+
+            // Process piggybacked scan result (DECISION handled inside loop)
+            if (scan_key != INVALID_KEY && ir.scan_decision_handled
+                && ir.scan_demoted) {
+                CacheEntry evicted = maint_->cache_admit(
+                    scan_key, ir.scan_fp, true);
+                pending_insert_key_ = evicted.key;
+                pending_insert_ref_ = cache_data_refs_[evicted.key];
+                phys_hot_keys_.erase(scan_key);
+                {
+                    auto eit = std::lower_bound(
+                        hot_key_list_.begin(), hot_key_list_.end(), scan_key);
+                    if (eit != hot_key_list_.end() && *eit == scan_key)
+                        hot_key_list_.erase(eit);
+                }
+                cache_keys_.insert(scan_key);
+                cache_data_refs_[scan_key] = ir.scan_ref;
+                cache_keys_.erase(evicted.key);
+                cache_data_refs_.erase(evicted.key);
+                maint_->set_swap_state(SwapState::HotPend);
+            }
+
+            // Handle piggybacked B2 (hot insert) result
+            if (ir.hot_insert_done) {
+                phys_hot_keys_.insert(hot_ins_key);
+                {
+                    auto it = std::lower_bound(
+                        hot_key_list_.begin(), hot_key_list_.end(), hot_ins_key);
+                    hot_key_list_.insert(it, hot_ins_key);
+                }
+                pending_insert_key_ = INVALID_KEY;
+                pending_insert_ref_.clear();
+                maint_->set_swap_state(SwapState::Idle);
+                hot_ins_piggybacked = true;
+            }
+
+            // Handle piggybacked B3 (cold insert) result
+            if (ir.cold_insert_done) {
+                pending_insert_key_ = INVALID_KEY;
+                pending_insert_ref_.clear();
+                maint_->set_swap_state(SwapState::Idle);
+                cold_ins_piggybacked = true;
+            }
 
             // Reactive cold promotion
-            if (!is_hot_logical && ir.last_access_fp > 0
+            if (!is_hot_logical && ir.cold_decision_handled) {
+                // DECISION phase handled the type-hidden remove/noop
+                if (ir.cold_promotion_done) {
+                    CacheEntry evicted = maint_->cache_admit(
+                        key, ir.last_access_fp, false);
+                    pending_insert_key_ = evicted.key;
+                    pending_insert_ref_ = cache_data_refs_[evicted.key];
+                    cache_keys_.erase(evicted.key);
+                    cache_data_refs_.erase(evicted.key);
+                    hot_keys_.erase(evicted.key);
+                    cache_keys_.insert(key);
+                    cache_data_refs_[key] = ir.cold_ref;
+                    hot_keys_.insert(key);
+                    maint_->set_swap_state(SwapState::ColdPend);
+                }
+            } else if (!is_hot_logical && ir.last_access_fp > 0
                 && maint_->swap_state() == SwapState::Idle
                 && maint_->should_promote(ir.last_access_fp)) {
                 cold_omap_->remove(key);
@@ -193,9 +328,11 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
                 cache_data_refs_.erase(evicted.key);
                 hot_keys_.erase(evicted.key);
                 cache_keys_.insert(key);
-                cache_data_refs_[key] = ir.value; // interleaved already got ref
+                cache_data_refs_[key] = ir.cold_ref;
                 hot_keys_.insert(key);
                 maint_->set_swap_state(SwapState::ColdPend);
+            } else if (!is_hot_logical && !ir.cold_decision_handled) {
+                cold_omap_->dummy_access();
             }
         } else if (is_in_cache) {
             // Cache hit: direct data access, dummy both OMAPs
@@ -288,24 +425,44 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
 
         // ── Staggered maintenance (B1/B2/B3 at different phase offsets) ──
-        maint_->tick();
         auto h_before = hot_omap_->total_stats();
         auto c_before = cold_omap_->total_stats();
-        if (maint_->should_scan())       do_scan_step();
-        if (maint_->should_hot_insert()) do_hot_insert_step();
-        if (maint_->should_cold_insert()) do_cold_insert_step();
-        if (!config_.maintenance.piggyback) {
+        auto d_before = data_oram_.total_stats();
+        bool did_scan = false, did_hins = false, did_cins = false;
+        if (!scan_piggybacked && maint_->should_scan()) { do_scan_step(); did_scan = true; }
+        if (!hot_ins_piggybacked && !hot_dummy_pb && maint_->should_hot_insert())
+            { do_hot_insert_step(); did_hins = true; }
+        if (!cold_ins_piggybacked && !cold_dummy_pb && maint_->should_cold_insert())
+            { do_cold_insert_step(); did_cins = true; }
+        {
             auto h_after = hot_omap_->total_stats();
             auto c_after = cold_omap_->total_stats();
+            auto d_after = data_oram_.total_stats();
+            auto delta_rnd =
+                (h_after.rounds - h_before.rounds)
+                + (c_after.rounds - c_before.rounds)
+                + (d_after.rounds - d_before.rounds);
+            if (debug_access_ && delta_rnd > 0) {
+                fprintf(stderr, "[DBG] standalone maint: scan=%d hins=%d cins=%d "
+                        "h_rnd=%lld c_rnd=%lld d_rnd=%lld total_delta=%lld\n",
+                        (int)did_scan, (int)did_hins, (int)did_cins,
+                        (long long)(h_after.rounds - h_before.rounds),
+                        (long long)(c_after.rounds - c_before.rounds),
+                        (long long)(d_after.rounds - d_before.rounds),
+                        (long long)delta_rnd);
+            }
             result.total_bw.bytes_downloaded +=
                 (h_after.bytes_downloaded - h_before.bytes_downloaded)
-                + (c_after.bytes_downloaded - c_before.bytes_downloaded);
+                + (c_after.bytes_downloaded - c_before.bytes_downloaded)
+                + (d_after.bytes_downloaded - d_before.bytes_downloaded);
             result.total_bw.bytes_uploaded +=
                 (h_after.bytes_uploaded - h_before.bytes_uploaded)
-                + (c_after.bytes_uploaded - c_before.bytes_uploaded);
+                + (c_after.bytes_uploaded - c_before.bytes_uploaded)
+                + (d_after.bytes_uploaded - d_before.bytes_uploaded);
             result.total_bw.rounds +=
                 (h_after.rounds - h_before.rounds)
-                + (c_after.rounds - c_before.rounds);
+                + (c_after.rounds - c_before.rounds)
+                + (d_after.rounds - d_before.rounds);
         }
 
         return result;
@@ -321,7 +478,9 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
 
     if (can_interleave) {
         bool use_partial = (config_.mode == SecurityMode::TierMembership);
-        auto ir = interleaved_access(key, new_value, use_partial);
+        auto ir = interleaved_access(key, new_value, use_partial, false,
+                                     INVALID_KEY, INVALID_KEY, INVALID_KEY,
+                                     false, force_cold_dummy_pb_);
         result.value = ir.value;
         result.found_in_hot = ir.found_in_hot;
         result.hot_bw = ir.hot_bw;
@@ -370,6 +529,21 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
 
     return result;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+int TieredOMap::next_scan_key() {
+    if (hot_key_list_.empty()) return INVALID_KEY;
+    auto it = std::upper_bound(
+        hot_key_list_.begin(), hot_key_list_.end(), maint_->scan_ptr());
+    if (it == hot_key_list_.end()) {
+        maint_->reset_scan_ptr();
+        it = hot_key_list_.begin();
+    }
+    int sk = *it;
+    maint_->set_scan_ptr(sk);
+    return sk;
 }
 
 // ─── Staggered maintenance steps ────────────────────────────────────────────
@@ -567,12 +741,18 @@ void TieredOMap::run_interleaved_loop(OmapInterface* a, OmapInterface* b) {
 
 AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                             bool use_partial_dummy,
-                                            bool epoch_mode) {
+                                            bool epoch_mode,
+                                            int scan_key,
+                                            int hot_insert_key,
+                                            int cold_insert_key,
+                                            bool hot_dummy_pb,
+                                            bool cold_dummy_pb) {
     AccessResult result;
     bool is_hot_physical = phys_hot_keys_.count(key) > 0;
     bool is_hot_logical = hot_keys_.count(key) > 0;
     result.found_in_hot = is_hot_logical;
     bool fo = !use_partial_dummy;
+    bool scan_on_piggyback = false;
 
     OmapInterface* searcher = is_hot_physical ? hot_omap_.get()
                                               : cold_omap_.get();
@@ -580,10 +760,66 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                               : hot_omap_.get();
 
     searcher->begin_step_search(key, nullptr);
-    if (use_partial_dummy)
+
+    if (scan_key != INVALID_KEY) {
+        // Scan fires: hot OMAP needs a full operation to support piggybacking
+        if (!is_hot_physical) {
+            // K in cold → hot is the dummy side, upgrade to full dummy
+            dummy->begin_step_dummy();
+        } else {
+            // K in hot → cold gets its normal dummy
+            if (use_partial_dummy)
+                dummy->begin_step_partial_dummy();
+            else
+                dummy->begin_step_dummy();
+        }
+        hot_omap_->begin_piggyback_search(scan_key);
+        hot_omap_->set_piggyback_decision_enabled(true);
+        scan_on_piggyback = true;
+    } else if (use_partial_dummy) {
         dummy->begin_step_partial_dummy();
-    else
+    } else {
         dummy->begin_step_dummy();
+    }
+
+    // B2: piggyback hot insert on hot OMAP
+    if (hot_insert_key != INVALID_KEY) {
+        if (is_hot_physical) {
+            hot_omap_->begin_piggyback_insert(hot_insert_key, pending_insert_ref_);
+        } else {
+            // Hot OMAP is the dummy side; for TM mode it's partial_dummy
+            // which doesn't support piggybacking. Only piggyback when hot
+            // OMAP has a full operation (search or dummy, not partial).
+            if (!use_partial_dummy)
+                hot_omap_->begin_piggyback_insert(hot_insert_key, pending_insert_ref_);
+        }
+    }
+
+    // B3: piggyback cold insert on cold OMAP
+    if (cold_insert_key != INVALID_KEY) {
+        if (!is_hot_physical) {
+            cold_omap_->begin_piggyback_insert(cold_insert_key, pending_insert_ref_);
+        } else {
+            if (!use_partial_dummy)
+                cold_omap_->begin_piggyback_insert(cold_insert_key, pending_insert_ref_);
+        }
+    }
+
+    // Enable DECISION for type-hidden cold promotion
+    if (epoch_mode && !is_hot_physical)
+        searcher->set_step_decision_enabled(true);
+
+    // B2 dummy piggybacking (no pending entry)
+    if (hot_dummy_pb && hot_insert_key == INVALID_KEY) {
+        if (is_hot_physical || !use_partial_dummy)
+            hot_omap_->begin_piggyback_dummy();
+    }
+
+    // B3 dummy piggybacking (no pending entry)
+    if (cold_dummy_pb && cold_insert_key == INVALID_KEY) {
+        if (!is_hot_physical || !use_partial_dummy)
+            cold_omap_->begin_piggyback_dummy();
+    }
 
     enum DStep { IDLE, NEED_READ, NEED_WRITE, DONE };
     DStep data_st   = IDLE;
@@ -593,15 +829,26 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
     int  data_new_leaf = -1;
     int  ddummy_leaf   = -1;
     bool searcher_done_flag = false;
+    bool decision_triggered = false;
+    bool decision_pending = false;
     int  total_rounds  = 0;
     int  answer_round  = 0;
     Bytes searcher_ref;
     int  computed_fp   = 0;
 
+    // Scan data ORAM state (for reading scan key's epoch metadata)
+    DStep scan_data_st = scan_on_piggyback ? IDLE : DONE;
+    int  scan_data_blk      = INVALID_BLOCK;
+    int  scan_data_leaf     = -1;
+    int  scan_data_new_leaf = -1;
+    bool scan_decision_triggered = false;
+    bool scan_decision_pending = false;
+
     while (true) {
         bool s_act = !searcher->step_done();
         bool d_act = !dummy->step_done();
-        if (!s_act && !d_act && data_st == DONE && ddummy_st == DONE)
+        if (!s_act && !d_act
+            && data_st == DONE && ddummy_st == DONE && scan_data_st == DONE)
             break;
 
         ++total_rounds;
@@ -616,9 +863,10 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         for (auto& r : dr.reads) reads.push_back({r.store_id, r.leaf});
         size_t d_cnt = dr.reads.size();
 
-        size_t dr_cnt = 0, dd_cnt = 0;
-        if (data_st == NEED_READ)   { reads.push_back({data_oram_.get_store_id(), data_leaf});   dr_cnt = 1; }
-        if (ddummy_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), ddummy_leaf}); dd_cnt = 1; }
+        size_t dr_cnt = 0, dd_cnt = 0, sdr_cnt = 0;
+        if (data_st == NEED_READ)      { reads.push_back({data_oram_.get_store_id(), data_leaf});      dr_cnt = 1; }
+        if (ddummy_st == NEED_READ)    { reads.push_back({data_oram_.get_store_id(), ddummy_leaf});    dd_cnt = 1; }
+        if (scan_data_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), scan_data_leaf}); sdr_cnt = 1; }
 
         auto fetched = batch_read_paths(*channel_, reads);
 
@@ -633,12 +881,14 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                      fetched.begin() + off + d_cnt});
         }
         off += d_cnt;
-        if (dr_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
-        if (dd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        if (dr_cnt)  { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        if (dd_cnt)  { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        if (sdr_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
 
         if (s_act) searcher->step_process();
         if (d_act) dummy->step_process();
 
+        // ── Main query data ORAM result processing ──
         if (dr_cnt) {
             if (data_blk != INVALID_BLOCK) {
                 Block b = data_oram_.extract_from_stash(data_blk);
@@ -659,12 +909,51 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             }
             data_st = NEED_WRITE;
             answer_round = total_rounds;
+            if (decision_pending) {
+                bool should_prom = computed_fp > 0
+                    && maint_ && maint_->swap_state() == SwapState::Idle
+                    && maint_->should_promote(computed_fp);
+                if (should_prom) {
+                    searcher->step_commit_remove();
+                    result.cold_promotion_done = true;
+                } else {
+                    searcher->step_commit_noop();
+                }
+                result.cold_decision_handled = true;
+                decision_pending = false;
+            }
         }
         if (dd_cnt) ddummy_st = NEED_WRITE;
 
-        if (!searcher_done_flag && searcher->step_done()) {
-            searcher_done_flag = true;
-            searcher_ref = searcher->step_finish();
+        // ── Scan data ORAM result processing ──
+        if (sdr_cnt) {
+            if (scan_data_blk != INVALID_BLOCK) {
+                Block sb = data_oram_.extract_from_stash(scan_data_blk);
+                if (epoch_mode && maint_) {
+                    auto [sv, sm] = decode_epoch(sb.value);
+                    bool should_demote = maint_->should_demote_cache(sm.fp);
+                    if (should_demote) {
+                        hot_omap_->piggyback_commit_remove();
+                        result.scan_demoted = true;
+                        result.scan_fp = sm.fp;
+                    } else {
+                        hot_omap_->piggyback_commit_noop();
+                    }
+                    result.scan_decision_handled = true;
+                } else {
+                    hot_omap_->piggyback_commit_noop();
+                }
+                data_oram_.add_to_stash({scan_data_blk, scan_data_new_leaf, sb.value});
+            }
+            scan_data_st = NEED_WRITE;
+        }
+
+        // ── DECISION trigger: cold searcher paused after traverse ──
+        if (!decision_triggered && !searcher_done_flag
+            && epoch_mode && !is_hot_physical
+            && searcher->step_needs_decision()) {
+            decision_triggered = true;
+            searcher_ref = searcher->step_get_traverse_result();
             data_blk = ref_to_blk(searcher_ref);
             if (data_blk != INVALID_BLOCK) {
                 data_leaf     = data_oram_.get_leaf(data_blk);
@@ -674,6 +963,42 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                 data_leaf = data_oram_.random_leaf();
             }
             data_st = NEED_READ;
+            decision_pending = true;
+        }
+
+        // ── DECISION trigger: scan piggyback paused after traverse ──
+        if (!scan_decision_triggered && scan_on_piggyback
+            && hot_omap_->piggyback_needs_decision()) {
+            scan_decision_triggered = true;
+            Bytes scan_trav_ref = hot_omap_->piggyback_get_traverse_result();
+            scan_data_blk = ref_to_blk(scan_trav_ref);
+            if (scan_data_blk != INVALID_BLOCK) {
+                scan_data_leaf     = data_oram_.get_leaf(scan_data_blk);
+                scan_data_new_leaf = data_oram_.random_leaf();
+                data_oram_.set_leaf(scan_data_blk, scan_data_new_leaf);
+            } else {
+                scan_data_leaf = data_oram_.random_leaf();
+            }
+            scan_data_st = NEED_READ;
+            scan_decision_pending = true;
+        }
+
+        if (!searcher_done_flag && searcher->step_done()) {
+            searcher_done_flag = true;
+            if (!decision_triggered) {
+                searcher_ref = searcher->step_finish();
+                data_blk = ref_to_blk(searcher_ref);
+                if (data_blk != INVALID_BLOCK) {
+                    data_leaf     = data_oram_.get_leaf(data_blk);
+                    data_new_leaf = data_oram_.random_leaf();
+                    data_oram_.set_leaf(data_blk, data_new_leaf);
+                } else {
+                    data_leaf = data_oram_.random_leaf();
+                }
+                data_st = NEED_READ;
+            } else {
+                searcher->step_finish();
+            }
         }
 
         std::vector<BatchWriteReq> writes;
@@ -699,6 +1024,11 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                               data_oram_.prepare_eviction(ddummy_leaf)});
             ddummy_st = DONE;
         }
+        if (scan_data_st == NEED_WRITE) {
+            writes.push_back({data_oram_.get_store_id(),
+                              data_oram_.prepare_eviction(scan_data_leaf)});
+            scan_data_st = DONE;
+        }
         batch_write_paths(*channel_, writes);
     }
 
@@ -706,12 +1036,34 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         searcher->step_finish();
     dummy->step_finish();
 
+    if (!is_hot_physical) result.cold_ref = searcher_ref;
+
+    // Extract piggybacked scan result
+    if (scan_on_piggyback) {
+        result.scan_ref = hot_omap_->finish_piggyback();
+    }
+
+    // Finish piggybacked inserts or dummy piggybacking
+    if (hot_insert_key != INVALID_KEY) {
+        hot_omap_->finish_piggyback();
+        result.hot_insert_done = true;
+    } else if (hot_dummy_pb && (is_hot_physical || !use_partial_dummy)) {
+        hot_omap_->finish_piggyback();
+    }
+    if (cold_insert_key != INVALID_KEY) {
+        cold_omap_->finish_piggyback();
+        result.cold_insert_done = true;
+    } else if (cold_dummy_pb && (!is_hot_physical || !use_partial_dummy)) {
+        cold_omap_->finish_piggyback();
+    }
+
     result.last_access_fp = computed_fp;
     result.hot_bw = hot_omap_->last_stats();
     result.cold_bw = cold_omap_->last_stats();
 
     int dpbw = data_oram_.path_bandwidth_bytes();
     int nops = fo ? 2 : 1;
+    if (scan_on_piggyback) nops++;
     result.total_bw.bytes_downloaded =
         result.hot_bw.bytes_downloaded + result.cold_bw.bytes_downloaded +
         static_cast<size_t>(dpbw) * nops;

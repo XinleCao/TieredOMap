@@ -53,6 +53,12 @@ public:
     Bytes step_finish(const Bytes* new_value = nullptr);
     void step_finish_dummy();
 
+    // ── Piggyback: concurrent second access sharing the same rounds ─────
+    void begin_piggyback_access(int key);
+    void begin_piggyback_dummy();
+    Bytes piggyback_finish(const Bytes* new_value = nullptr);
+    void piggyback_finish_dummy();
+
     // ── Legacy single-round interface (traverses pos_maps locally) ─────────
     struct PreparedAccess {
         int leaf1;
@@ -182,6 +188,24 @@ private:
         Bytes result;
     };
     StepState step_;
+
+    struct PBStepState {
+        bool active = false;
+        bool is_dummy = false;
+        int data_key = INVALID_KEY;
+
+        int cur_leaf1 = INVALID_LEAF;
+        int cur_leaf2 = INVALID_LEAF;
+        int cur_new_leaf = INVALID_LEAF;
+        int cur_r_key = INVALID_KEY;
+        int cur_r_new_leaf = INVALID_LEAF;
+
+        int write_leaf1 = INVALID_LEAF;
+        int write_leaf2 = INVALID_LEAF;
+
+        Bytes result;
+    };
+    PBStepState pb_step_;
 
     BandwidthStats last_bw_;
     BandwidthStats total_bw_;

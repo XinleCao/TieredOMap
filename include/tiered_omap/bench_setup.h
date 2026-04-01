@@ -24,11 +24,23 @@ Bytes setup_tiered_on_server(
     SecurityMode mode, bool use_split,
     OmapBackend hot_backend = OmapBackend::AVL, bool use_hot_backend = false);
 
+Bytes setup_index_data_on_server(
+    StorageServer::ClientState& stores,
+    OmapBackend backend, int N, int bucket_size, int value_size);
+
 // Client-side: reconstruct OMAP from the server state blob + TCP channel.
 std::unique_ptr<OmapInterface> restore_standalone(
     const uint8_t*& p, std::shared_ptr<TcpChannel> channel);
 
 std::unique_ptr<TieredOMap> restore_tiered(
+    const uint8_t*& p, std::shared_ptr<TcpChannel> channel);
+
+struct IndexDataParts {
+    std::unique_ptr<OmapInterface> index;
+    PathORAM data;
+};
+
+IndexDataParts restore_index_data(
     const uint8_t*& p, std::shared_ptr<TcpChannel> channel);
 
 }  // namespace bench_setup

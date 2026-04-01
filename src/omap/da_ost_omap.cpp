@@ -435,6 +435,12 @@ OmapInterface& DaOstOmap::ods_omap() {
                : static_cast<OmapInterface&>(bplus_ods_);
 }
 
+const OmapInterface& DaOstOmap::ods_omap() const {
+    return (tree_type_ == OdsTreeType::AVL)
+               ? static_cast<const OmapInterface&>(avl_ods_)
+               : static_cast<const OmapInterface&>(bplus_ods_);
+}
+
 PathORAM& DaOstOmap::ods_oram() {
     return (tree_type_ == OdsTreeType::AVL)
                ? avl_ods_.oram() : bplus_ods_.oram();
@@ -546,6 +552,40 @@ void DaOstOmap::step_process() {
         daoram_.step_process();
         if (daoram_.step_done()) {
             daoram_.step_finish(nullptr);
+
+            if (pb_.active && !pb_.is_dummy) {
+                daoram_.piggyback_finish(nullptr);
+                auto it = root_cache_.find(pb_.pos);
+                int pb_rk = INVALID_KEY, pb_rl = INVALID_LEAF;
+                if (it != root_cache_.end()) {
+                    pb_rk = it->second.first;
+                    pb_rl = it->second.second;
+                }
+                pb_.saved_main_root_key = root_cache_.count(ss_.pos)
+                    ? root_cache_[ss_.pos].first : INVALID_KEY;
+                pb_.saved_main_root_leaf = root_cache_.count(ss_.pos)
+                    ? root_cache_[ss_.pos].second : INVALID_LEAF;
+                if (tree_type_ == OdsTreeType::AVL) {
+                    avl_ods_.set_root(pb_rk, pb_rl);
+                    if (pb_.is_insert)
+                        avl_ods_.begin_piggyback_insert(pb_.key, pb_.insert_value);
+                    else
+                        avl_ods_.begin_piggyback_search(pb_.key);
+                } else {
+                    bplus_ods_.set_root(pb_rk, pb_rl);
+                    if (pb_.is_insert)
+                        bplus_ods_.begin_piggyback_insert(pb_.key, pb_.insert_value);
+                    else
+                        bplus_ods_.begin_piggyback_search(pb_.key);
+                }
+            } else if (pb_.active && pb_.is_dummy) {
+                daoram_.piggyback_finish_dummy();
+                if (tree_type_ == OdsTreeType::AVL)
+                    avl_ods_.begin_piggyback_dummy();
+                else
+                    bplus_ods_.begin_piggyback_dummy();
+            }
+
             if (ss_.is_partial_dummy) {
                 ss_.pad_remaining = 1;
                 ss_.phase = StepPhase::ODS_PAD;
@@ -574,7 +614,10 @@ void DaOstOmap::step_process() {
         }
     } else if (ss_.round_phase == StepPhase::ODS) {
         ods_omap().step_process();
-        if (ods_omap().step_done()) {
+        if (ods_omap().step_needs_decision()) {
+            // Inner ODS paused for decision; DaOstOmap stays in ODS phase.
+            // Caller detects via DaOstOmap::step_needs_decision().
+        } else if (ods_omap().step_done()) {
             ss_.ods_ops = (tree_type_ == OdsTreeType::AVL)
                               ? avl_ods_.last_op_count()
                               : bplus_ods_.last_op_count();
@@ -632,12 +675,22 @@ Bytes DaOstOmap::step_finish() {
     if (!ss_.is_dummy) {
         if (tree_type_ == OdsTreeType::AVL) {
             ss_.result = avl_ods_.step_finish();
-            auto [nrk, nrl] = avl_ods_.get_root();
-            root_cache_[ss_.pos] = {nrk, nrl};
+            if (pb_.active) {
+                root_cache_[ss_.pos] = {pb_.saved_main_root_key,
+                                        pb_.saved_main_root_leaf};
+            } else {
+                auto [nrk, nrl] = avl_ods_.get_root();
+                root_cache_[ss_.pos] = {nrk, nrl};
+            }
         } else {
             ss_.result = bplus_ods_.step_finish();
-            auto [nrk, nrl] = bplus_ods_.get_root();
-            root_cache_[ss_.pos] = {nrk, nrl};
+            if (pb_.active) {
+                root_cache_[ss_.pos] = {pb_.saved_main_root_key,
+                                        pb_.saved_main_root_leaf};
+            } else {
+                auto [nrk, nrl] = bplus_ods_.get_root();
+                root_cache_[ss_.pos] = {nrk, nrl};
+            }
         }
     } else {
         ods_omap().step_finish();
@@ -645,6 +698,77 @@ Bytes DaOstOmap::step_finish() {
 
     finalize_bw(ss_.ods_ops);
     return ss_.result;
+}
+
+// ─── Mid-access decision interface ─────────────────────────────────────────
+
+void DaOstOmap::set_step_decision_enabled(bool enable) {
+    ods_omap().set_step_decision_enabled(enable);
+}
+
+bool DaOstOmap::step_needs_decision() const {
+    return ss_.phase == StepPhase::ODS && ods_omap().step_needs_decision();
+}
+
+Bytes DaOstOmap::step_get_traverse_result() {
+    return ods_omap().step_get_traverse_result();
+}
+
+void DaOstOmap::step_commit_remove() {
+    ods_omap().step_commit_remove();
+}
+
+void DaOstOmap::step_commit_noop() {
+    ods_omap().step_commit_noop();
+}
+
+// ─── Piggyback interface ───────────────────────────────────────────────────
+
+void DaOstOmap::begin_piggyback_insert(int key, const Bytes& value) {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.is_insert = true;
+    pb_.key = key;
+    pb_.insert_value = value;
+    pb_.pos = hash_to_position(key);
+    daoram_.begin_piggyback_access(pb_.pos);
+}
+
+void DaOstOmap::begin_piggyback_search(int key) {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.key = key;
+    pb_.pos = hash_to_position(key);
+    daoram_.begin_piggyback_access(pb_.pos);
+}
+
+void DaOstOmap::begin_piggyback_dummy() {
+    pb_ = PBState{};
+    pb_.active = true;
+    pb_.is_dummy = true;
+    daoram_.begin_piggyback_dummy();
+}
+
+Bytes DaOstOmap::finish_piggyback() {
+    if (!pb_.active) return {};
+
+    if (!pb_.is_dummy) {
+        Bytes pb_result;
+        if (tree_type_ == OdsTreeType::AVL) {
+            pb_result = avl_ods_.finish_piggyback();
+            auto [nrk, nrl] = avl_ods_.get_root();
+            root_cache_[pb_.pos] = {nrk, nrl};
+        } else {
+            pb_result = bplus_ods_.finish_piggyback();
+            auto [nrk, nrl] = bplus_ods_.get_root();
+            root_cache_[pb_.pos] = {nrk, nrl};
+        }
+        pb_.result = std::move(pb_result);
+    }
+
+    Bytes result = std::move(pb_.result);
+    pb_.active = false;
+    return result;
 }
 
 // ─── State export / import ─────────────────────────────────────────────────

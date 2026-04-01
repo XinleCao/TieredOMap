@@ -55,6 +55,8 @@ public:
     bool is_open() const { return fd_ >= 0; }
     int fd() const { return fd_; }
 
+    void set_recv_timeout(int seconds);
+
 private:
     void send_raw(const uint8_t* data, size_t len);
     bool recv_raw(uint8_t* buf, size_t len);

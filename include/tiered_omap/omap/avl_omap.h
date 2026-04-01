@@ -62,12 +62,29 @@ public:
     bool supports_interleaved() const override { return true; }
     void begin_step_search(int key, const Bytes* update = nullptr) override;
     void begin_step_dummy() override;
+    void begin_step_partial_dummy() override;
     OramStepRound step_next_round() override;
     void step_apply_reads(const std::vector<PathData>& results) override;
     void step_process() override;
     std::vector<StepWriteReq> step_prepare_writes() override;
     bool step_done() const override;
     Bytes step_finish() override;
+
+    // ── Piggyback interface (concurrent second operation) ──
+    void begin_piggyback_search(int key) override;
+    void begin_piggyback_insert(int key, const Bytes& value) override;
+    void begin_piggyback_dummy() override;
+    Bytes finish_piggyback() override;
+    bool piggyback_needs_decision() const override;
+    Bytes piggyback_get_traverse_result() override;
+    void piggyback_commit_remove() override;
+    void piggyback_commit_noop() override;
+
+    // Non-step piggyback: two sequential operations sharing 6h budget
+    Bytes search_piggyback(int key, const Bytes* update,
+                           int extra_key, char extra_op,
+                           const Bytes* extra_value,
+                           Bytes* extra_result) override;
 
     // ODS mode: used as inner tree by DaOstOmap.
     void set_ods_mode(int tree_height_bound) {
@@ -123,9 +140,33 @@ private:
         int dummy_split_boundary = 0;
         PathORAM* cur_round_oram = nullptr;
         int cur_round_leaf = INVALID_LEAF;
+        bool round_read = false;
         Bytes result;
     };
     StepState ss_;
+
+    struct PBState {
+        bool active = false;
+        StepPhase phase = StepPhase::DONE;
+        int key = INVALID_KEY;
+        int cur_key = INVALID_KEY;
+        int cur_leaf = INVALID_LEAF;
+        int depth = 0;
+        int ops = 0;
+        int budget = 0;
+        int pad_remaining = 0;
+        int dummy_step = 0;
+        int dummy_split_boundary = 0;
+        PathORAM* cur_round_oram = nullptr;
+        int cur_round_leaf = INVALID_LEAF;
+        bool round_read = false;
+        Bytes result;
+        bool node_in_local = false;
+        bool traverse_done = false;
+        bool is_insert = false;
+        Bytes insert_value;
+    };
+    PBState pb_;
 
     int capacity_ = 0;
     int max_height_ = 0;

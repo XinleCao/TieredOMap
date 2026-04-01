@@ -222,6 +222,9 @@ void StorageServer::dispatch(ClientState& state, MsgType type,
             int init_n = (data_count > 0) ? data_count : N;
             result = bench_setup::setup_standalone_on_server(
                 state, backend, N, bucket_size, value_size, init_n);
+        } else if (mode == 2) {
+            result = bench_setup::setup_index_data_on_server(
+                state, backend, N, bucket_size, value_size);
         } else {
             result = bench_setup::setup_tiered_on_server(
                 state, backend, N, n, bucket_size, value_size,

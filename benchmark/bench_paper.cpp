@@ -81,7 +81,7 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--min_logN") c.min_logN = std::stoi(v);
         else if (k == "--outdir") c.outdir = v;
         else if (k == "--value_size") c.value_size = std::stoi(v);
-        else if (k == "--host") c.host = v;
+        else if (k == "--host" || k == "--server") c.host = v;
         else if (k == "--port") c.port = std::stoi(v);
         else if (k == "--backend") c.backend_filter = v;
     }
@@ -89,6 +89,7 @@ Cfg parse_args(int argc, char** argv) {
     if (!c.host.empty()) {
         c.channel = std::make_shared<TcpChannel>(
             TcpChannel::connect(c.host, c.port));
+        c.channel->set_recv_timeout(300);
         c.storage_creator = make_network_creator(c.channel);
         std::cout << "Connected to ORAM server at "
                   << c.host << ":" << c.port << "\n";
@@ -211,6 +212,28 @@ struct IndexDataOmap {
 static IndexDataOmap setup_fair_baseline(const Cfg& cfg, OmapBackend be,
                                          int N, int vs = 0) {
     int value_size = vs > 0 ? vs : cfg.value_size;
+    if (cfg.channel) {
+        Bytes payload;
+        ser_int(payload, 2);
+        ser_int(payload, static_cast<int>(be));
+        ser_int(payload, N);
+        ser_int(payload, 0);
+        ser_int(payload, 4);
+        ser_int(payload, value_size);
+        ser_int(payload, 0);
+        ser_int(payload, 0);
+        cfg.channel->send_msg(MsgType::SETUP_BENCH, payload);
+        MsgType resp_type; Bytes resp;
+        cfg.channel->recv_msg(resp_type, resp);
+        if (resp_type != MsgType::OK)
+            throw std::runtime_error("SETUP_BENCH index_data failed");
+        const uint8_t* p = resp.data();
+        auto parts = bench_setup::restore_index_data(p, cfg.channel);
+        IndexDataOmap ido;
+        ido.index = std::move(parts.index);
+        ido.data = std::move(parts.data);
+        return ido;
+    }
     IndexDataOmap ido;
     ido.init_local(be, N, value_size, cfg.storage_creator);
     return ido;
@@ -1612,97 +1635,85 @@ static void exp_paper_wan(const Cfg& cfg) {
                 continue;
             int Q = cfg.Q;
 
-            // ── (A) Standalone baseline ──
+            // ── (A) Fair baseline (index OMAP + data ORAM) ──
             double bl_bw = 0, bl_rnd = 0, bl_ms = 0;
+            bool da_hot = (be == OmapBackend::DaBplus);
             {
                 g_progress.config("logN=" + std::to_string(logN) + " " + label + " base");
-                auto omap = setup_standalone(cfg, be, N);
-                ZipfSampler z(N, cfg.s, 42);
-                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
-                for (int i = 0; i < Q; ++i) {
-                    auto t0 = Clock::now();
-                    omap->search(z.sample());
-                    bl_ms += std::chrono::duration<double, std::milli>(
-                        Clock::now() - t0).count();
-                    bl_bw += omap->last_stats().total_bytes();
-                    bl_rnd += omap->last_stats().rounds;
-                    g_progress.query_tick(i, Q);
-                }
-                bl_bw /= Q; bl_rnd /= Q; bl_ms /= Q;
+                auto ido = setup_fair_baseline(cfg, be, N);
+                ido.search(0);
+                auto t0 = Clock::now();
+                ido.search(0);
+                bl_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - t0).count();
+                bl_bw = ido.total_bytes();
+                bl_rnd = ido.rounds();
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(0) << bl_bw/1024 << "KB "
                    << (int)bl_rnd << "rnd " << std::setprecision(0) << bl_ms << "ms";
                 g_progress.config_done(ss.str());
             }
 
-            // ── (B) TieredOMAP TM mode — hot/cold separated ──
+            // ── (B) TieredOMAP TM mode — 1 hot + 1 cold ──
             double hot_bw = 0, cold_bw = 0;
             double hot_rnd = 0, cold_rnd = 0;
             double hot_ms = 0, cold_ms = 0;
-            int hot_cnt = 0, cold_cnt = 0;
-            bool da_hot = (be == OmapBackend::DaBplus);
             {
                 g_progress.config("logN=" + std::to_string(logN) + " " + label + " TM");
                 auto tm = setup_tiered(cfg, be, N, n,
                                        SecurityMode::TierMembership, true,
                                        0, OmapBackend::BPlus, da_hot);
-                ZipfSampler z(N, cfg.s, 42);
-                for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
-                for (int i = 0; i < Q; ++i) {
+                tm->access(0); tm->access(N - 1);
+
+                {
                     auto t0 = Clock::now();
-                    auto r = tm->access(z.sample());
+                    auto r = tm->access(0);
                     double elapsed = std::chrono::duration<double, std::milli>(
                         Clock::now() - t0).count();
                     double ans_frac = (r.total_bw.rounds > 0)
                         ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
-                    if (r.found_in_hot) {
-                        hot_bw += r.total_bw.total_bytes();
-                        hot_rnd += r.rounds_to_answer;
-                        hot_ms += elapsed * ans_frac;
-                        ++hot_cnt;
-                    } else {
-                        cold_bw += r.total_bw.total_bytes();
-                        cold_rnd += r.total_bw.rounds;
-                        cold_ms += elapsed;
-                        ++cold_cnt;
-                    }
-                    g_progress.query_tick(i, Q);
+                    hot_bw = r.total_bw.total_bytes();
+                    hot_rnd = r.rounds_to_answer;
+                    hot_ms = elapsed * ans_frac;
                 }
-                if (hot_cnt > 0) { hot_bw /= hot_cnt; hot_rnd /= hot_cnt; hot_ms /= hot_cnt; }
-                if (cold_cnt > 0) { cold_bw /= cold_cnt; cold_rnd /= cold_cnt; cold_ms /= cold_cnt; }
-                double hit = 100.0 * hot_cnt / Q;
+                {
+                    auto t0 = Clock::now();
+                    auto r = tm->access(N - 1);
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    cold_bw = r.total_bw.total_bytes();
+                    cold_rnd = r.total_bw.rounds;
+                    cold_ms = elapsed;
+                }
                 std::ostringstream ss;
-                ss << "hit=" << std::fixed << std::setprecision(0) << hit << "% "
-                   << "hot:" << (int)(hot_bw/1024) << "KB/" << (int)hot_rnd << "rnd/"
-                   << std::setprecision(0) << hot_ms << "ms  "
+                ss << "hot:" << (int)(hot_bw/1024) << "KB/" << (int)hot_rnd << "rnd/"
+                   << std::fixed << std::setprecision(0) << hot_ms << "ms  "
                    << "cold:" << (int)(cold_bw/1024) << "KB/" << (int)cold_rnd << "rnd/"
                    << std::setprecision(0) << cold_ms << "ms";
                 g_progress.config_done(ss.str());
             }
 
-            // ── (C) TieredOMAP FO mode — bandwidth only ──
+            // ── (C) TieredOMAP FO mode — 1 query ──
             double fo_bw = 0;
             {
                 g_progress.config("logN=" + std::to_string(logN) + " " + label + " FO");
                 auto fo = setup_tiered(cfg, be, N, n,
                                        SecurityMode::FullOblivious, true,
                                        0, OmapBackend::BPlus, da_hot);
-                ZipfSampler z(N, cfg.s, 42);
-                for (int i = 0; i < cfg.warmup; ++i) fo->access(z.sample());
-                for (int i = 0; i < Q; ++i) {
-                    auto r = fo->access(z.sample());
-                    fo_bw += r.total_bw.total_bytes();
-                    g_progress.query_tick(i, Q);
-                }
-                fo_bw /= Q;
+                fo->access(0);
+                auto r = fo->access(0);
+                fo_bw = r.total_bw.total_bytes();
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(0) << fo_bw/1024 << "KB";
                 g_progress.config_done(ss.str());
             }
 
             // ── Write CSV row ──
-            double hit_pct = (hot_cnt + cold_cnt > 0)
-                ? 100.0 * hot_cnt / (hot_cnt + cold_cnt) : 0;
+            ZipfSampler z_hit(N, cfg.s, 42);
+            int hit_count = 0;
+            for (int i = 0; i < 10000; ++i)
+                if (z_hit.sample() < n) ++hit_count;
+            double hit_pct = 100.0 * hit_count / 10000;
             double mean_bw = hit_pct/100 * hot_bw + (1 - hit_pct/100) * cold_bw;
             double mean_rnd = hit_pct/100 * hot_rnd + (1 - hit_pct/100) * cold_rnd;
             double mean_ms = hit_pct/100 * hot_ms + (1 - hit_pct/100) * cold_ms;
@@ -1871,20 +1882,14 @@ static void exp_profile(const Cfg& cfg) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 static void exp_dynamic_overhead(const Cfg& cfg) {
-    std::cout << "\n=== Exp: Dynamic Maintenance Overhead (worst-case) ===\n";
+    std::cout << "\n=== Exp: Dynamic Maintenance Overhead (worst-case, pb ON vs OFF) ===\n";
     ensure_dir(cfg.outdir);
 
     int logN = cfg.max_logN;
     int N = 1 << logN;
     int n = cfg.n;
     int B_swap = 8;
-    OmapBackend be = OmapBackend::AVL;
-
-    MaintenanceConfig mc;
-    mc.enabled = true;
-    mc.observation_window = B_swap;
-    mc.swap_interval = B_swap;
-    mc.cache_size = 8;
+    OmapBackend be = OmapBackend::BPlus;
 
     std::ofstream csv(cfg.outdir + "/dynamic_overhead.csv");
     csv << "mode,query_type,config,bw_KB,ans_rounds,total_rounds,ans_ms,total_ms\n";
@@ -1900,135 +1905,449 @@ static void exp_dynamic_overhead(const Cfg& cfg) {
 
     struct Sample { double bw, ans, rnd, ams, tms; int cnt; };
 
+    auto measure_static = [&](const Cfg& c, SecurityMode m,
+                              Sample& out_hot, Sample& out_cold) {
+        g_progress.config("static setup");
+        auto tm = setup_tiered(c, be, N, n, m, true,
+                               0, OmapBackend::BPlus, true);
+        g_progress.config_done("ok");
+
+        g_progress.config("static warmup");
+        ZipfSampler z(N, c.s, 42);
+        for (int i = 0; i < warmup_q; ++i) tm->access(z.sample());
+        g_progress.config_done("done");
+
+        for (bool is_hot : {true, false}) {
+            auto& hk = tm->hot_keys();
+            int target = -1;
+            if (is_hot) {
+                target = *hk.begin();
+            } else {
+                for (int k = N - 1; k >= 0; --k)
+                    if (!hk.count(k)) { target = k; break; }
+            }
+            Sample& out = is_hot ? out_hot : out_cold;
+            g_progress.config(std::string("static ") + (is_hot ? "hot" : "cold"));
+            for (int i = 0; i < measure_cycles * 2; ++i) {
+                auto t0 = Clock::now();
+                auto r = tm->access(target);
+                double elapsed = std::chrono::duration<double, std::milli>(
+                    Clock::now() - t0).count();
+                double frac = r.total_bw.rounds > 0
+                    ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                out.bw += r.total_bw.total_bytes();
+                out.ans += r.rounds_to_answer;
+                out.rnd += r.total_bw.rounds;
+                out.ams += elapsed * frac;
+                out.tms += elapsed;
+                ++out.cnt;
+            }
+            std::ostringstream ss;
+            ss << "rnd=" << std::fixed << std::setprecision(1) << out.rnd/out.cnt;
+            g_progress.config_done(ss.str());
+        }
+    };
+
+    auto measure_dynamic = [&](const Cfg& c, SecurityMode m, bool pb,
+                               Sample& out_hot, Sample& out_cold) {
+        MaintenanceConfig mc;
+        mc.enabled = true;
+        mc.observation_window = B_swap;
+        mc.swap_interval = B_swap;
+        mc.cache_size = std::min(std::max(n / 2, 4), 8);
+        mc.piggyback = pb;
+
+        const char* tag = pb ? "dyn-pb-ON" : "dyn-pb-OFF";
+        g_progress.config(std::string(tag) + " setup");
+        auto tm = setup_tiered(c, be, N, n, m, true,
+                               0, OmapBackend::BPlus, true, mc);
+        g_progress.config_done("ok");
+
+        g_progress.config(std::string(tag) + " warmup");
+        ZipfSampler z(N, c.s, 42);
+        int warmup_err = 0;
+        for (int i = 0; i < warmup_q; ++i) {
+            try { tm->access(z.sample()); }
+            catch (const std::exception& e) { ++warmup_err; }
+        }
+        g_progress.config_done("done (err=" + std::to_string(warmup_err) + ")");
+
+        for (bool is_hot : {true, false}) {
+            auto& hk = tm->hot_keys();
+            int target = -1;
+            if (is_hot) {
+                target = *hk.begin();
+            } else {
+                for (int k = N - 1; k >= 0; --k)
+                    if (!hk.count(k)) { target = k; break; }
+            }
+            Sample& out = is_hot ? out_hot : out_cold;
+            g_progress.config(std::string(tag) + " " + (is_hot ? "hot" : "cold")
+                              + " boundary");
+            ZipfSampler z_fill(N, c.s, 99);
+            int meas_err = 0;
+            for (int cycle = 0; cycle < measure_cycles; ++cycle) {
+                for (int j = 0; j < B_swap - 1; ++j) {
+                    try { tm->access(z_fill.sample()); }
+                    catch (const std::exception&) { ++meas_err; }
+                }
+                if (cycle == 0) tm->set_debug_access(true);
+                try {
+                    auto t0 = Clock::now();
+                    auto r = tm->access(target);
+                    if (cycle == 0) tm->set_debug_access(false);
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    double frac = r.total_bw.rounds > 0
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    out.bw += r.total_bw.total_bytes();
+                    out.ans += r.rounds_to_answer;
+                    out.rnd += r.total_bw.rounds;
+                    out.ams += elapsed * frac;
+                    out.tms += elapsed;
+                    ++out.cnt;
+                } catch (const std::exception&) {
+                    if (cycle == 0) tm->set_debug_access(false);
+                    ++meas_err;
+                }
+            }
+            std::ostringstream ss;
+            ss << "rnd=" << std::fixed << std::setprecision(1)
+               << (out.cnt > 0 ? out.rnd/out.cnt : 0);
+            if (meas_err) ss << " err=" << meas_err;
+            g_progress.config_done(ss.str());
+        }
+    };
+
     for (auto& ms : modes) {
         const char* ml = ms.label;
         SecurityMode m = ms.mode;
+        std::cout << "\n── " << ml << " mode (N=2^" << logN << ", n=" << n
+                  << ", BPlus+Split+HotBPlus) ──\n";
 
-        std::unordered_set<int> hot_snapshot;
-        Sample static_hot{}, static_cold{}, dyn_hot{}, dyn_cold{};
+        Sample s_hot{}, s_cold{};
+        Sample pb_on_hot{}, pb_on_cold{};
+        Sample pb_off_hot{}, pb_off_cold{};
 
-        // Phase 1: static measurement (one SETUP_BENCH)
-        {
-            g_progress.config(std::string(ml) + " static setup N=2^" + std::to_string(logN));
-            auto tm_s = setup_tiered(cfg, be, N, n, m, true);
-            g_progress.config_done("ok");
-
-            g_progress.config(std::string(ml) + " static warmup");
-            ZipfSampler z(N, cfg.s, 42);
-            for (int i = 0; i < warmup_q; ++i) tm_s->access(z.sample());
-            hot_snapshot = tm_s->hot_keys();
-            g_progress.config_done("done");
-
-            for (const char* qtype : {"hot", "cold"}) {
-                bool is_hot = (std::string(qtype) == "hot");
-                auto& hk = tm_s->hot_keys();
-                int target = -1;
-                if (is_hot) {
-                    target = *hk.begin();
-                } else {
-                    for (int k = N - 1; k >= 0; --k)
-                        if (!hk.count(k)) { target = k; break; }
-                }
-                Sample& out = is_hot ? static_hot : static_cold;
-                int runs = measure_cycles * 2;
-                g_progress.config(std::string(ml) + " static " + qtype);
-                for (int i = 0; i < runs; ++i) {
-                    auto t0 = Clock::now();
-                    auto r = tm_s->access(target);
-                    double elapsed = std::chrono::duration<double, std::milli>(
-                        Clock::now() - t0).count();
-                    double frac = r.total_bw.rounds > 0
-                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
-                    out.bw += r.total_bw.total_bytes();
-                    out.ans += r.rounds_to_answer;
-                    out.rnd += r.total_bw.rounds;
-                    out.ams += elapsed * frac;
-                    out.tms += elapsed;
-                    ++out.cnt;
-                }
-                std::ostringstream ss;
-                ss << "rnd=" << std::fixed << std::setprecision(1) << out.rnd/out.cnt;
-                g_progress.config_done(ss.str());
-            }
-        }
-
-        // Phase 2: dynamic measurement (separate SETUP_BENCH)
-        {
-            g_progress.config(std::string(ml) + " dynamic setup");
-            auto tm_d = setup_tiered(cfg, be, N, n, m, true,
-                                     0, OmapBackend::AVL, false, mc);
-            g_progress.config_done("ok");
-
-            g_progress.config(std::string(ml) + " dynamic warmup");
-            ZipfSampler z(N, cfg.s, 42);
-            for (int i = 0; i < warmup_q; ++i) tm_d->access(z.sample());
-            g_progress.config_done("done");
-
-            for (const char* qtype : {"hot", "cold"}) {
-                bool is_hot = (std::string(qtype) == "hot");
-                auto& hk = tm_d->hot_keys();
-                int target = -1;
-                if (is_hot) {
-                    target = *hk.begin();
-                } else {
-                    for (int k = N - 1; k >= 0; --k)
-                        if (!hk.count(k)) { target = k; break; }
-                }
-                Sample& out = is_hot ? dyn_hot : dyn_cold;
-                g_progress.config(std::string(ml) + " dynamic " + qtype + " boundary");
-                ZipfSampler z_fill(N, cfg.s, 99);
-                for (int cycle = 0; cycle < measure_cycles; ++cycle) {
-                    for (int j = 0; j < B_swap - 1; ++j)
-                        tm_d->access(z_fill.sample());
-                    auto t0 = Clock::now();
-                    auto r = tm_d->access(target);
-                    double elapsed = std::chrono::duration<double, std::milli>(
-                        Clock::now() - t0).count();
-                    double frac = r.total_bw.rounds > 0
-                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
-                    out.bw += r.total_bw.total_bytes();
-                    out.ans += r.rounds_to_answer;
-                    out.rnd += r.total_bw.rounds;
-                    out.ams += elapsed * frac;
-                    out.tms += elapsed;
-                    ++out.cnt;
-                }
-                std::ostringstream ss;
-                ss << "rnd=" << std::fixed << std::setprecision(1) << out.rnd/out.cnt;
-                g_progress.config_done(ss.str());
-            }
-        }
+        measure_static(cfg, m, s_hot, s_cold);
+        measure_dynamic(cfg, m, true, pb_on_hot, pb_on_cold);
+        measure_dynamic(cfg, m, false, pb_off_hot, pb_off_cold);
 
         auto write_row = [&](const char* mode_l, const char* qt, const char* conf,
                              const Sample& s) {
+            double c = std::max(s.cnt, 1);
             csv << mode_l << "," << qt << "," << conf << ","
-                << std::fixed << std::setprecision(2) << s.bw / s.cnt / 1024 << ","
-                << std::setprecision(1) << s.ans / s.cnt << ","
-                << s.rnd / s.cnt << ","
-                << std::setprecision(1) << s.ams / s.cnt << ","
-                << s.tms / s.cnt << "\n";
+                << std::fixed << std::setprecision(2) << s.bw / c / 1024 << ","
+                << std::setprecision(1) << s.ans / c << ","
+                << s.rnd / c << ","
+                << std::setprecision(1) << s.ams / c << ","
+                << s.tms / c << "\n";
         };
 
-        write_row(ml, "hot", "static", static_hot);
-        write_row(ml, "hot", "dynamic_boundary", dyn_hot);
-        write_row(ml, "cold", "static", static_cold);
-        write_row(ml, "cold", "dynamic_boundary", dyn_cold);
+        write_row(ml, "hot", "static", s_hot);
+        write_row(ml, "hot", "dyn_pb_on", pb_on_hot);
+        write_row(ml, "hot", "dyn_pb_off", pb_off_hot);
+        write_row(ml, "cold", "static", s_cold);
+        write_row(ml, "cold", "dyn_pb_on", pb_on_cold);
+        write_row(ml, "cold", "dyn_pb_off", pb_off_cold);
         csv.flush();
 
-        auto pct = [](double a, double b) { return (a - b) / b * 100; };
-        std::cout << "  " << ml << " hot rnd overhead: "
-                  << std::fixed << std::setprecision(1)
-                  << pct(dyn_hot.rnd/dyn_hot.cnt, static_hot.rnd/static_hot.cnt)
-                  << "% (" << dyn_hot.rnd/dyn_hot.cnt << " vs "
-                  << static_hot.rnd/static_hot.cnt << ")\n";
-        std::cout << "  " << ml << " cold rnd overhead: "
-                  << pct(dyn_cold.rnd/dyn_cold.cnt, static_cold.rnd/static_cold.cnt)
-                  << "% (" << dyn_cold.rnd/dyn_cold.cnt << " vs "
-                  << static_cold.rnd/static_cold.cnt << ")\n";
+        auto avg = [](const Sample& s, auto fn) {
+            return s.cnt > 0 ? fn(s) / s.cnt : 0.0;
+        };
+        auto pct = [](double a, double b) {
+            return b > 0 ? (a - b) / b * 100 : 0.0;
+        };
+
+        printf("\n  %-22s │ %8s │ %6s │ %6s │ %8s │ %8s\n",
+               "", "BW(KB)", "Rounds", "RTA", "BW OH", "Rnd OH");
+        printf("  ──────────────────────┼──────────┼────────┼────────┼──────────┼──────────\n");
+
+        double sh_bw  = avg(s_hot, [](auto& s){ return s.bw / 1024.0; });
+        double sh_rnd = avg(s_hot, [](auto& s){ return s.rnd; });
+        double sh_rta = avg(s_hot, [](auto& s){ return s.ans; });
+        printf("  %-22s │ %8.1f │ %6.0f │ %6.0f │    ---   │    ---\n",
+               "Static Hot", sh_bw, sh_rnd, sh_rta);
+
+        double ph_bw  = avg(pb_off_hot, [](auto& s){ return s.bw / 1024.0; });
+        double ph_rnd = avg(pb_off_hot, [](auto& s){ return s.rnd; });
+        double ph_rta = avg(pb_off_hot, [](auto& s){ return s.ans; });
+        printf("  %-22s │ %8.1f │ %6.0f │ %6.0f │ %+7.1f%% │ %+6.0f\n",
+               "Dynamic Hot (pb OFF)", ph_bw, ph_rnd, ph_rta,
+               pct(ph_bw, sh_bw), ph_rnd - sh_rnd);
+
+        double oh_bw  = avg(pb_on_hot, [](auto& s){ return s.bw / 1024.0; });
+        double oh_rnd = avg(pb_on_hot, [](auto& s){ return s.rnd; });
+        double oh_rta = avg(pb_on_hot, [](auto& s){ return s.ans; });
+        printf("  %-22s │ %8.1f │ %6.0f │ %6.0f │ %+7.1f%% │ %+6.0f\n",
+               "Dynamic Hot (pb ON)", oh_bw, oh_rnd, oh_rta,
+               pct(oh_bw, sh_bw), oh_rnd - sh_rnd);
+
+        printf("  ──────────────────────┼──────────┼────────┼────────┼──────────┼──────────\n");
+
+        double sc_bw  = avg(s_cold, [](auto& s){ return s.bw / 1024.0; });
+        double sc_rnd = avg(s_cold, [](auto& s){ return s.rnd; });
+        double sc_rta = avg(s_cold, [](auto& s){ return s.ans; });
+        printf("  %-22s │ %8.1f │ %6.0f │ %6.0f │    ---   │    ---\n",
+               "Static Cold", sc_bw, sc_rnd, sc_rta);
+
+        double pc_bw  = avg(pb_off_cold, [](auto& s){ return s.bw / 1024.0; });
+        double pc_rnd = avg(pb_off_cold, [](auto& s){ return s.rnd; });
+        double pc_rta = avg(pb_off_cold, [](auto& s){ return s.ans; });
+        printf("  %-22s │ %8.1f │ %6.0f │ %6.0f │ %+7.1f%% │ %+6.0f\n",
+               "Dynamic Cold (pb OFF)", pc_bw, pc_rnd, pc_rta,
+               pct(pc_bw, sc_bw), pc_rnd - sc_rnd);
+
+        double oc_bw  = avg(pb_on_cold, [](auto& s){ return s.bw / 1024.0; });
+        double oc_rnd = avg(pb_on_cold, [](auto& s){ return s.rnd; });
+        double oc_rta = avg(pb_on_cold, [](auto& s){ return s.ans; });
+        printf("  %-22s │ %8.1f │ %6.0f │ %6.0f │ %+7.1f%% │ %+6.0f\n",
+               "Dynamic Cold (pb ON)", oc_bw, oc_rnd, oc_rta,
+               pct(oc_bw, sc_bw), oc_rnd - sc_rnd);
+        printf("\n");
+
+        double ms_off = avg(pb_off_hot, [](auto& s){ return s.tms; });
+        double ms_on  = avg(pb_on_hot,  [](auto& s){ return s.tms; });
+        double ms_s   = avg(s_hot, [](auto& s){ return s.tms; });
+        printf("  Hot latency:  static=%.1fms  pb-OFF=%.1fms  pb-ON=%.1fms\n",
+               ms_s, ms_off, ms_on);
+        ms_off = avg(pb_off_cold, [](auto& s){ return s.tms; });
+        ms_on  = avg(pb_on_cold,  [](auto& s){ return s.tms; });
+        ms_s   = avg(s_cold, [](auto& s){ return s.tms; });
+        printf("  Cold latency: static=%.1fms  pb-OFF=%.1fms  pb-ON=%.1fms\n",
+               ms_s, ms_off, ms_on);
     }
 
     csv.close();
-    std::cout << "  -> " << cfg.outdir << "/dynamic_overhead.csv\n";
+    std::cout << "\n  -> " << cfg.outdir << "/dynamic_overhead.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exp: Dynamic Overhead Table-1 — per-maintenance-op overhead on WAN
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_dyn_overhead_table1(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Dynamic Overhead (Table-1 configs, per maint-op) ===\n";
+    ensure_dir(cfg.outdir);
+
+    std::ofstream csv(cfg.outdir + "/dyn_oh_table1.csv");
+    csv << "backend,logN,mode,query,maint_op,"
+        << "rta,total_rnd,bw_KB,ans_ms,total_ms,"
+        << "oh_rta,oh_total,oh_bw_KB\n";
+
+    static const BackendSpec BACKENDS[] = {
+        {"AVL",     OmapBackend::AVL},
+        {"BPlus",   OmapBackend::BPlus},
+        {"DaBplus", OmapBackend::DaBplus},
+    };
+
+    struct ModeSpec { const char* label; SecurityMode mode; };
+    static const ModeSpec MODES[] = {
+        {"TM", SecurityMode::TierMembership},
+        {"FO", SecurityMode::FullOblivious},
+    };
+
+    int start = cfg.min_logN > 0 ? cfg.min_logN : 16;
+    std::vector<int> logNs;
+    for (int l = start; l <= cfg.max_logN; l += 2) logNs.push_back(l);
+    if (logNs.empty()) logNs.push_back(start);
+
+    const int B_swap = 9;
+    const int warmup_q = 64;
+    const char* maint_names[] = {"scan", "hot_ins", "cold_ins"};
+    int maint_phases[] = {0, B_swap / 3, 2 * B_swap / 3};
+
+    for (int logN : logNs) {
+        int N = 1 << logN;
+        int n = std::min(cfg.n, N / 2);
+
+        for (auto& [be_label, be] : BACKENDS) {
+            if (!cfg.backend_filter.empty() && cfg.backend_filter != be_label)
+                continue;
+            bool da_hot = (be == OmapBackend::DaBplus);
+
+            for (auto& [mode_label, mode] : MODES) {
+                std::string prefix = std::string(be_label) + " logN="
+                    + std::to_string(logN) + " " + mode_label;
+
+                // ── Static baseline ──
+                double s_hot_rta = 0, s_hot_total = 0, s_hot_bw = 0;
+                double s_hot_ams = 0, s_hot_tms = 0;
+                double s_cold_rta = 0, s_cold_total = 0, s_cold_bw = 0;
+                double s_cold_ams = 0, s_cold_tms = 0;
+                {
+                    g_progress.config(prefix + " static");
+                    auto tm = setup_tiered(cfg, be, N, n, mode, true,
+                                           0, OmapBackend::BPlus, da_hot);
+                    tm->access(0); tm->access(N - 1);
+
+                    auto t0 = Clock::now();
+                    auto r = tm->access(0);
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    double frac = r.total_bw.rounds > 0
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    s_hot_rta = r.rounds_to_answer;
+                    s_hot_total = r.total_bw.rounds;
+                    s_hot_bw = r.total_bw.total_bytes();
+                    s_hot_ams = elapsed * frac;
+                    s_hot_tms = elapsed;
+
+                    t0 = Clock::now();
+                    r = tm->access(N - 1);
+                    elapsed = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    frac = r.total_bw.rounds > 0
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    s_cold_rta = r.rounds_to_answer;
+                    s_cold_total = r.total_bw.rounds;
+                    s_cold_bw = r.total_bw.total_bytes();
+                    s_cold_ams = elapsed * frac;
+                    s_cold_tms = elapsed;
+
+                    std::ostringstream ss;
+                    ss << "hot:" << (int)s_hot_rta << "/" << (int)s_hot_total
+                       << "rnd  cold:" << (int)s_cold_rta << "/" << (int)s_cold_total << "rnd";
+                    g_progress.config_done(ss.str());
+
+                    csv << be_label << "," << logN << "," << mode_label
+                        << ",hot,static," << (int)s_hot_rta << "," << (int)s_hot_total
+                        << "," << std::fixed << std::setprecision(1) << s_hot_bw/1024
+                        << "," << s_hot_ams << "," << s_hot_tms
+                        << ",0,0,0\n";
+                    csv << be_label << "," << logN << "," << mode_label
+                        << ",cold,static," << (int)s_cold_rta << "," << (int)s_cold_total
+                        << "," << std::fixed << std::setprecision(1) << s_cold_bw/1024
+                        << "," << s_cold_ams << "," << s_cold_tms
+                        << ",0,0,0\n";
+                }
+
+                // ── Dynamic: for each maintenance op ──
+                for (int mi = 0; mi < 3; ++mi) {
+                    const char* mop = maint_names[mi];
+                    int target_phase = maint_phases[mi];
+
+                    g_progress.config(prefix + " " + mop);
+
+                    MaintenanceConfig mc;
+                    mc.enabled = true;
+                    mc.observation_window = B_swap;
+                    mc.swap_interval = B_swap;
+                    mc.cache_size = std::min(std::max(n / 2, 4), 8);
+                    mc.piggyback = true;
+
+                    std::unique_ptr<TieredOMap> tm;
+                    try {
+                        tm = setup_tiered(cfg, be, N, n, mode, true,
+                                          0, OmapBackend::BPlus, da_hot, mc);
+                    } catch (const std::exception& e) {
+                        g_progress.config_done("setup-err");
+                        for (auto qt : {"hot", "cold"}) {
+                            csv << be_label << "," << logN << "," << mode_label
+                                << "," << qt << "," << mop << ",ERR\n";
+                        }
+                        continue;
+                    }
+
+                    ZipfSampler z(N, cfg.s, 42);
+                    int wq = ((warmup_q + B_swap - 1) / B_swap) * B_swap;
+                    bool broken = false;
+                    for (int i = 0; i < wq; ++i) {
+                        try { tm->access(z.sample()); }
+                        catch (...) { broken = true; break; }
+                    }
+
+                    if (broken) {
+                        g_progress.config_done("warmup-crash");
+                        for (auto qt : {"hot", "cold"}) {
+                            csv << be_label << "," << logN << "," << mode_label
+                                << "," << qt << "," << mop << ",CRASH\n";
+                        }
+                        csv.flush();
+                        continue;
+                    }
+
+                    for (bool is_hot : {true, false}) {
+                        auto& hk = tm->hot_keys();
+                        int target_key = -1;
+                        if (is_hot) {
+                            target_key = hk.empty() ? 0 : *hk.begin();
+                        } else {
+                            for (int k = N - 1; k >= 0; --k)
+                                if (!hk.count(k)) { target_key = k; break; }
+                        }
+
+                        int cur = tm->maintenance_mgr()->total_access_count() % B_swap;
+                        int need = (target_phase - cur - 1 + B_swap) % B_swap;
+                        for (int j = 0; j < need; ++j) {
+                            try { tm->access(z.sample()); }
+                            catch (...) { broken = true; break; }
+                        }
+
+                        if (broken) {
+                            csv << be_label << "," << logN << "," << mode_label
+                                << "," << (is_hot ? "hot" : "cold") << "," << mop
+                                << ",CRASH\n";
+                            csv.flush();
+                            continue;
+                        }
+
+                        double rta = -1, total_rnd = -1, bw = -1;
+                        double ams = -1, tms = -1;
+                        bool ok = false;
+                        try {
+                            auto t0 = Clock::now();
+                            auto r = tm->access(target_key);
+                            double elapsed = std::chrono::duration<double, std::milli>(
+                                Clock::now() - t0).count();
+                            double frac = r.total_bw.rounds > 0
+                                ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                            rta = r.rounds_to_answer;
+                            total_rnd = r.total_bw.rounds;
+                            bw = r.total_bw.total_bytes();
+                            ams = elapsed * frac;
+                            tms = elapsed;
+                            ok = true;
+                        } catch (const std::exception& e) {
+                            // crash — record what we can
+                        }
+
+                        const char* qt = is_hot ? "hot" : "cold";
+                        double s_rta = is_hot ? s_hot_rta : s_cold_rta;
+                        double s_total = is_hot ? s_hot_total : s_cold_total;
+                        double s_bw = is_hot ? s_hot_bw : s_cold_bw;
+
+                        if (ok) {
+                            csv << be_label << "," << logN << "," << mode_label
+                                << "," << qt << "," << mop << ","
+                                << (int)rta << "," << (int)total_rnd << ","
+                                << std::fixed << std::setprecision(1) << bw/1024 << ","
+                                << ams << "," << tms << ","
+                                << (int)(rta - s_rta) << ","
+                                << (int)(total_rnd - s_total) << ","
+                                << std::setprecision(1) << (bw - s_bw)/1024
+                                << "\n";
+                        } else {
+                            csv << be_label << "," << logN << "," << mode_label
+                                << "," << qt << "," << mop << ",CRASH\n";
+                        }
+                        csv.flush();
+                    }
+
+                    g_progress.config_done("ok");
+                }
+
+                // ── Print summary table ──
+                printf("\n  %s:\n", prefix.c_str());
+                printf("  %-10s │ static │ scan   │ hot_ins │ cold_ins │ MAX OH\n", "");
+                printf("  ──────────┼────────┼────────┼─────────┼──────────┼───────\n");
+                // (Summary will be in CSV; real-time progress is sufficient)
+            }
+        }
+    }
+
+    csv.close();
+    std::cout << "\n  -> " << cfg.outdir << "/dyn_oh_table1.csv\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2099,6 +2418,122 @@ static void exp_storage(const Cfg& cfg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp: Piggyback overhead — FO static, cold OMAP piggybacked dummy
+//   Measures bandwidth with and without a piggybacked dummy on cold OMAP.
+//   logN ∈ {16, 20, 24}, backends ∈ {AVL, BPlus, DaBplus}
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_pb_overhead(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Piggyback Overhead (FO static, cold dummy PB) ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/pb_overhead.csv");
+    csv << "logN,backend,query,pb,"
+        << "hot_bw_KB,cold_bw_KB,total_bw_KB,"
+        << "hot_rnd,cold_rnd,total_rnd,"
+        << "rounds_to_answer,latency_ms\n";
+
+    static const BackendSpec BACKENDS[] = {
+        {"AVL",     OmapBackend::AVL},
+        {"BPlus",   OmapBackend::BPlus},
+        {"DaBplus", OmapBackend::DaBplus},
+    };
+
+    const int logNs[] = {16, 20, 24};
+
+    for (int logN : logNs) {
+        int N = 1 << logN;
+        int n = std::min(cfg.n, N / 2);
+        std::cout << "\n--- logN=" << logN << " N=" << N << " n=" << n << " ---\n";
+
+        for (auto& [label, be] : BACKENDS) {
+            if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
+                continue;
+            bool da_hot = (be == OmapBackend::DaBplus);
+
+            auto emit = [&](const AccessResult& r, const char* qtag,
+                            bool pb, double ms) {
+                csv << logN << "," << label << "," << qtag << "," << (pb ? 1 : 0)
+                    << "," << std::fixed << std::setprecision(2)
+                    << r.hot_bw.total_bytes() / 1024.0 << ","
+                    << r.cold_bw.total_bytes() / 1024.0 << ","
+                    << r.total_bw.total_bytes() / 1024.0 << ","
+                    << r.hot_bw.rounds << "," << r.cold_bw.rounds << ","
+                    << r.total_bw.rounds << ","
+                    << r.rounds_to_answer << ","
+                    << std::setprecision(1) << ms << "\n";
+                csv.flush();
+                std::cout << "  " << label << " " << qtag << " pb=" << pb
+                          << " cold=" << std::setprecision(0)
+                          << r.cold_bw.total_bytes() / 1024.0 << "KB"
+                          << " total=" << r.total_bw.total_bytes() / 1024.0 << "KB"
+                          << " rta=" << r.rounds_to_answer
+                          << "/" << r.total_bw.rounds
+                          << " " << std::setprecision(0) << ms << "ms\n";
+            };
+
+            try {
+                // (A) Baseline: FO static, no PB
+                {
+                    std::string tag = "logN=" + std::to_string(logN)
+                                      + " " + label + " base";
+                    g_progress.config(tag);
+                    auto tm = setup_tiered(cfg, be, N, n,
+                                           SecurityMode::FullOblivious, true,
+                                           0, OmapBackend::BPlus, da_hot);
+                    tm->access(0);
+                    tm->access(N - 1);
+
+                    auto t0 = Clock::now();
+                    auto rh = tm->access(0);
+                    double ms_h = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    emit(rh, "hot", false, ms_h);
+
+                    t0 = Clock::now();
+                    auto rc = tm->access(N - 1);
+                    double ms_c = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    emit(rc, "cold", false, ms_c);
+                    g_progress.config_done("ok");
+                }
+
+                // (B) With cold dummy PB
+                {
+                    std::string tag = "logN=" + std::to_string(logN)
+                                      + " " + label + " pb";
+                    g_progress.config(tag);
+                    auto tm = setup_tiered(cfg, be, N, n,
+                                           SecurityMode::FullOblivious, true,
+                                           0, OmapBackend::BPlus, da_hot);
+                    tm->access(0);
+                    tm->access(N - 1);
+                    tm->set_force_cold_dummy_pb(true);
+
+                    auto t0 = Clock::now();
+                    auto rh = tm->access(0);
+                    double ms_h = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    emit(rh, "hot", true, ms_h);
+
+                    t0 = Clock::now();
+                    auto rc = tm->access(N - 1);
+                    double ms_c = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    emit(rc, "cold", true, ms_c);
+                    g_progress.config_done("ok");
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "  [CRASH] " << label << " logN=" << logN
+                          << ": " << e.what() << "\n";
+            }
+        }
+    }
+
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/pb_overhead.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2130,7 +2565,9 @@ int main(int argc, char** argv) {
         {"paper_wan",       exp_paper_wan},
         {"profile",         exp_profile},
         {"dynamic_overhead", exp_dynamic_overhead},
+        {"dyn_oh_table1",   exp_dyn_overhead_table1},
         {"storage",         exp_storage},
+        {"pb_overhead",     exp_pb_overhead},
     };
 
     bool all = (cfg.exp == "all");

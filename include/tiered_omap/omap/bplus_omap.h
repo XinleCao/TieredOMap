@@ -71,6 +71,24 @@ public:
     bool step_done() const override;
     Bytes step_finish() override;
 
+    // ── Mid-access decision interface ──
+    void set_step_decision_enabled(bool enable) override;
+    bool step_needs_decision() const override;
+    Bytes step_get_traverse_result() override;
+    void step_commit_remove() override;
+    void step_commit_noop() override;
+
+    // ── Piggyback interface (concurrent second operation) ──
+    void begin_piggyback_search(int key) override;
+    void begin_piggyback_insert(int key, const Bytes& value) override;
+    void begin_piggyback_dummy() override;
+    Bytes finish_piggyback() override;
+    void set_piggyback_decision_enabled(bool enable) override;
+    bool piggyback_needs_decision() const override;
+    Bytes piggyback_get_traverse_result() override;
+    void piggyback_commit_remove() override;
+    void piggyback_commit_noop() override;
+
     // ODS mode: used as inner tree by DaOstOmap.
     void set_index_mode(bool m) {
         if (m == index_mode_) return;
@@ -147,12 +165,13 @@ private:
 
     void finalize_bw();
 
-    enum class StepPhase { TRAVERSE_TARGET, TRAVERSE_SIBLING, PAD, DONE };
+    enum class StepPhase { TRAVERSE_TARGET, TRAVERSE_SIBLING, DECISION, PAD, DONE };
     struct StepState {
         StepPhase phase = StepPhase::DONE;
         int key = INVALID_KEY;
         const Bytes* update = nullptr;
         bool is_dummy = false;
+        bool decision_enabled = false;
         int budget = 0;
         int ops = 0;
 
@@ -161,14 +180,12 @@ private:
         int depth = 0;
         bool leaf_reached = false;
 
-        // Sibling info for current level
         bool sibling_is_dummy = false;
         int sib_id = INVALID_KEY;
         int sib_leaf = INVALID_LEAF;
         int sib_parent_idx = -1;
         int sib_child_idx = -1;
 
-        // Next child to descend into after sibling step
         int next_id = INVALID_KEY;
         int next_leaf = INVALID_LEAF;
 
@@ -176,9 +193,41 @@ private:
         int partial_upper_pad = 0;
         int cur_round_leaf = INVALID_LEAF;
         int cur_round_depth = 0;
+        bool round_read = false;
         Bytes result;
     };
     StepState ss_;
+
+    struct PBState {
+        bool active = false;
+        StepPhase phase = StepPhase::DONE;
+        int key = INVALID_KEY;
+        int cur_id = INVALID_KEY;
+        int cur_leaf = INVALID_LEAF;
+        int depth = 0;
+        int ops = 0;
+        int budget = 0;
+        int pad_remaining = 0;
+        int partial_upper_pad = 0;
+        int cur_round_leaf = INVALID_LEAF;
+        int cur_round_depth = 0;
+        bool round_read = false;
+        Bytes result;
+        bool node_in_local = false;
+        bool traverse_done = false;
+        bool leaf_reached = false;
+        bool sibling_is_dummy = false;
+        int next_id = INVALID_KEY;
+        int next_leaf = INVALID_LEAF;
+        int sib_id = INVALID_KEY;
+        int sib_leaf = INVALID_LEAF;
+        int sib_parent_idx = -1;
+        int sib_child_idx = -1;
+        bool is_insert = false;
+        Bytes insert_value;
+        bool decision_enabled = false;
+    };
+    PBState pb_;
 
     int split_depth_ = 0;
     StorageCreator storage_creator_;

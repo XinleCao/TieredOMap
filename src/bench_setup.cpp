@@ -340,6 +340,69 @@ Bytes setup_tiered_on_server(
     return result;
 }
 
+Bytes setup_index_data_on_server(
+    StorageServer::ClientState& stores,
+    OmapBackend backend, int N, int bucket_size, int value_size) {
+
+    std::cerr << "[bench_setup] index_data: backend=" << (int)backend
+              << " N=" << N << " bs=" << bucket_size << " vs=" << value_size << "\n";
+
+    // 1. Index OMAP with 4-byte reference values
+    auto index = make_omap(backend, N, bucket_size);
+    if (backend == OmapBackend::BPlus)
+        static_cast<BPlusOmap*>(index.get())->set_index_mode(true);
+
+    std::vector<std::pair<int, Bytes>> idata;
+    idata.reserve(N);
+    for (int i = 0; i < N; ++i)
+        idata.emplace_back(i, int_to_bytes(i));
+    index->init(idata);
+
+    // 2. Data PathORAM with full-size values
+    PathORAM data_oram(N, bucket_size, 7);
+    {
+        std::unordered_map<int, Bytes> dmap;
+        dmap.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            Bytes v(value_size, 0);
+            std::memcpy(v.data(), &i,
+                        std::min(sizeof(int), static_cast<size_t>(value_size)));
+            dmap[i] = std::move(v);
+        }
+        data_oram.init(dmap);
+    }
+
+    // 3. Export blobs
+    auto index_blob = export_omap(index.get(), backend);
+    auto data_blob = data_oram.export_state(0);
+
+    // 4. Detach/register/patch index OMAP stores
+    detach_register_patch_omap(stores, index.get(), backend, index_blob, 0);
+
+    // 5. Detach/register/patch data ORAM store
+    {
+        auto s = data_oram.detach_storage();
+        int sid = register_bts(stores, std::move(s));
+        patch_sid(data_blob, 0, sid);
+    }
+
+    // 6. Build result: backend(4) + N(4) + bucket_size(4)
+    //                + index_blob_len(4) + index_blob
+    //                + data_blob_len(4)  + data_blob
+    Bytes result;
+    si(result, static_cast<int>(backend));
+    si(result, N);
+    si(result, bucket_size);
+    si(result, static_cast<int>(index_blob.size()));
+    result.insert(result.end(), index_blob.begin(), index_blob.end());
+    si(result, static_cast<int>(data_blob.size()));
+    result.insert(result.end(), data_blob.begin(), data_blob.end());
+
+    std::cerr << "[bench_setup] index_data done: stores=" << stores.stores.size()
+              << " blob=" << result.size() << " bytes\n";
+    return result;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Client-side restore
 // ═══════════════════════════════════════════════════════════════════════
@@ -372,6 +435,22 @@ std::unique_ptr<TieredOMap> restore_tiered(
     int tag = di(p); (void)tag; // should be 1
     int blob_len = di(p); (void)blob_len;
     return TieredOMap::from_state(p, channel);
+}
+
+IndexDataParts restore_index_data(
+    const uint8_t*& p, std::shared_ptr<TcpChannel> channel) {
+    int backend_i = di(p);
+    int N = di(p); (void)N;
+    int bucket_size = di(p); (void)bucket_size;
+
+    int index_blob_len = di(p); (void)index_blob_len;
+    auto be = static_cast<OmapBackend>(backend_i);
+    auto index = restore_by_backend(be, p, channel);
+
+    int data_blob_len = di(p); (void)data_blob_len;
+    auto data = PathORAM::from_state_network(p, channel);
+
+    return {std::move(index), std::move(data)};
 }
 
 }  // namespace bench_setup
