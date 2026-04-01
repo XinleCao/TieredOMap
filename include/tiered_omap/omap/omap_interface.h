@@ -70,6 +70,7 @@ public:
     virtual std::vector<StepWriteReq> step_prepare_writes() { return {}; }
     virtual bool step_done() const { return true; }
     virtual Bytes step_finish() { return {}; }
+    virtual void step_abort() {}  // TM early termination: finalize BW for completed rounds
 
     struct ScanResult {
         int key = INVALID_KEY;

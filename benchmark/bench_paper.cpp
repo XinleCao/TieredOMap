@@ -1612,8 +1612,8 @@ static void exp_paper_wan(const Cfg& cfg) {
         csv << "logN,backend,hit_pct,"
             << "base_bw_KB,base_rnd,base_ms,"
             << "tm_hot_bw_KB,tm_cold_bw_KB,tm_mean_bw_KB,fo_bw_KB,"
-            << "tm_hot_rnd,tm_cold_rnd,tm_mean_rnd,"
-            << "tm_hot_ms,tm_cold_ms,tm_mean_ms\n";
+            << "tm_hot_rnd,tm_cold_rnd,tm_mean_rnd,fo_rnd,"
+            << "tm_hot_ms,tm_cold_ms,tm_mean_ms,fo_ms\n";
 
     static const BackendSpec PAPER_BE[] = {
         {"AVL",     OmapBackend::AVL},
@@ -1694,17 +1694,22 @@ static void exp_paper_wan(const Cfg& cfg) {
             }
 
             // ── (C) TieredOMAP FO mode — 1 query ──
-            double fo_bw = 0;
+            double fo_bw = 0, fo_rnd = 0, fo_ms = 0;
             {
                 g_progress.config("logN=" + std::to_string(logN) + " " + label + " FO");
                 auto fo = setup_tiered(cfg, be, N, n,
                                        SecurityMode::FullOblivious, true,
                                        0, OmapBackend::BPlus, da_hot);
                 fo->access(0);
+                auto t0 = Clock::now();
                 auto r = fo->access(0);
+                fo_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - t0).count();
                 fo_bw = r.total_bw.total_bytes();
+                fo_rnd = r.total_bw.rounds;
                 std::ostringstream ss;
-                ss << std::fixed << std::setprecision(0) << fo_bw/1024 << "KB";
+                ss << std::fixed << std::setprecision(0) << fo_bw/1024 << "KB/"
+                   << (int)fo_rnd << "rnd/" << fo_ms << "ms";
                 g_progress.config_done(ss.str());
             }
 
@@ -1730,9 +1735,11 @@ static void exp_paper_wan(const Cfg& cfg) {
                 << std::setprecision(0) << hot_rnd << ","
                 << std::setprecision(0) << cold_rnd << ","
                 << std::setprecision(0) << mean_rnd << ","
+                << std::setprecision(0) << fo_rnd << ","
                 << std::setprecision(0) << hot_ms << ","
                 << std::setprecision(0) << cold_ms << ","
-                << std::setprecision(0) << mean_ms << "\n";
+                << std::setprecision(0) << mean_ms << ","
+                << std::setprecision(0) << fo_ms << "\n";
             csv.flush();
         }
     }

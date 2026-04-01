@@ -47,7 +47,7 @@ DaOstOmap::DaOstOmap(int capacity, OdsTreeType tree_type,
         ods_budget_ = 3 * tree_height_bound_;
         avl_ods_.set_ods_mode(tree_height_bound_);
     } else {
-        ods_budget_ = 2 * tree_height_bound_;
+        ods_budget_ = 3 * tree_height_bound_;
         bplus_ods_.set_ods_mode(tree_height_bound_);
     }
 
@@ -92,9 +92,9 @@ void DaOstOmap::pad_ods(int actual_ops) {
     }
 }
 
-void DaOstOmap::finalize_bw(int /*ods_ops*/) {
+void DaOstOmap::finalize_bw(int ods_ops) {
     int da_rounds = daoram_.num_access_rounds();
-    int total_ops = ods_budget_ + da_rounds;
+    int total_ops = ods_ops + da_rounds;
     PathORAM& ods = (tree_type_ == OdsTreeType::AVL)
                         ? avl_ods_.oram() : bplus_ods_.oram();
     int da_bw = daoram_.last_stats().bytes_downloaded +
@@ -102,7 +102,7 @@ void DaOstOmap::finalize_bw(int /*ods_ops*/) {
     int ods_bw = ods.path_bandwidth_bytes();
     last_bw_.rounds = total_ops;
     last_bw_.bytes_downloaded = da_bw / 2 +
-        static_cast<uint64_t>(ods_budget_) * ods_bw;
+        static_cast<uint64_t>(ods_ops) * ods_bw;
     last_bw_.bytes_uploaded = last_bw_.bytes_downloaded;
     total_bw_ += last_bw_;
 }
@@ -295,7 +295,7 @@ Bytes DaOstOmap::search(int key, const Bytes* update) {
     }
 
     pad_ods(ods_ops);
-    finalize_bw(ods_ops);
+    finalize_bw(ods_budget_);
     return result;
 }
 
@@ -326,7 +326,7 @@ void DaOstOmap::insert(int key, const Bytes& value) {
     }
 
     pad_ods(ods_ops);
-    finalize_bw(ods_ops);
+    finalize_bw(ods_budget_);
 }
 
 // ─── Remove ─────────────────────────────────────────────────────────────────
@@ -356,7 +356,7 @@ void DaOstOmap::remove(int key) {
     }
 
     pad_ods(ods_ops);
-    finalize_bw(ods_ops);
+    finalize_bw(ods_budget_);
 }
 
 // ─── Piggyback scan ─────────────────────────────────────────────────────────
@@ -394,7 +394,7 @@ DaOstOmap::ScanResult DaOstOmap::piggyback_scan_step() {
     }
 
     pad_ods(ods_ops);
-    finalize_bw(ods_ops);
+    finalize_bw(ods_budget_);
 
     scan_pos_ = (scan_pos_ + 1) % num_positions_;
     return sr;
@@ -415,7 +415,7 @@ void DaOstOmap::dummy_access() {
             bplus_ods_.oram().dummy_access();
     }
 
-    finalize_bw(0);
+    finalize_bw(ods_budget_);
 }
 
 void DaOstOmap::partial_dummy_access() {
@@ -424,7 +424,7 @@ void DaOstOmap::partial_dummy_access() {
     daoram_.dummy_access();
     ods_oram().dummy_access();
 
-    finalize_bw(0);
+    finalize_bw(1);
 }
 
 // ─── Step-by-step interface for interleaved access ─────────────────────────
@@ -513,7 +513,7 @@ DaOstOmap::ScanResult DaOstOmap::step_finish_scan() {
     sr.value = ss_.scan_result;
 
     scan_pos_ = (scan_pos_ + 1) % num_positions_;
-    finalize_bw(0);
+    finalize_bw(ods_budget_);
     return sr;
 }
 
@@ -696,8 +696,15 @@ Bytes DaOstOmap::step_finish() {
         ods_omap().step_finish();
     }
 
-    finalize_bw(ss_.ods_ops);
+    finalize_bw(ss_.is_partial_dummy ? 1 : ods_budget_);
     return ss_.result;
+}
+
+void DaOstOmap::step_abort() {
+    ods_omap().step_abort();
+    finalize_bw(ss_.ods_ops);
+    ss_.phase = StepPhase::DONE;
+    pb_ = PBState{};
 }
 
 // ─── Mid-access decision interface ─────────────────────────────────────────

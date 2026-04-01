@@ -1383,6 +1383,12 @@ Bytes BPlusOmap::step_finish() {
     return ss_.result;
 }
 
+void BPlusOmap::step_abort() {
+    finalize_bw();
+    ss_.phase = StepPhase::DONE;
+    pb_ = PBState{};
+}
+
 // ─── Piggyback step interface ───────────────────────────────────────────────
 
 void BPlusOmap::begin_piggyback_search(int key) {

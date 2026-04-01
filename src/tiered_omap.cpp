@@ -490,40 +490,42 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         return result;
     }
 
-    if (is_hot_physical) {
-        Bytes ref = hot_omap_->search(key);
-        result.hot_bw = hot_omap_->last_stats();
-        int blk = ref_to_blk(ref);
+    // Both OMAPs search (sequential in non-interleaved mode)
+    Bytes hot_ref = hot_omap_->search(key);
+    result.hot_bw = hot_omap_->last_stats();
+    bool found_hot = !hot_ref.empty();
+
+    if (found_hot) {
+        result.found_in_hot = true;
+        int blk = ref_to_blk(hot_ref);
         result.value = data_access(blk, new_value);
         if (config_.mode == SecurityMode::FullOblivious) {
-            cold_omap_->dummy_access();
+            cold_omap_->search(key);
             data_oram_.dummy_access();
         } else {
             cold_omap_->partial_dummy_access();
         }
     } else {
-        hot_omap_->dummy_access();
-        result.hot_bw = hot_omap_->last_stats();
-        Bytes ref = cold_omap_->search(key);
-        int blk = ref_to_blk(ref);
+        Bytes cold_ref = cold_omap_->search(key);
+        int blk = ref_to_blk(cold_ref);
         if (config_.mode == SecurityMode::FullOblivious)
             data_oram_.dummy_access();
         result.value = data_access(blk, new_value);
     }
     result.cold_bw = cold_omap_->last_stats();
 
-    auto data_bw = data_oram_.last_stats();
+    int dpbw = data_oram_.path_bandwidth_bytes();
+    int nops = (config_.mode == SecurityMode::FullOblivious) ? 2 : 1;
     result.total_bw.bytes_downloaded =
         result.hot_bw.bytes_downloaded + result.cold_bw.bytes_downloaded +
-        data_bw.bytes_downloaded;
+        static_cast<size_t>(dpbw) * nops;
     result.total_bw.bytes_uploaded =
         result.hot_bw.bytes_uploaded + result.cold_bw.bytes_uploaded +
-        data_bw.bytes_uploaded;
+        static_cast<size_t>(dpbw) * nops;
     result.total_bw.rounds =
-        std::max(result.hot_bw.rounds, result.cold_bw.rounds) +
-        data_bw.rounds;
+        result.hot_bw.rounds + result.cold_bw.rounds + nops;
 
-    if (is_hot_logical)
+    if (found_hot)
         result.rounds_to_answer = static_cast<int>(result.hot_bw.rounds) + 1;
     else
         result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
@@ -748,150 +750,125 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                             bool hot_dummy_pb,
                                             bool cold_dummy_pb) {
     AccessResult result;
-    bool is_hot_physical = phys_hot_keys_.count(key) > 0;
-    bool is_hot_logical = hot_keys_.count(key) > 0;
-    result.found_in_hot = is_hot_logical;
     bool fo = !use_partial_dummy;
+
+    // ── Both OMAPs search in parallel (no searcher/dummy split) ──
+    hot_omap_->begin_step_search(key, nullptr);
+    cold_omap_->begin_step_search(key, nullptr);
+
+    // ── Piggybacking setup (epoch mode maintenance) ──
     bool scan_on_piggyback = false;
-
-    OmapInterface* searcher = is_hot_physical ? hot_omap_.get()
-                                              : cold_omap_.get();
-    OmapInterface* dummy    = is_hot_physical ? cold_omap_.get()
-                                              : hot_omap_.get();
-
-    searcher->begin_step_search(key, nullptr);
-
     if (scan_key != INVALID_KEY) {
-        // Scan fires: hot OMAP needs a full operation to support piggybacking
-        if (!is_hot_physical) {
-            // K in cold → hot is the dummy side, upgrade to full dummy
-            dummy->begin_step_dummy();
-        } else {
-            // K in hot → cold gets its normal dummy
-            if (use_partial_dummy)
-                dummy->begin_step_partial_dummy();
-            else
-                dummy->begin_step_dummy();
-        }
         hot_omap_->begin_piggyback_search(scan_key);
         hot_omap_->set_piggyback_decision_enabled(true);
         scan_on_piggyback = true;
-    } else if (use_partial_dummy) {
-        dummy->begin_step_partial_dummy();
-    } else {
-        dummy->begin_step_dummy();
     }
+    if (hot_insert_key != INVALID_KEY)
+        hot_omap_->begin_piggyback_insert(hot_insert_key, pending_insert_ref_);
+    if (cold_insert_key != INVALID_KEY)
+        cold_omap_->begin_piggyback_insert(cold_insert_key, pending_insert_ref_);
+    if (hot_dummy_pb && hot_insert_key == INVALID_KEY)
+        hot_omap_->begin_piggyback_dummy();
+    if (cold_dummy_pb && cold_insert_key == INVALID_KEY)
+        cold_omap_->begin_piggyback_dummy();
 
-    // B2: piggyback hot insert on hot OMAP
-    if (hot_insert_key != INVALID_KEY) {
-        if (is_hot_physical) {
-            hot_omap_->begin_piggyback_insert(hot_insert_key, pending_insert_ref_);
-        } else {
-            // Hot OMAP is the dummy side; for TM mode it's partial_dummy
-            // which doesn't support piggybacking. Only piggyback when hot
-            // OMAP has a full operation (search or dummy, not partial).
-            if (!use_partial_dummy)
-                hot_omap_->begin_piggyback_insert(hot_insert_key, pending_insert_ref_);
-        }
-    }
+    if (epoch_mode)
+        cold_omap_->set_step_decision_enabled(true);
 
-    // B3: piggyback cold insert on cold OMAP
-    if (cold_insert_key != INVALID_KEY) {
-        if (!is_hot_physical) {
-            cold_omap_->begin_piggyback_insert(cold_insert_key, pending_insert_ref_);
-        } else {
-            if (!use_partial_dummy)
-                cold_omap_->begin_piggyback_insert(cold_insert_key, pending_insert_ref_);
-        }
-    }
-
-    // Enable DECISION for type-hidden cold promotion
-    if (epoch_mode && !is_hot_physical)
-        searcher->set_step_decision_enabled(true);
-
-    // B2 dummy piggybacking (no pending entry)
-    if (hot_dummy_pb && hot_insert_key == INVALID_KEY) {
-        if (is_hot_physical || !use_partial_dummy)
-            hot_omap_->begin_piggyback_dummy();
-    }
-
-    // B3 dummy piggybacking (no pending entry)
-    if (cold_dummy_pb && cold_insert_key == INVALID_KEY) {
-        if (!is_hot_physical || !use_partial_dummy)
-            cold_omap_->begin_piggyback_dummy();
-    }
-
+    // ── Data ORAM state machines ──
     enum DStep { IDLE, NEED_READ, NEED_WRITE, DONE };
-    DStep data_st   = IDLE;
-    DStep ddummy_st = fo ? IDLE : DONE;
-    int  data_blk      = INVALID_BLOCK;
-    int  data_leaf     = -1;
-    int  data_new_leaf = -1;
-    int  ddummy_leaf   = -1;
-    bool searcher_done_flag = false;
-    bool decision_triggered = false;
-    bool decision_pending = false;
-    int  total_rounds  = 0;
-    int  answer_round  = 0;
-    Bytes searcher_ref;
-    int  computed_fp   = 0;
 
-    // Scan data ORAM state (for reading scan key's epoch metadata)
+    // Data ORAM at hot_done (real if key in hot, dummy if key in cold for FO)
+    DStep hot_data_st = IDLE;
+    int  hot_data_blk = INVALID_BLOCK;
+    int  hot_data_leaf = -1, hot_data_new_leaf = -1;
+
+    // Data ORAM at cold_done (real if key in cold, dummy if key in hot for FO)
+    DStep cold_data_st = IDLE;
+    int  cold_data_blk = INVALID_BLOCK;
+    int  cold_data_leaf = -1, cold_data_new_leaf = -1;
+
+    // Scan data ORAM (epoch piggyback)
     DStep scan_data_st = scan_on_piggyback ? IDLE : DONE;
-    int  scan_data_blk      = INVALID_BLOCK;
-    int  scan_data_leaf     = -1;
-    int  scan_data_new_leaf = -1;
+    int  scan_data_blk = INVALID_BLOCK;
+    int  scan_data_leaf = -1, scan_data_new_leaf = -1;
     bool scan_decision_triggered = false;
-    bool scan_decision_pending = false;
+
+    bool hot_done_flag = false, cold_done_flag = false;
+    bool found_in_hot = false;
+    Bytes hot_ref, cold_ref;
+    int  total_rounds = 0;
+    int  answer_round = 0;
+    int  computed_fp  = 0;
+    bool decision_triggered = false;
+    bool decision_pending   = false;
+
+    auto setup_data_oram = [&](DStep& st, int& blk, int& leaf, int& new_leaf,
+                               const Bytes& ref) {
+        blk = ref_to_blk(ref);
+        if (blk != INVALID_BLOCK) {
+            leaf     = data_oram_.get_leaf(blk);
+            new_leaf = data_oram_.random_leaf();
+            data_oram_.set_leaf(blk, new_leaf);
+        } else {
+            leaf     = data_oram_.random_leaf();
+            new_leaf = -1;
+        }
+        st = NEED_READ;
+    };
 
     while (true) {
-        bool s_act = !searcher->step_done();
-        bool d_act = !dummy->step_done();
-        if (!s_act && !d_act
-            && data_st == DONE && ddummy_st == DONE && scan_data_st == DONE)
+        bool h_act = !hot_done_flag  && !hot_omap_->step_done();
+        bool c_act = !cold_done_flag && !cold_omap_->step_done();
+        if (!h_act && !c_act
+            && hot_data_st  == DONE && cold_data_st == DONE
+            && scan_data_st == DONE)
             break;
 
         ++total_rounds;
 
-        OramStepRound sr{}, dr{};
-        if (s_act) sr = searcher->step_next_round();
-        if (d_act) dr = dummy->step_next_round();
+        // ── Gather read requests ──
+        OramStepRound hr{}, cr{};
+        if (h_act) hr = hot_omap_->step_next_round();
+        if (c_act) cr = cold_omap_->step_next_round();
 
         std::vector<BatchReadReq> reads;
-        for (auto& r : sr.reads) reads.push_back({r.store_id, r.leaf});
-        size_t s_cnt = sr.reads.size();
-        for (auto& r : dr.reads) reads.push_back({r.store_id, r.leaf});
-        size_t d_cnt = dr.reads.size();
+        for (auto& r : hr.reads) reads.push_back({r.store_id, r.leaf});
+        size_t h_cnt = hr.reads.size();
+        for (auto& r : cr.reads) reads.push_back({r.store_id, r.leaf});
+        size_t c_cnt = cr.reads.size();
 
-        size_t dr_cnt = 0, dd_cnt = 0, sdr_cnt = 0;
-        if (data_st == NEED_READ)      { reads.push_back({data_oram_.get_store_id(), data_leaf});      dr_cnt = 1; }
-        if (ddummy_st == NEED_READ)    { reads.push_back({data_oram_.get_store_id(), ddummy_leaf});    dd_cnt = 1; }
-        if (scan_data_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), scan_data_leaf}); sdr_cnt = 1; }
+        size_t hd_cnt = 0, cd_cnt = 0, sd_cnt = 0;
+        if (hot_data_st  == NEED_READ) { reads.push_back({data_oram_.get_store_id(), hot_data_leaf});  hd_cnt = 1; }
+        if (cold_data_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), cold_data_leaf}); cd_cnt = 1; }
+        if (scan_data_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), scan_data_leaf}); sd_cnt = 1; }
 
         auto fetched = batch_read_paths(*channel_, reads);
 
+        // ── Apply reads ──
         size_t off = 0;
-        if (s_act && s_cnt > 0) {
-            searcher->step_apply_reads({fetched.begin() + off,
-                                        fetched.begin() + off + s_cnt});
+        if (h_act && h_cnt > 0) {
+            hot_omap_->step_apply_reads({fetched.begin() + off,
+                                         fetched.begin() + off + h_cnt});
         }
-        off += s_cnt;
-        if (d_act && d_cnt > 0) {
-            dummy->step_apply_reads({fetched.begin() + off,
-                                     fetched.begin() + off + d_cnt});
+        off += h_cnt;
+        if (c_act && c_cnt > 0) {
+            cold_omap_->step_apply_reads({fetched.begin() + off,
+                                          fetched.begin() + off + c_cnt});
         }
-        off += d_cnt;
-        if (dr_cnt)  { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
-        if (dd_cnt)  { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
-        if (sdr_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        off += c_cnt;
+        if (hd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        if (cd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        if (sd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
 
-        if (s_act) searcher->step_process();
-        if (d_act) dummy->step_process();
+        // ── Process OMAP steps ──
+        if (h_act) hot_omap_->step_process();
+        if (c_act) cold_omap_->step_process();
 
-        // ── Main query data ORAM result processing ──
-        if (dr_cnt) {
-            if (data_blk != INVALID_BLOCK) {
-                Block b = data_oram_.extract_from_stash(data_blk);
+        // ── Hot data ORAM result processing ──
+        if (hd_cnt) {
+            if (hot_data_blk != INVALID_BLOCK) {
+                Block b = data_oram_.extract_from_stash(hot_data_blk);
                 Bytes sv;
                 if (epoch_mode && maint_) {
                     auto [val, meta] = decode_epoch(b.value);
@@ -905,28 +882,50 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                     result.value = new_value ? *new_value : b.value;
                     sv = new_value ? *new_value : b.value;
                 }
-                data_oram_.add_to_stash({data_blk, data_new_leaf, std::move(sv)});
+                data_oram_.add_to_stash({hot_data_blk, hot_data_new_leaf, std::move(sv)});
+                answer_round = total_rounds;
             }
-            data_st = NEED_WRITE;
-            answer_round = total_rounds;
+            hot_data_st = NEED_WRITE;
+        }
+
+        // ── Cold data ORAM result processing ──
+        if (cd_cnt) {
+            if (cold_data_blk != INVALID_BLOCK) {
+                Block b = data_oram_.extract_from_stash(cold_data_blk);
+                Bytes sv;
+                if (epoch_mode && maint_) {
+                    auto [val, meta] = decode_epoch(b.value);
+                    meta = maint_->update_meta(meta);
+                    computed_fp = meta.fp;
+                    result.value = new_value ? *new_value : val;
+                    sv = encode_with_epoch(result.value, meta);
+                    if (cache_keys_.count(key))
+                        maint_->update_cache_fp(key, meta.fp);
+                } else {
+                    result.value = new_value ? *new_value : b.value;
+                    sv = new_value ? *new_value : b.value;
+                }
+                data_oram_.add_to_stash({cold_data_blk, cold_data_new_leaf, std::move(sv)});
+                answer_round = total_rounds;
+            }
+            cold_data_st = NEED_WRITE;
             if (decision_pending) {
                 bool should_prom = computed_fp > 0
                     && maint_ && maint_->swap_state() == SwapState::Idle
                     && maint_->should_promote(computed_fp);
                 if (should_prom) {
-                    searcher->step_commit_remove();
+                    cold_omap_->step_commit_remove();
                     result.cold_promotion_done = true;
                 } else {
-                    searcher->step_commit_noop();
+                    cold_omap_->step_commit_noop();
                 }
                 result.cold_decision_handled = true;
                 decision_pending = false;
             }
         }
-        if (dd_cnt) ddummy_st = NEED_WRITE;
 
         // ── Scan data ORAM result processing ──
-        if (sdr_cnt) {
+        if (sd_cnt) {
             if (scan_data_blk != INVALID_BLOCK) {
                 Block sb = data_oram_.extract_from_stash(scan_data_blk);
                 if (epoch_mode && maint_) {
@@ -948,81 +947,95 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             scan_data_st = NEED_WRITE;
         }
 
-        // ── DECISION trigger: cold searcher paused after traverse ──
-        if (!decision_triggered && !searcher_done_flag
-            && epoch_mode && !is_hot_physical
-            && searcher->step_needs_decision()) {
+        // ── DECISION trigger: cold OMAP paused after traverse (epoch) ──
+        if (!decision_triggered && epoch_mode
+            && !cold_done_flag && cold_omap_->step_needs_decision()) {
             decision_triggered = true;
-            searcher_ref = searcher->step_get_traverse_result();
-            data_blk = ref_to_blk(searcher_ref);
-            if (data_blk != INVALID_BLOCK) {
-                data_leaf     = data_oram_.get_leaf(data_blk);
-                data_new_leaf = data_oram_.random_leaf();
-                data_oram_.set_leaf(data_blk, data_new_leaf);
-            } else {
-                data_leaf = data_oram_.random_leaf();
-            }
-            data_st = NEED_READ;
+            Bytes trav_ref = cold_omap_->step_get_traverse_result();
+            setup_data_oram(cold_data_st, cold_data_blk, cold_data_leaf,
+                            cold_data_new_leaf, trav_ref);
             decision_pending = true;
         }
 
-        // ── DECISION trigger: scan piggyback paused after traverse ──
+        // ── Scan DECISION trigger ──
         if (!scan_decision_triggered && scan_on_piggyback
             && hot_omap_->piggyback_needs_decision()) {
             scan_decision_triggered = true;
             Bytes scan_trav_ref = hot_omap_->piggyback_get_traverse_result();
-            scan_data_blk = ref_to_blk(scan_trav_ref);
-            if (scan_data_blk != INVALID_BLOCK) {
-                scan_data_leaf     = data_oram_.get_leaf(scan_data_blk);
-                scan_data_new_leaf = data_oram_.random_leaf();
-                data_oram_.set_leaf(scan_data_blk, scan_data_new_leaf);
-            } else {
-                scan_data_leaf = data_oram_.random_leaf();
-            }
-            scan_data_st = NEED_READ;
-            scan_decision_pending = true;
+            setup_data_oram(scan_data_st, scan_data_blk, scan_data_leaf,
+                            scan_data_new_leaf, scan_trav_ref);
         }
 
-        if (!searcher_done_flag && searcher->step_done()) {
-            searcher_done_flag = true;
-            if (!decision_triggered) {
-                searcher_ref = searcher->step_finish();
-                data_blk = ref_to_blk(searcher_ref);
-                if (data_blk != INVALID_BLOCK) {
-                    data_leaf     = data_oram_.get_leaf(data_blk);
-                    data_new_leaf = data_oram_.random_leaf();
-                    data_oram_.set_leaf(data_blk, data_new_leaf);
-                } else {
-                    data_leaf = data_oram_.random_leaf();
+        // ── Hot OMAP completion ──
+        if (!hot_done_flag && hot_omap_->step_done()) {
+            hot_done_flag = true;
+            hot_ref = hot_omap_->step_finish();
+            found_in_hot = !hot_ref.empty();
+
+            if (found_in_hot) {
+                setup_data_oram(hot_data_st, hot_data_blk, hot_data_leaf,
+                                hot_data_new_leaf, hot_ref);
+                if (!fo) {
+                    // TM: abort cold, skip cold data ORAM
+                    cold_omap_->step_abort();
+                    cold_done_flag = true;
+                    cold_data_st = DONE;
                 }
-                data_st = NEED_READ;
             } else {
-                searcher->step_finish();
+                if (fo) {
+                    // FO: dummy data ORAM at hot_done to hide tier membership
+                    Bytes dummy_ref;
+                    setup_data_oram(hot_data_st, hot_data_blk, hot_data_leaf,
+                                    hot_data_new_leaf, dummy_ref);
+                } else {
+                    // TM: no data ORAM at hot_done (reveals key is cold)
+                    hot_data_st = DONE;
+                }
             }
         }
 
-        std::vector<BatchWriteReq> writes;
-        if (s_act) {
-            for (auto& w : searcher->step_prepare_writes())
-                writes.push_back({w.store_id, std::move(w.data)});
-        }
-        if (d_act) {
-            for (auto& w : dummy->step_prepare_writes())
-                writes.push_back({w.store_id, std::move(w.data)});
-        }
-        if (data_st == NEED_WRITE) {
-            writes.push_back({data_oram_.get_store_id(),
-                              data_oram_.prepare_eviction(data_leaf)});
-            data_st = DONE;
-            if (fo && ddummy_st == IDLE) {
-                ddummy_leaf = data_oram_.random_leaf();
-                ddummy_st = NEED_READ;
+        // ── Cold OMAP completion ──
+        if (!cold_done_flag && cold_omap_->step_done()) {
+            cold_done_flag = true;
+            if (!decision_triggered)
+                cold_ref = cold_omap_->step_finish();
+            else
+                cold_omap_->step_finish();
+
+            if (cold_data_st == IDLE) {
+                if (!found_in_hot && !cold_ref.empty()) {
+                    setup_data_oram(cold_data_st, cold_data_blk, cold_data_leaf,
+                                    cold_data_new_leaf, cold_ref);
+                } else if (fo) {
+                    // FO: dummy data ORAM at cold_done (key was in hot)
+                    Bytes dummy_ref;
+                    setup_data_oram(cold_data_st, cold_data_blk, cold_data_leaf,
+                                    cold_data_new_leaf, dummy_ref);
+                } else {
+                    cold_data_st = DONE;
+                }
             }
         }
-        if (ddummy_st == NEED_WRITE) {
+
+        // ── Prepare writes ──
+        std::vector<BatchWriteReq> writes;
+        if (h_act) {
+            for (auto& w : hot_omap_->step_prepare_writes())
+                writes.push_back({w.store_id, std::move(w.data)});
+        }
+        if (c_act) {
+            for (auto& w : cold_omap_->step_prepare_writes())
+                writes.push_back({w.store_id, std::move(w.data)});
+        }
+        if (hot_data_st == NEED_WRITE) {
             writes.push_back({data_oram_.get_store_id(),
-                              data_oram_.prepare_eviction(ddummy_leaf)});
-            ddummy_st = DONE;
+                              data_oram_.prepare_eviction(hot_data_leaf)});
+            hot_data_st = DONE;
+        }
+        if (cold_data_st == NEED_WRITE) {
+            writes.push_back({data_oram_.get_store_id(),
+                              data_oram_.prepare_eviction(cold_data_leaf)});
+            cold_data_st = DONE;
         }
         if (scan_data_st == NEED_WRITE) {
             writes.push_back({data_oram_.get_store_id(),
@@ -1032,33 +1045,32 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         batch_write_paths(*channel_, writes);
     }
 
-    if (!searcher_done_flag)
-        searcher->step_finish();
-    dummy->step_finish();
+    // ── Cleanup ──
+    if (!hot_done_flag)
+        hot_omap_->step_finish();
+    if (!cold_done_flag)
+        cold_omap_->step_finish();
 
-    if (!is_hot_physical) result.cold_ref = searcher_ref;
+    result.found_in_hot = found_in_hot;
+    if (!found_in_hot) result.cold_ref = cold_ref;
 
-    // Extract piggybacked scan result
-    if (scan_on_piggyback) {
+    if (scan_on_piggyback)
         result.scan_ref = hot_omap_->finish_piggyback();
-    }
-
-    // Finish piggybacked inserts or dummy piggybacking
     if (hot_insert_key != INVALID_KEY) {
         hot_omap_->finish_piggyback();
         result.hot_insert_done = true;
-    } else if (hot_dummy_pb && (is_hot_physical || !use_partial_dummy)) {
+    } else if (hot_dummy_pb) {
         hot_omap_->finish_piggyback();
     }
     if (cold_insert_key != INVALID_KEY) {
         cold_omap_->finish_piggyback();
         result.cold_insert_done = true;
-    } else if (cold_dummy_pb && (!is_hot_physical || !use_partial_dummy)) {
+    } else if (cold_dummy_pb) {
         cold_omap_->finish_piggyback();
     }
 
     result.last_access_fp = computed_fp;
-    result.hot_bw = hot_omap_->last_stats();
+    result.hot_bw  = hot_omap_->last_stats();
     result.cold_bw = cold_omap_->last_stats();
 
     int dpbw = data_oram_.path_bandwidth_bytes();

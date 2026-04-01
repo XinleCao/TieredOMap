@@ -1187,6 +1187,12 @@ Bytes AVLOmap::step_finish() {
     return ss_.result;
 }
 
+void AVLOmap::step_abort() {
+    finalize_bw();
+    ss_.phase = StepPhase::DONE;
+    pb_ = PBState{};
+}
+
 // ─── Piggyback step interface ───────────────────────────────────────────────
 
 void AVLOmap::begin_piggyback_search(int key) {

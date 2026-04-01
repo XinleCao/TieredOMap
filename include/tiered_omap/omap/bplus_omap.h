@@ -70,6 +70,7 @@ public:
     std::vector<StepWriteReq> step_prepare_writes() override;
     bool step_done() const override;
     Bytes step_finish() override;
+    void step_abort() override;
 
     // ── Mid-access decision interface ──
     void set_step_decision_enabled(bool enable) override;

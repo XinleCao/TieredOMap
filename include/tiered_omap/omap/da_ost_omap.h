@@ -43,6 +43,7 @@ public:
     std::vector<StepWriteReq> step_prepare_writes() override;
     bool step_done() const override;
     Bytes step_finish() override;
+    void step_abort() override;
 
     int num_positions() const { return num_positions_; }
     int tree_height_bound() const { return tree_height_bound_; }

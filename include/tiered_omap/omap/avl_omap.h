@@ -69,6 +69,7 @@ public:
     std::vector<StepWriteReq> step_prepare_writes() override;
     bool step_done() const override;
     Bytes step_finish() override;
+    void step_abort() override;
 
     // ── Piggyback interface (concurrent second operation) ──
     void begin_piggyback_search(int key) override;
