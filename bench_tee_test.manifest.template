@@ -1,0 +1,64 @@
+[libos]
+entrypoint = "/bench_tee"
+
+[loader]
+log_level = "error"
+argv = ["/bench_tee", "--max_logN", "14", "--n", "64", "--val", "64", "--Q", "10", "--s", "0.99", "--outdir", "tee_results_test"]
+
+[loader.env]
+LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
+
+[[fs.mounts]]
+path = "/lib"
+uri = "file:{{ gramine.runtimedir() }}"
+
+[[fs.mounts]]
+path = "/lib/x86_64-linux-gnu"
+uri = "file:/lib/x86_64-linux-gnu"
+
+[[fs.mounts]]
+path = "/usr/lib/x86_64-linux-gnu"
+uri = "file:/usr/lib/x86_64-linux-gnu"
+
+[[fs.mounts]]
+path = "/bench_tee"
+uri = "file:build/bench_tee"
+
+[[fs.mounts]]
+path = "tee_results_test"
+uri = "file:tee_results_test"
+type = "chroot"
+
+[[fs.mounts]]
+path = "/etc"
+uri = "file:/etc"
+
+[[fs.mounts]]
+path = "/tmp"
+uri = "file:/tmp"
+type = "chroot"
+
+[sgx]
+enclave_size = "512M"
+max_threads = 4
+debug = true
+edmm_enable = false
+trusted_files = [
+    "file:build/bench_tee",
+    "file:{{ gramine.libos }}",
+    "file:{{ gramine.runtimedir() }}/",
+    "file:/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "file:/lib/x86_64-linux-gnu/libstdc++.so.6",
+    "file:/lib/x86_64-linux-gnu/libm.so.6",
+    "file:/lib/x86_64-linux-gnu/libgcc_s.so.1",
+    "file:/lib/x86_64-linux-gnu/libc.so.6",
+    "file:/lib64/ld-linux-x86-64.so.2",
+]
+allowed_files = [
+    "file:tee_results_test/",
+    "file:/tmp/",
+]
+
+[sys]
+insecure__allow_eventfd = true
+enable_sigterm_injection = true
