@@ -89,6 +89,25 @@ target_link_libraries(bench_paper PRIVATE tiered_omap)
 add_executable(bench_tee benchmark/bench_tee.cpp)
 target_link_libraries(bench_tee PRIVATE tiered_omap)
 
+add_executable(bench_tee_batch benchmark/bench_tee_batch.cpp)
+target_link_libraries(bench_tee_batch PRIVATE tiered_omap)
+
+set(ENIGMAP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/EnigMap")
+set(ENIGMAP_COMMON_LIB "${ENIGMAP_ROOT}/build_noboost/ods/libcommon.a")
+if(EXISTS "${ENIGMAP_ROOT}/ods/otree/otree.hpp" AND EXISTS "${ENIGMAP_COMMON_LIB}")
+    add_executable(bench_tee_original_enigmap benchmark/bench_tee_original_enigmap.cpp)
+    target_compile_features(bench_tee_original_enigmap PRIVATE cxx_std_20)
+    target_include_directories(bench_tee_original_enigmap PRIVATE
+        ${ENIGMAP_ROOT}/ods
+    )
+    target_link_libraries(bench_tee_original_enigmap PRIVATE
+        tiered_omap
+        ${ENIGMAP_COMMON_LIB}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+    )
+endif()
+
 add_executable(bench_tee_e2e benchmark/bench_tee_e2e.cpp)
 target_link_libraries(bench_tee_e2e PRIVATE tiered_omap)
 

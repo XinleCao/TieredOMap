@@ -80,6 +80,38 @@ Bytes PathORAM::access(int key, const Bytes* new_value) {
     return result;
 }
 
+Bytes PathORAM::access_update(
+    int key, const std::function<Bytes(const Bytes&)>& update) {
+    last_bw_.reset();
+
+    int old_leaf = pos_map_.at(key);
+    int new_leaf = random_leaf();
+    pos_map_[key] = new_leaf;
+
+    read_path_to_stash(old_leaf);
+
+    Bytes result;
+    Block* target = find_in_stash(key);
+    if (!target)
+        throw std::runtime_error("PathORAM::access_update: key " +
+                                 std::to_string(key) + " not found");
+    result = target->value;
+    if (update)
+        target->value = update(result);
+    target->leaf = new_leaf;
+
+    evict_and_write_path(old_leaf);
+    inject_round_delay();
+
+    last_bw_.rounds = 1;
+    int path_blocks = storage_->level() * bucket_size_;
+    last_bw_.bytes_downloaded = path_blocks * (block_size_bytes_ + 8);
+    last_bw_.bytes_uploaded = last_bw_.bytes_downloaded;
+    total_bw_ += last_bw_;
+
+    return result;
+}
+
 void PathORAM::dummy_access() {
     int leaf = random_leaf();
     read_path_to_stash(leaf);

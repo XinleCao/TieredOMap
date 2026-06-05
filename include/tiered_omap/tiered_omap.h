@@ -65,6 +65,19 @@ struct AccessResult {
     int  scan_fp = 0;
 };
 
+struct DynamicDebugState {
+    std::unordered_set<int> hot_keys;
+    std::unordered_set<int> phys_hot_keys;
+    std::unordered_set<int> cache_keys;
+    std::vector<int> hot_key_list;
+    std::vector<CacheEntry> cache_entries;
+    int pending_insert_key = INVALID_KEY;
+    bool pending_has_ref = false;
+    SwapState swap_state = SwapState::Idle;
+    int total_accesses = 0;
+    int obs_epoch = 0;
+};
+
 class TieredOMap {
 public:
     explicit TieredOMap(const TieredOMapConfig& config);
@@ -78,8 +91,10 @@ public:
     void demote(int key);
 
     void set_round_delay_us(int us) {
+        round_delay_us_ = us;
         if (hot_omap_) hot_omap_->set_round_delay_us(us);
         if (cold_omap_) cold_omap_->set_round_delay_us(us);
+        data_oram_.set_round_delay_us(us);
     }
 
     void set_channel(std::shared_ptr<TcpChannel> ch) { channel_ = std::move(ch); }
@@ -104,6 +119,7 @@ public:
 
     const std::vector<int>& hot_key_list() const { return hot_key_list_; }
     MaintenanceManager* maintenance_mgr() { return maint_.get(); }
+    DynamicDebugState dynamic_debug_state() const;
 
     void enable_maintenance(const MaintenanceConfig& mc);
 
@@ -112,6 +128,7 @@ private:
         if (blk < 0) { data_oram_.dummy_access(); return {}; }
         return data_oram_.access(blk, new_value);
     }
+    Bytes data_epoch_access(int blk, const Bytes* new_value, EpochMeta* out_meta);
 
     // Staggered maintenance steps (paper B1/B2/B3)
     void do_scan_step();
@@ -133,8 +150,10 @@ private:
                                     bool hot_dummy_pb = false,
                                     bool cold_dummy_pb = false);
     int next_scan_key();
+    int next_scan_key_excluding(int avoid_key);
     AccessResult interleaved_da_piggyback(int key, const Bytes* new_value);
     void run_interleaved_loop(OmapInterface* a, OmapInterface* b);
+    void inject_round_delay() const;
 
     // Cache-based maintenance state (paper Algorithm 2)
     std::unordered_set<int> cache_keys_;
@@ -158,6 +177,7 @@ private:
     std::deque<std::pair<int, int>> da_pending_demotions_;
     bool debug_access_ = false;
     bool force_cold_dummy_pb_ = false;
+    int round_delay_us_ = 0;
 };
 
 }  // namespace tiered_omap

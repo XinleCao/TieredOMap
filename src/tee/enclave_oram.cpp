@@ -1,20 +1,23 @@
 #include "tiered_omap/tee/enclave_oram.h"
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 
 namespace tiered_omap {
 namespace tee {
 
 EnclaveOram::EnclaveOram(int num_data, int value_size, int bucket_size,
-                         int stash_scale)
+                         int stash_scale, EnclaveOramLayout layout)
     : value_size_(value_size),
-      bucket_size_(bucket_size) {
+      bucket_size_(bucket_size),
+      layout_(layout) {
     level_ = std::max(1, ceil_log2(num_data));
     leaf_range_ = 1 << (level_ - 1);
     num_nodes_ = (1 << level_) - 1;
     stash_max_ = stash_scale * level_;
 
     tree_.resize(num_nodes_);
+    build_layout();
     for (auto& bucket : tree_) {
         bucket.blocks.resize(bucket_size_);
         for (auto& b : bucket.blocks)
@@ -43,7 +46,7 @@ std::unordered_map<int, int> EnclaveOram::init(
         int node = leaf_to_node(leaf);
         bool placed = false;
         while (node >= 0) {
-            auto& bucket = tree_[node];
+            auto& bucket = bucket_for_node(node);
             for (int j = 0; j < bucket_size_; ++j) {
                 if (bucket.blocks[j].key == INVALID_KEY) {
                     bucket.blocks[j] = {key, leaf, padded};
@@ -132,7 +135,7 @@ std::vector<int> EnclaveOram::read_path(int leaf) {
         nodes.push_back(node);
         record_node_access(node);
 
-        auto& bucket = tree_[node];
+        auto& bucket = bucket_for_node(node);
         for (int j = 0; j < bucket_size_; ++j) {
             // Unconditionally push every slot to stash — no branch on key.
             stash_.push_back(bucket.blocks[j]);
@@ -171,7 +174,7 @@ void EnclaveOram::evict_path(int /*leaf*/, const std::vector<int>& path_nodes) {
         int node = path_nodes[pi];
         record_node_access(node);
 
-        auto& bucket = tree_[node];
+        auto& bucket = bucket_for_node(node);
         for (int j = 0; j < bucket_size_; ++j) {
             int filled_i = 0;
             for (int si = 0; si < n; ++si) {
@@ -287,6 +290,69 @@ int EnclaveOram::node_byte_size() const {
     return bucket_size_ * (static_cast<int>(sizeof(int)) * 2 + value_size_);
 }
 
+void EnclaveOram::build_layout() {
+    logical_to_physical_.assign(num_nodes_, 0);
+
+    std::vector<int> order;
+    order.reserve(num_nodes_);
+
+    if (layout_ == EnclaveOramLayout::Heap) {
+        for (int i = 0; i < num_nodes_; ++i) order.push_back(i);
+    } else {
+        std::function<void(int, int)> add_veb = [&](int root, int height) {
+            if (height <= 0 || root >= num_nodes_) return;
+            if (height == 1) {
+                order.push_back(root);
+                return;
+            }
+
+            int top_h = (height + 1) / 2;
+            int bottom_h = height - top_h;
+            add_veb(root, top_h);
+
+            std::vector<int> frontier = {root};
+            for (int d = 0; d < top_h; ++d) {
+                std::vector<int> next;
+                for (int node : frontier) {
+                    int l = left_child(node);
+                    int r = right_child(node);
+                    if (l < num_nodes_) next.push_back(l);
+                    if (r < num_nodes_) next.push_back(r);
+                }
+                frontier = std::move(next);
+            }
+            for (int node : frontier)
+                add_veb(node, bottom_h);
+        };
+        add_veb(0, level_);
+    }
+
+    if (static_cast<int>(order.size()) != num_nodes_) {
+        std::vector<bool> seen(num_nodes_, false);
+        for (int node : order)
+            if (node >= 0 && node < num_nodes_) seen[node] = true;
+        for (int node = 0; node < num_nodes_; ++node)
+            if (!seen[node]) order.push_back(node);
+    }
+
+    for (int phys = 0; phys < static_cast<int>(order.size()); ++phys)
+        logical_to_physical_[order[phys]] = phys;
+}
+
+EnclaveOram::Bucket& EnclaveOram::bucket_for_node(int node_idx) {
+    return tree_[physical_node_index(node_idx)];
+}
+
+const EnclaveOram::Bucket& EnclaveOram::bucket_for_node(int node_idx) const {
+    return tree_[physical_node_index(node_idx)];
+}
+
+int EnclaveOram::physical_node_index(int node_idx) const {
+    if (node_idx < 0 || node_idx >= static_cast<int>(logical_to_physical_.size()))
+        return node_idx;
+    return logical_to_physical_[node_idx];
+}
+
 void EnclaveOram::begin_page_tracking() {
     touched_pages_.clear();
     node_access_count_ = 0;
@@ -299,7 +365,8 @@ uint64_t EnclaveOram::end_page_tracking() {
 void EnclaveOram::record_node_access(int node_idx) {
     ++node_access_count_;
     int bytes_per_node = node_byte_size();
-    uint64_t byte_start = static_cast<uint64_t>(node_idx) * bytes_per_node;
+    int phys_idx = physical_node_index(node_idx);
+    uint64_t byte_start = static_cast<uint64_t>(phys_idx) * bytes_per_node;
     uint64_t byte_end = byte_start + bytes_per_node;
     uint64_t page_start = byte_start / PAGE_SIZE;
     uint64_t page_end = (byte_end - 1) / PAGE_SIZE;

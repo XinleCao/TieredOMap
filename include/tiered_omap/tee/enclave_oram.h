@@ -11,6 +11,11 @@
 namespace tiered_omap {
 namespace tee {
 
+enum class EnclaveOramLayout {
+    Heap,
+    Veb
+};
+
 // Flat-memory ORAM tree for TEE mode.
 //
 // In SGX the tree resides in untrusted memory (or in EPC if small enough).
@@ -30,7 +35,8 @@ public:
 
     EnclaveOram() = default;
     EnclaveOram(int num_data, int value_size, int bucket_size = 4,
-                int stash_scale = 7);
+                int stash_scale = 7,
+                EnclaveOramLayout layout = EnclaveOramLayout::Heap);
 
     // Init returns a map of key -> assigned leaf for the caller to record.
     // If preset_leaves is non-empty, those assignments are used instead of
@@ -121,8 +127,10 @@ private:
     int leaf_range_ = 0;
     int num_nodes_ = 0;
     int stash_max_ = 0;
+    EnclaveOramLayout layout_ = EnclaveOramLayout::Heap;
 
     std::vector<Bucket> tree_;
+    std::vector<int> logical_to_physical_;
     std::vector<TreeBlock> stash_;
 
     Stats last_stats_;
@@ -137,6 +145,10 @@ private:
 
     // Page tracking helpers.
     int node_byte_size() const;
+    Bucket& bucket_for_node(int node_idx);
+    const Bucket& bucket_for_node(int node_idx) const;
+    int physical_node_index(int node_idx) const;
+    void build_layout();
     void record_node_access(int node_idx);
     std::unordered_map<uint64_t, bool> touched_pages_;
     uint64_t node_access_count_ = 0;

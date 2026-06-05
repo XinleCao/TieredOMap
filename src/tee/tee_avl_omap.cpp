@@ -13,8 +13,8 @@ static int node_oram_val_size(int user_val_size) {
 }
 
 TeeAvlOmap::TeeAvlOmap(int capacity, int value_size, int bucket_size,
-                        int split_depth)
-    : split_depth_(split_depth), value_size_(value_size) {
+                       int split_depth, EnclaveOramLayout layout)
+    : split_depth_(split_depth), value_size_(value_size), layout_(layout) {
     max_height_ = std::max(1,
         static_cast<int>(std::ceil(1.44 * std::log2(std::max(capacity, 2)))));
     if (split_depth_ > max_height_) split_depth_ = max_height_;
@@ -23,9 +23,10 @@ TeeAvlOmap::TeeAvlOmap(int capacity, int value_size, int bucket_size,
 
     if (split_depth_ > 0) {
         int upper_cap = (1 << split_depth_) - 1;
-        upper_oram_ = EnclaveOram(std::max(upper_cap, 1), nv, bucket_size);
+        upper_oram_ = EnclaveOram(
+            std::max(upper_cap, 1), nv, bucket_size, 7, layout_);
     }
-    lower_oram_ = EnclaveOram(capacity, nv, bucket_size);
+    lower_oram_ = EnclaveOram(capacity, nv, bucket_size, 7, layout_);
 }
 
 EnclaveOram& TeeAvlOmap::oram_for_depth(int depth) {

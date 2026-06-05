@@ -5,8 +5,10 @@
 #include "tiered_omap/network/tcp_channel.h"
 #include "tiered_omap/network/network_storage.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 namespace tiered_omap {
 
@@ -130,6 +132,8 @@ void TieredOMap::init(
     cold_omap_ = make_omap(config_.backend, cold_cap, true);
     hot_omap_->init(hot_refs);
     cold_omap_->init(cold_refs);
+    if (round_delay_us_ > 0)
+        set_round_delay_us(round_delay_us_);
 
     if (maint_) {
         int B = config_.maintenance.cache_size;
@@ -151,6 +155,43 @@ void TieredOMap::init(
     }
 }
 
+DynamicDebugState TieredOMap::dynamic_debug_state() const {
+    DynamicDebugState st;
+    st.hot_keys = hot_keys_;
+    st.phys_hot_keys = phys_hot_keys_;
+    st.cache_keys = cache_keys_;
+    st.hot_key_list = hot_key_list_;
+    st.pending_insert_key = pending_insert_key_;
+    st.pending_has_ref = !pending_insert_ref_.empty();
+    if (maint_) {
+        st.cache_entries = maint_->cache();
+        st.swap_state = maint_->swap_state();
+        st.total_accesses = maint_->total_access_count();
+        st.obs_epoch = maint_->obs_epoch();
+    }
+    return st;
+}
+
+Bytes TieredOMap::data_epoch_access(
+    int blk, const Bytes* new_value, EpochMeta* out_meta) {
+    if (blk < 0) {
+        data_oram_.dummy_access();
+        if (out_meta) *out_meta = {};
+        return {};
+    }
+
+    Bytes plain;
+    EpochMeta updated;
+    data_oram_.access_update(blk, [&](const Bytes& raw) {
+        auto [val, meta] = decode_epoch(raw);
+        updated = maint_->update_meta(meta);
+        plain = new_value ? *new_value : val;
+        return encode_with_epoch(plain, updated);
+    });
+    if (out_meta) *out_meta = updated;
+    return plain;
+}
+
 // ─── Main access ────────────────────────────────────────────────────────────
 
 AccessResult TieredOMap::access(int key, const Bytes* new_value) {
@@ -169,6 +210,7 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         bool cold_ins_piggybacked = false;
         bool hot_dummy_pb = false;
         bool cold_dummy_pb = false;
+        bool query_stats_ready = false;
 
         bool is_pending = (key == pending_insert_key_);
         bool is_in_cache = !is_pending && cache_keys_.count(key) > 0;
@@ -187,22 +229,24 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
                     (int)is_hot_logical, (int)is_hot_physical);
         }
         if (is_pending) {
-            // Pending entry: between scan eviction and B2 insertion.
-            // Serve from local; treat as logically in hot OMAP.
-            result.found_in_hot = true;
+            // Pending entry: between cache eviction and its fixed-rate
+            // insertion into the destination OMAP. The logical tier is tracked
+            // by hot_keys_: HotPend entries remain hot, ColdPend entries do not.
+            result.found_in_hot = is_hot_logical;
             int blk = ref_to_blk(pending_insert_ref_);
-            Bytes raw = data_access(blk);
-            auto [val, meta] = decode_epoch(raw);
-            meta = maint_->update_meta(meta);
-            Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
-            result.value = new_value ? *new_value : val;
+            EpochMeta meta;
+            result.value = data_epoch_access(blk, new_value, &meta);
             result.last_access_fp = meta.fp;
-            data_access(blk, &wb);
-            hot_omap_->dummy_access();
-            if (config_.mode == SecurityMode::FullOblivious)
+            if (config_.mode == SecurityMode::FullOblivious) {
+                hot_omap_->dummy_access();
                 cold_omap_->dummy_access();
-            else
+            } else if (is_hot_logical) {
+                hot_omap_->dummy_access();
                 cold_omap_->partial_dummy_access();
+            } else {
+                hot_omap_->partial_dummy_access();
+                cold_omap_->dummy_access();
+            }
         } else if (can_interleave && !is_in_cache) {
             bool use_partial = (config_.mode == SecurityMode::TierMembership);
             bool do_pb = config_.maintenance.piggyback;
@@ -214,8 +258,10 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             if (do_pb) {
                 bool do_scan = maint_->should_scan()
                                && !is_da_hot()
-                               && maint_->swap_state() == SwapState::Idle;
-                scan_key = do_scan ? next_scan_key() : INVALID_KEY;
+                               && maint_->swap_state() == SwapState::Idle
+                               && is_hot_logical;
+                scan_key = do_scan ? next_scan_key_excluding(key)
+                                   : INVALID_KEY;
                 if (scan_key != INVALID_KEY) scan_piggybacked = true;
 
                 bool can_pb_hot = is_hot_physical || !use_partial;
@@ -248,6 +294,7 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             result.total_bw = ir.total_bw;
             result.rounds_to_answer = ir.rounds_to_answer;
             result.last_access_fp = ir.last_access_fp;
+            query_stats_ready = true;
             if (debug_access_) {
                 fprintf(stderr, "[DBG] key=%d pb=%d scan=%d hins=%d cins=%d hdpb=%d cdpb=%d "
                         "ir_rnd=%d ir_rta=%d ir_bw=%.0f\n",
@@ -338,12 +385,9 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             // Cache hit: direct data access, dummy both OMAPs
             Bytes ref = cache_data_refs_[key];
             int blk = ref_to_blk(ref);
-            Bytes raw = data_access(blk);
-            auto [val, meta] = decode_epoch(raw);
-            meta = maint_->update_meta(meta);
-            Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
-            result.value = new_value ? *new_value : val;
-            data_access(blk, &wb);
+            EpochMeta meta;
+            result.value = data_epoch_access(blk, new_value, &meta);
+            result.last_access_fp = meta.fp;
             maint_->update_cache_fp(key, meta.fp);
             hot_omap_->dummy_access();
             if (config_.mode == SecurityMode::FullOblivious)
@@ -358,13 +402,9 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
                                                     : hot_omap_.get();
             Bytes ref = target->search(key);
             int blk = ref_to_blk(ref);
-            Bytes raw = data_access(blk);
-            auto [val, meta] = decode_epoch(raw);
-            meta = maint_->update_meta(meta);
-            Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
-            result.value = new_value ? *new_value : val;
+            EpochMeta meta;
+            result.value = data_epoch_access(blk, new_value, &meta);
             result.last_access_fp = meta.fp;
-            data_access(blk, &wb);
 
             if (config_.mode == SecurityMode::FullOblivious)
                 other->dummy_access();
@@ -405,24 +445,32 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             }
         }
 
-        // Bandwidth for epoch paths
-        result.hot_bw = hot_omap_->last_stats();
-        result.cold_bw = cold_omap_->last_stats();
-        auto data_bw = data_oram_.last_stats();
-        result.total_bw.bytes_downloaded =
-            result.hot_bw.bytes_downloaded + result.cold_bw.bytes_downloaded +
-            data_bw.bytes_downloaded;
-        result.total_bw.bytes_uploaded =
-            result.hot_bw.bytes_uploaded + result.cold_bw.bytes_uploaded +
-            data_bw.bytes_uploaded;
-        result.total_bw.rounds =
-            std::max(result.hot_bw.rounds, result.cold_bw.rounds) +
-            data_bw.rounds;
+        if (!query_stats_ready) {
+            // Non-interleaved epoch paths above execute their OMAP/data ORAM
+            // operations sequentially, so total interaction rounds are additive.
+            result.hot_bw = hot_omap_->last_stats();
+            result.cold_bw = cold_omap_->last_stats();
+            auto data_bw = data_oram_.last_stats();
+            result.total_bw.bytes_downloaded =
+                result.hot_bw.bytes_downloaded + result.cold_bw.bytes_downloaded +
+                data_bw.bytes_downloaded;
+            result.total_bw.bytes_uploaded =
+                result.hot_bw.bytes_uploaded + result.cold_bw.bytes_uploaded +
+                data_bw.bytes_uploaded;
+            result.total_bw.rounds =
+                result.hot_bw.rounds + result.cold_bw.rounds + data_bw.rounds;
 
-        if (is_hot_logical)
-            result.rounds_to_answer = static_cast<int>(result.hot_bw.rounds) + 1;
-        else
-            result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
+            if (is_in_cache || is_pending) {
+                result.rounds_to_answer = result.found_in_hot
+                    ? static_cast<int>(data_bw.rounds)
+                    : static_cast<int>(result.total_bw.rounds);
+            } else if (is_hot_logical) {
+                result.rounds_to_answer =
+                    static_cast<int>(result.hot_bw.rounds + data_bw.rounds);
+            } else {
+                result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
+            }
+        }
 
         // ── Staggered maintenance (B1/B2/B3 at different phase offsets) ──
         auto h_before = hot_omap_->total_stats();
@@ -546,6 +594,27 @@ int TieredOMap::next_scan_key() {
     int sk = *it;
     maint_->set_scan_ptr(sk);
     return sk;
+}
+
+int TieredOMap::next_scan_key_excluding(int avoid_key) {
+    if (hot_key_list_.empty()) return INVALID_KEY;
+    if (hot_key_list_.size() == 1 && hot_key_list_.front() == avoid_key)
+        return INVALID_KEY;
+
+    auto it = std::upper_bound(
+        hot_key_list_.begin(), hot_key_list_.end(), maint_->scan_ptr());
+    for (size_t seen = 0; seen < hot_key_list_.size(); ++seen) {
+        if (it == hot_key_list_.end()) {
+            maint_->reset_scan_ptr();
+            it = hot_key_list_.begin();
+        }
+        int sk = *it;
+        ++it;
+        if (sk == avoid_key) continue;
+        maint_->set_scan_ptr(sk);
+        return sk;
+    }
+    return INVALID_KEY;
 }
 
 // ─── Staggered maintenance steps ────────────────────────────────────────────
@@ -694,6 +763,11 @@ void TieredOMap::demote(int key) {
 
 // ─── Interleaved helpers ────────────────────────────────────────────────────
 
+void TieredOMap::inject_round_delay() const {
+    if (round_delay_us_ > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(round_delay_us_));
+}
+
 void TieredOMap::run_interleaved_loop(OmapInterface* a, OmapInterface* b) {
     while (!a->step_done() || !b->step_done()) {
         bool a_active = !a->step_done();
@@ -736,6 +810,7 @@ void TieredOMap::run_interleaved_loop(OmapInterface* a, OmapInterface* b) {
         }
 
         batch_write_paths(*channel_, writes);
+        inject_round_delay();
     }
 }
 
@@ -751,6 +826,39 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                             bool cold_dummy_pb) {
     AccessResult result;
     bool fo = !use_partial_dummy;
+
+    if (use_partial_dummy && !epoch_mode) {
+        bool is_hot = hot_keys_.count(key) > 0;
+        OmapInterface* target = is_hot ? hot_omap_.get() : cold_omap_.get();
+        OmapInterface* other  = is_hot ? cold_omap_.get() : hot_omap_.get();
+
+        target->begin_step_search(key, nullptr);
+        other->begin_step_partial_dummy();
+        run_interleaved_loop(target, other);
+
+        Bytes ref = target->step_finish();
+        other->step_finish();
+
+        result.found_in_hot = is_hot;
+        int blk = ref_to_blk(ref);
+        result.value = data_access(blk, new_value);
+
+        result.hot_bw = hot_omap_->last_stats();
+        result.cold_bw = cold_omap_->last_stats();
+        auto data_bw = data_oram_.last_stats();
+        result.total_bw.bytes_downloaded =
+            result.hot_bw.bytes_downloaded + result.cold_bw.bytes_downloaded +
+            data_bw.bytes_downloaded;
+        result.total_bw.bytes_uploaded =
+            result.hot_bw.bytes_uploaded + result.cold_bw.bytes_uploaded +
+            data_bw.bytes_uploaded;
+        result.total_bw.rounds =
+            std::max(result.hot_bw.rounds, result.cold_bw.rounds) +
+            data_bw.rounds;
+        result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
+        if (!is_hot) result.cold_ref = ref;
+        return result;
+    }
 
     // ── Both OMAPs search in parallel (no searcher/dummy split) ──
     hot_omap_->begin_step_search(key, nullptr);
@@ -802,6 +910,7 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
     int  computed_fp  = 0;
     bool decision_triggered = false;
     bool decision_pending   = false;
+    bool maintenance_transition_reserved = false;
 
     auto setup_data_oram = [&](DStep& st, int& blk, int& leaf, int& new_leaf,
                                const Bytes& ref) {
@@ -912,10 +1021,12 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             if (decision_pending) {
                 bool should_prom = computed_fp > 0
                     && maint_ && maint_->swap_state() == SwapState::Idle
+                    && !maintenance_transition_reserved
                     && maint_->should_promote(computed_fp);
                 if (should_prom) {
                     cold_omap_->step_commit_remove();
                     result.cold_promotion_done = true;
+                    maintenance_transition_reserved = true;
                 } else {
                     cold_omap_->step_commit_noop();
                 }
@@ -930,11 +1041,15 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                 Block sb = data_oram_.extract_from_stash(scan_data_blk);
                 if (epoch_mode && maint_) {
                     auto [sv, sm] = decode_epoch(sb.value);
-                    bool should_demote = maint_->should_demote_cache(sm.fp);
+                    bool should_demote =
+                        maint_->swap_state() == SwapState::Idle
+                        && !maintenance_transition_reserved
+                        && maint_->should_demote_cache(sm.fp);
                     if (should_demote) {
                         hot_omap_->piggyback_commit_remove();
                         result.scan_demoted = true;
                         result.scan_fp = sm.fp;
+                        maintenance_transition_reserved = true;
                     } else {
                         hot_omap_->piggyback_commit_noop();
                     }
@@ -1043,6 +1158,7 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             scan_data_st = DONE;
         }
         batch_write_paths(*channel_, writes);
+        inject_round_delay();
     }
 
     // ── Cleanup ──

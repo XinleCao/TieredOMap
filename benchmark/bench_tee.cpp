@@ -65,7 +65,7 @@ static void run_all(const Config& cfg) {
     csv << "logN,config,hot_us,cold_us,total_us,hit_pct,enclave_KB\n";
 
     std::cout << "=== TEE Full Benchmark ===\n";
-    std::cout << std::setw(6) << "logN" << std::setw(14) << "config"
+    std::cout << std::setw(6) << "logN" << std::setw(18) << "config"
               << std::setw(10) << "hot_us" << std::setw(10) << "cold_us"
               << std::setw(10) << "total_us"
               << std::setw(8)  << "hit%"
@@ -81,9 +81,10 @@ static void run_all(const Config& cfg) {
         auto hk = make_hot_keys(n);
         ZipfSampler zipf(N, cfg.s, 42);
 
-        // ── Flat AVL OMAP (baseline) ──
+        // ── Flat AVL OMAP (plain baseline / ablation) ──
         {
-            TeeAvlOmap flat(N, cfg.value_size, 4, 0);
+            TeeAvlOmap flat(
+                N, cfg.value_size, 4, 0, EnclaveOramLayout::Heap);
             flat.init(data);
 
             double sum_us = 0, sum_pages = 0;
@@ -98,13 +99,43 @@ static void run_all(const Config& cfg) {
             double avg_us = sum_us / cfg.Q;
             double avg_kb = sum_pages / cfg.Q * PAGE_SIZE / 1024.0;
 
-            std::cout << std::setw(6) << logN << std::setw(14) << "flat_avl"
+            std::cout << std::setw(6) << logN << std::setw(18) << "flat_avl_plain"
                       << std::setw(10) << std::fixed << std::setprecision(1) << avg_us
                       << std::setw(10) << avg_us
                       << std::setw(10) << avg_us
                       << std::setw(8) << "-"
                       << std::setw(12) << std::setprecision(0) << avg_kb << "\n";
-            csv << logN << ",flat_avl,"
+            csv << logN << ",flat_avl_plain,"
+                << std::fixed << std::setprecision(1)
+                << avg_us << "," << avg_us << "," << avg_us << ",,"
+                << std::setprecision(0) << avg_kb << "\n";
+        }
+
+        // ── ENIGMAP-style flat AVL OMAP (fair TEE baseline) ──
+        {
+            TeeAvlOmap flat(
+                N, cfg.value_size, 4, 0, EnclaveOramLayout::Veb);
+            flat.init(data);
+
+            double sum_us = 0, sum_pages = 0;
+            for (int q = 0; q < cfg.Q; ++q) {
+                int key = zipf.sample();
+                auto t0 = Clock::now();
+                flat.search(key);
+                auto t1 = Clock::now();
+                sum_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                sum_pages += flat.last_stats().total_pages();
+            }
+            double avg_us = sum_us / cfg.Q;
+            double avg_kb = sum_pages / cfg.Q * PAGE_SIZE / 1024.0;
+
+            std::cout << std::setw(6) << logN << std::setw(18) << "flat_avl_enig"
+                      << std::setw(10) << std::fixed << std::setprecision(1) << avg_us
+                      << std::setw(10) << avg_us
+                      << std::setw(10) << avg_us
+                      << std::setw(8) << "-"
+                      << std::setw(12) << std::setprecision(0) << avg_kb << "\n";
+            csv << logN << ",flat_avl_enig,"
                 << std::fixed << std::setprecision(1)
                 << avg_us << "," << avg_us << "," << avg_us << ",,"
                 << std::setprecision(0) << avg_kb << "\n";
@@ -118,6 +149,7 @@ static void run_all(const Config& cfg) {
             tcfg.value_size = cfg.value_size;
             tcfg.mode = TeeSecurityMode::FullOblivious;
             tcfg.use_split_oram = true;
+            tcfg.oram_layout = EnclaveOramLayout::Veb;
 
             TeeOmap omap(tcfg);
             omap.init(data, hk);
@@ -155,13 +187,13 @@ static void run_all(const Config& cfg) {
             double hit = 100.0 * hot_cnt / cfg.Q;
             double avg_kb = sum_pages / cfg.Q * PAGE_SIZE / 1024.0;
 
-            std::cout << std::setw(6) << logN << std::setw(14) << "packed_FO"
+            std::cout << std::setw(6) << logN << std::setw(18) << "packed_FO_enig"
                       << std::setw(10) << std::fixed << std::setprecision(1) << avg_hot
                       << std::setw(10) << avg_cold
                       << std::setw(10) << avg_total
                       << std::setw(8) << std::setprecision(0) << hit
                       << std::setw(12) << avg_kb << "\n";
-            csv << logN << ",packed_FO,"
+            csv << logN << ",packed_FO_enig,"
                 << std::fixed << std::setprecision(1)
                 << avg_hot << "," << avg_cold << "," << avg_total << ","
                 << hit << "," << std::setprecision(0) << avg_kb << "\n";
@@ -175,6 +207,7 @@ static void run_all(const Config& cfg) {
             tcfg.value_size = cfg.value_size;
             tcfg.mode = TeeSecurityMode::TierMembership;
             tcfg.use_split_oram = true;
+            tcfg.oram_layout = EnclaveOramLayout::Veb;
 
             TeeOmap omap(tcfg);
             omap.init(data, hk);
@@ -208,13 +241,13 @@ static void run_all(const Config& cfg) {
             double hit = 100.0 * hot_cnt / cfg.Q;
             double avg_kb = sum_pages / cfg.Q * PAGE_SIZE / 1024.0;
 
-            std::cout << std::setw(6) << logN << std::setw(14) << "packed_TM"
+            std::cout << std::setw(6) << logN << std::setw(18) << "packed_TM_enig"
                       << std::setw(10) << std::fixed << std::setprecision(1) << avg_hot
                       << std::setw(10) << avg_cold
                       << std::setw(10) << avg_total
                       << std::setw(8) << std::setprecision(0) << hit
                       << std::setw(12) << avg_kb << "\n";
-            csv << logN << ",packed_TM,"
+            csv << logN << ",packed_TM_enig,"
                 << std::fixed << std::setprecision(1)
                 << avg_hot << "," << avg_cold << "," << avg_total << ","
                 << hit << "," << std::setprecision(0) << avg_kb << "\n";

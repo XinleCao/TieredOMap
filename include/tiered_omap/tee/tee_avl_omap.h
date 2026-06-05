@@ -27,7 +27,8 @@ public:
     };
 
     TeeAvlOmap(int capacity, int value_size, int bucket_size = 4,
-               int split_depth = 0);
+               int split_depth = 0,
+               EnclaveOramLayout layout = EnclaveOramLayout::Heap);
 
     void init(const std::vector<std::pair<int, Bytes>>& data);
 
@@ -89,6 +90,7 @@ private:
     int max_height_ = 0;
     int split_depth_ = 0;
     int value_size_ = 0;
+    EnclaveOramLayout layout_ = EnclaveOramLayout::Heap;
 
     int root_key_ = INVALID_KEY;
     int root_leaf_ = INVALID_LEAF;

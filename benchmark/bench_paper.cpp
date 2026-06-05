@@ -17,6 +17,7 @@
 //   wan_static      — WAN validation: static hot set
 //   wan_dynamic     — WAN validation: dynamic maintenance
 //   all             — Run all of the above sequentially
+//   client_fo       — Revised client/server mainline: standalone/fair/FO only
 
 #include "tiered_omap/tiered_omap.h"
 #include "tiered_omap/omap/avl_omap.h"
@@ -551,6 +552,105 @@ static void exp_modes(const Cfg& cfg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp: Revised client/server mainline — no per-query tier-membership leakage.
+// Reports flat baselines and TieredOMap in FO mode only.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_client_fo(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Revised Client/Server Mainline (FO only) ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/client_fo.csv");
+    csv << "backend,logN,type,avg_bw_KB,avg_rounds,avg_answer_rnd,hit_pct\n";
+
+    for (auto& [label, be] : ALL_BACKENDS) {
+        if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
+            continue;
+
+        for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
+            int N = 1 << logN;
+            int n = std::min(cfg.n, N / 2);
+
+            {
+                g_progress.config(std::string(label) + " logN="
+                                  + std::to_string(logN) + " standalone");
+                auto omap = setup_standalone(cfg, be, N);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+                double bw = 0.0, rnd = 0.0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    omap->search(z.sample());
+                    bw += omap->last_stats().total_bytes();
+                    rnd += omap->last_stats().rounds;
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                bw /= cfg.Q; rnd /= cfg.Q;
+                csv << label << "," << logN << ",standalone,"
+                    << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                    << std::setprecision(1) << rnd << "," << rnd << ",\n";
+                std::ostringstream ss;
+                ss << (int)(bw / 1024) << "KB " << (int)rnd << "rnd";
+                g_progress.config_done(ss.str());
+            }
+
+            {
+                g_progress.config(std::string(label) + " logN="
+                                  + std::to_string(logN) + " fair");
+                auto ido = setup_fair_baseline(cfg, be, N);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) ido.search(z.sample());
+                double bw = 0.0, rnd = 0.0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    ido.search(z.sample());
+                    bw += ido.total_bytes();
+                    rnd += ido.rounds();
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                bw /= cfg.Q; rnd /= cfg.Q;
+                csv << label << "," << logN << ",fair,"
+                    << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                    << std::setprecision(1) << rnd << "," << rnd << ",\n";
+                std::ostringstream ss;
+                ss << (int)(bw / 1024) << "KB " << (int)rnd << "rnd";
+                g_progress.config_done(ss.str());
+            }
+
+            {
+                g_progress.config(std::string(label) + " logN="
+                                  + std::to_string(logN) + " tiered_FO");
+                auto fo = setup_tiered(cfg, be, N, n,
+                                       SecurityMode::FullOblivious, true);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) fo->access(z.sample());
+                double bw = 0.0, rnd = 0.0, ans = 0.0;
+                int hot = 0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    auto r = fo->access(z.sample());
+                    bw += r.total_bw.total_bytes();
+                    rnd += r.total_bw.rounds;
+                    ans += r.total_bw.rounds;
+                    if (r.found_in_hot) ++hot;
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                bw /= cfg.Q; rnd /= cfg.Q; ans /= cfg.Q;
+                double hit = 100.0 * hot / cfg.Q;
+                csv << label << "," << logN << ",tiered_FO,"
+                    << std::fixed << std::setprecision(2) << bw / 1024 << ","
+                    << std::setprecision(1) << rnd << "," << ans << ","
+                    << hit << "\n";
+                std::ostringstream ss;
+                ss << (int)(bw / 1024) << "KB " << (int)rnd
+                   << "rnd hit=" << (int)hit << "%";
+                g_progress.config_done(ss.str());
+            }
+
+            csv.flush();
+        }
+    }
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/client_fo.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Exp: Backend comparison — standalone OMAP performance  (Fig 3, 4)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -903,6 +1003,13 @@ static void exp_skewness(const Cfg& cfg) {
     std::cout << "\n=== Exp: Skewness + Hot-Set Size Effect ===\n";
     ensure_dir(cfg.outdir);
     run_skewness_backend(cfg, OmapBackend::AVL, "AVL", "skewness");
+    run_skewness_backend(cfg, OmapBackend::BPlus, "BPlus", "skewness_bplus");
+    run_skewness_backend(cfg, OmapBackend::DaBplus, "DaBplus", "skewness_dabplus");
+}
+
+static void exp_skewness_bplus_only(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Skewness (BPlus + DaBplus only) ===\n";
+    ensure_dir(cfg.outdir);
     run_skewness_backend(cfg, OmapBackend::BPlus, "BPlus", "skewness_bplus");
     run_skewness_backend(cfg, OmapBackend::DaBplus, "DaBplus", "skewness_dabplus");
 }
@@ -1917,6 +2024,7 @@ static void exp_dynamic_overhead(const Cfg& cfg) {
         g_progress.config("static setup");
         auto tm = setup_tiered(c, be, N, n, m, true,
                                0, OmapBackend::BPlus, true);
+        if (c.rtt_us > 0) tm->set_round_delay_us(c.rtt_us);
         g_progress.config_done("ok");
 
         g_progress.config("static warmup");
@@ -1968,6 +2076,7 @@ static void exp_dynamic_overhead(const Cfg& cfg) {
         g_progress.config(std::string(tag) + " setup");
         auto tm = setup_tiered(c, be, N, n, m, true,
                                0, OmapBackend::BPlus, true, mc);
+        if (c.rtt_us > 0) tm->set_round_delay_us(c.rtt_us);
         g_progress.config_done("ok");
 
         g_progress.config(std::string(tag) + " warmup");
@@ -1998,11 +2107,9 @@ static void exp_dynamic_overhead(const Cfg& cfg) {
                     try { tm->access(z_fill.sample()); }
                     catch (const std::exception&) { ++meas_err; }
                 }
-                if (cycle == 0) tm->set_debug_access(true);
                 try {
                     auto t0 = Clock::now();
                     auto r = tm->access(target);
-                    if (cycle == 0) tm->set_debug_access(false);
                     double elapsed = std::chrono::duration<double, std::milli>(
                         Clock::now() - t0).count();
                     double frac = r.total_bw.rounds > 0
@@ -2014,7 +2121,6 @@ static void exp_dynamic_overhead(const Cfg& cfg) {
                     out.tms += elapsed;
                     ++out.cnt;
                 } catch (const std::exception&) {
-                    if (cycle == 0) tm->set_debug_access(false);
                     ++meas_err;
                 }
             }
@@ -2452,7 +2558,9 @@ static void exp_pb_overhead(const Cfg& cfg) {
         int n = std::min(cfg.n, N / 2);
         std::cout << "\n--- logN=" << logN << " N=" << N << " n=" << n << " ---\n";
 
-        for (auto& [label, be] : BACKENDS) {
+        for (const auto& spec : BACKENDS) {
+            const char* label = spec.label;
+            OmapBackend be = spec.backend;
             if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
                 continue;
             bool da_hot = (be == OmapBackend::DaBplus);
@@ -2557,12 +2665,14 @@ int main(int argc, char** argv) {
     struct ExpEntry { const char* name; void (*fn)(const Cfg&); };
     ExpEntry exps[] = {
         {"bandwidth",       exp_bandwidth},
+        {"client_fo",       exp_client_fo},
         {"modes",           exp_modes},
         {"backend_cmp",     exp_backend_cmp},
         {"tiered_backend",  exp_tiered_backend},
         {"latency",         exp_latency},
         {"throughput",      exp_throughput},
         {"skewness",        exp_skewness},
+        {"skewness_bplus",  exp_skewness_bplus_only},
         {"hotsize",         exp_hotsize},
         {"split_ablation",  exp_split_ablation},
         {"dynamic",         exp_dynamic},

@@ -44,7 +44,7 @@ TeeOmap::TeeOmap(const TeeOmapConfig& config) : config_(config) {
     int sv = stored_value_size();
     hot_dir_ = std::make_unique<PackedDirectory>(hot_capacity_);
     hot_oram_ = std::make_unique<EnclaveOram>(
-        hot_capacity_, sv, config_.bucket_size);
+        hot_capacity_, sv, config_.bucket_size, 7, config_.oram_layout);
 
     int cold_cap = config_.maintenance.enabled
                  ? std::max(N - n, N)
@@ -53,7 +53,8 @@ TeeOmap::TeeOmap(const TeeOmapConfig& config) : config_(config) {
                     ? std::max(1, ceil_log2(std::max(n, 2)))
                     : 0;
     cold_omap_ = std::make_unique<TeeAvlOmap>(
-        cold_cap, sv, config_.bucket_size, split_depth);
+        cold_cap, sv, config_.bucket_size, split_depth,
+        config_.oram_layout);
 }
 
 // ── Init ────────────────────────────────────────────────────────────────────

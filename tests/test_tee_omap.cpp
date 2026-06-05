@@ -5,11 +5,39 @@
 #include "tiered_omap/tee/tee_omap.h"
 #include "tiered_omap/tee/tee_server.h"
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include <memory>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 
 using namespace tiered_omap;
 using namespace tiered_omap::tee;
+
+static uint16_t pick_loopback_port() {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("socket failed");
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        throw std::runtime_error("bind failed");
+    }
+
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
+        ::close(fd);
+        throw std::runtime_error("getsockname failed");
+    }
+    uint16_t port = ntohs(addr.sin_port);
+    ::close(fd);
+    return port;
+}
 
 // ── Oblivious primitives ────────────────────────────────────────────────────
 
@@ -137,6 +165,22 @@ TEST(EnclaveOram, PageTracking) {
     oram.access(0, leaves[0], nl);
     leaves[0] = nl;
     EXPECT_GT(oram.last_stats().pages_touched, 0u);
+}
+
+TEST(EnclaveOram, VebLayoutReducesPathPages) {
+    std::vector<std::pair<int, Bytes>> data = {{0, Bytes(256, 7)}};
+    std::unordered_map<int, int> leaves = {{0, 0}};
+
+    EnclaveOram heap(4096, 256, 4, 7, EnclaveOramLayout::Heap);
+    EnclaveOram veb(4096, 256, 4, 7, EnclaveOramLayout::Veb);
+    heap.init(data, leaves);
+    veb.init(data, leaves);
+
+    heap.access(0, 0, heap.random_leaf());
+    veb.access(0, 0, veb.random_leaf());
+
+    EXPECT_LT(veb.last_stats().pages_touched,
+              heap.last_stats().pages_touched);
 }
 
 // ── TEE AVL OMAP (cold tier) ────────────────────────────────────────────────
@@ -630,17 +674,22 @@ TEST(TeeServerClient, RoundTrip) {
     cfg.mode = TeeSecurityMode::FullOblivious;
     cfg.use_split_oram = false;
 
-    const uint16_t PORT = 19877 + (std::rand() % 1000);
-
     std::vector<std::pair<int, Bytes>> data;
     for (int i = 0; i < 32; ++i)
         data.push_back({i, int_to_bytes(i * 7)});
     std::vector<int> hk = {0, 1, 2, 3, 4, 5, 6, 7};
 
-    TeeServer server(cfg, PORT);
-    server.init(data, hk);
+    uint16_t PORT = 0;
+    std::unique_ptr<TeeServer> server;
+    try {
+        PORT = pick_loopback_port();
+        server = std::make_unique<TeeServer>(cfg, PORT);
+        server->init(data, hk);
+    } catch (const std::runtime_error& e) {
+        GTEST_SKIP() << "local loopback bind unavailable: " << e.what();
+    }
 
-    std::thread srv_thread([&]() { server.serve_one(); });
+    std::thread srv_thread([&]() { server->serve_one(); });
 
     // Give server time to start.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

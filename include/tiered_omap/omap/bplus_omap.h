@@ -136,6 +136,8 @@ private:
     };
 
     PathORAM& oram_for_depth(int depth);
+    Block extract_node(PathORAM& o, int id, const char* context,
+                       int depth, int requested_leaf);
     void move_to_local(int id, int leaf, int parent_id, int depth);
     void move_to_sibling_cache(int id, int leaf, int parent_local_idx, int child_idx, int depth);
     int traverse_with_siblings(int key);

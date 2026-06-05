@@ -32,6 +32,7 @@ struct TeeOmapConfig {
     int bucket_size = 4;       // Z
     TeeSecurityMode mode = TeeSecurityMode::FullOblivious;
     bool use_split_oram = true;
+    EnclaveOramLayout oram_layout = EnclaveOramLayout::Veb;
     TeeMaintenanceConfig maintenance;
 };
 

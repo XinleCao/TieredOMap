@@ -5,6 +5,7 @@
 #include "tiered_omap/network/storage_interface.h"
 #include "tiered_omap/oram/binary_tree_storage.h"
 #include <chrono>
+#include <functional>
 #include <thread>
 #include <unordered_map>
 
@@ -39,6 +40,7 @@ public:
     }
 
     Bytes access(int key, const Bytes* new_value = nullptr);
+    Bytes access_update(int key, const std::function<Bytes(const Bytes&)>& update);
     void dummy_access();
 
     void read_path_to_stash(int leaf);

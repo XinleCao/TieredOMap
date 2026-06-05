@@ -291,10 +291,28 @@ int BPlusOmap::find_leaf_index(const BPlusNode& node, int key) {
     return -1;
 }
 
+Block BPlusOmap::extract_node(PathORAM& o, int id, const char* context,
+                              int depth, int requested_leaf) {
+    try {
+        return o.extract_from_stash(id);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("BPlusOmap::") + context +
+            " id=" + std::to_string(id) +
+            " depth=" + std::to_string(depth) +
+            " requested_leaf=" + std::to_string(requested_leaf) +
+            " pos_leaf=" + std::to_string(o.get_leaf(id)) +
+            " root_id=" + std::to_string(root_id_) +
+            " root_leaf=" + std::to_string(root_leaf_) +
+            " store_id=" + std::to_string(o.get_store_id()) +
+            ": " + e.what());
+    }
+}
+
 void BPlusOmap::move_to_local(int id, int leaf, int parent_id, int depth) {
     PathORAM& o = oram_for_depth(depth);
     o.read_path_to_stash(leaf);
-    Block block = o.extract_from_stash(id);
+    Block block = extract_node(o, id, "move_to_local", depth, leaf);
     BPlusNode nd = BPlusNode::decode(block.value);
     local_.push_back({id, block.leaf, nd, parent_id, depth});
     o.evict_and_write_path(leaf);
@@ -310,7 +328,7 @@ void BPlusOmap::move_to_sibling_cache(int id, int leaf,
                                        int depth) {
     PathORAM& o = oram_for_depth(depth);
     o.read_path_to_stash(leaf);
-    Block block = o.extract_from_stash(id);
+    Block block = extract_node(o, id, "move_to_sibling_cache", depth, leaf);
     BPlusNode nd = BPlusNode::decode(block.value);
     sibling_cache_.push_back({id, block.leaf, nd, parent_local_idx, child_idx, depth});
     o.evict_and_write_path(leaf);
@@ -383,6 +401,7 @@ int BPlusOmap::traverse_with_siblings(int key) {
     sibling_cache_.clear();
 
     int cur_id = root_id_;
+    root_leaf_ = oram_for_depth(0).get_leaf(root_id_);
     int cur_leaf = root_leaf_;
     int ops_start = op_count_;
 
@@ -927,6 +946,7 @@ void BPlusOmap::begin_step_search(int key, const Bytes* update) {
         ss_.pad_remaining = ss_.budget;
     } else {
         ss_.phase = StepPhase::TRAVERSE_TARGET;
+        root_leaf_ = oram_for_depth(0).get_leaf(root_id_);
         ss_.cur_id = root_id_;
         ss_.cur_leaf = root_leaf_;
         ss_.depth = 0;
@@ -1008,6 +1028,29 @@ OramStepRound BPlusOmap::step_next_round() {
             pb_.node_in_local = false;
             for (auto& ln : local_)
                 if (ln.id == pb_.cur_id) { pb_.node_in_local = true; break; }
+            if (!pb_.node_in_local &&
+                ss_.round_read &&
+                ss_.phase == StepPhase::TRAVERSE_TARGET &&
+                ss_.cur_id == pb_.cur_id &&
+                ss_.cur_round_depth == pb_.depth) {
+                pb_.node_in_local = true;
+                pb_.round_read = false;
+                pb_.cur_round_depth = ss_.cur_round_depth;
+                pb_.cur_round_leaf = ss_.cur_round_leaf;
+                return r;
+            }
+            if (!pb_.node_in_local &&
+                ss_.round_read &&
+                ss_.phase == StepPhase::TRAVERSE_SIBLING &&
+                !ss_.sibling_is_dummy &&
+                ss_.sib_id == pb_.cur_id &&
+                ss_.cur_round_depth == pb_.depth) {
+                pb_.node_in_local = true;
+                pb_.round_read = false;
+                pb_.cur_round_depth = ss_.cur_round_depth;
+                pb_.cur_round_leaf = ss_.cur_round_leaf;
+                return r;
+            }
             PathORAM& po = oram_for_depth(pb_.depth);
             leaf = pb_.node_in_local ? po.random_leaf() : pb_.cur_leaf;
             pb_.cur_round_depth = pb_.depth;
@@ -1059,7 +1102,8 @@ void BPlusOmap::step_apply_reads(const std::vector<PathData>& results) {
 void BPlusOmap::step_process() {
     if (ss_.phase == StepPhase::TRAVERSE_TARGET) {
         PathORAM& to = oram_for_depth(ss_.depth);
-        Block block = to.extract_from_stash(ss_.cur_id);
+        Block block = extract_node(to, ss_.cur_id, "main_target",
+                                   ss_.depth, ss_.cur_leaf);
         BPlusNode nd = BPlusNode::decode(block.value);
         int parent = local_.empty() ? INVALID_KEY : local_.back().id;
         local_.push_back({ss_.cur_id, block.leaf, nd, parent, ss_.depth});
@@ -1108,7 +1152,8 @@ void BPlusOmap::step_process() {
         int sib_depth = ss_.depth + 1;
         if (!ss_.sibling_is_dummy) {
             PathORAM& so = oram_for_depth(sib_depth);
-            Block block = so.extract_from_stash(ss_.sib_id);
+            Block block = extract_node(so, ss_.sib_id, "main_sibling",
+                                       sib_depth, ss_.sib_leaf);
             BPlusNode nd = BPlusNode::decode(block.value);
             sibling_cache_.push_back({ss_.sib_id, block.leaf, nd,
                                       ss_.sib_parent_idx, ss_.sib_child_idx,
@@ -1159,15 +1204,34 @@ void BPlusOmap::step_process() {
     if (!pb_.active || pb_.phase == StepPhase::DONE)
         return;
 
+    auto promote_cached_sibling = [&](int id) -> int {
+        for (int i = 0; i < static_cast<int>(sibling_cache_.size()); ++i) {
+            if (sibling_cache_[i].id != id) continue;
+            auto sib = sibling_cache_[i];
+            int parent = INVALID_KEY;
+            if (sib.parent_local_idx >= 0 &&
+                sib.parent_local_idx < static_cast<int>(local_.size())) {
+                parent = local_[sib.parent_local_idx].id;
+            }
+            local_.push_back({sib.id, sib.leaf, sib.node, parent, sib.depth});
+            sibling_cache_.erase(sibling_cache_.begin() + i);
+            return static_cast<int>(local_.size()) - 1;
+        }
+        return -1;
+    };
+
     if (pb_.phase == StepPhase::TRAVERSE_TARGET) {
         int local_idx = -1;
         if (pb_.node_in_local) {
             for (int i = 0; i < static_cast<int>(local_.size()); ++i)
                 if (local_[i].id == pb_.cur_id) { local_idx = i; break; }
+            if (local_idx < 0)
+                local_idx = promote_cached_sibling(pb_.cur_id);
             if (local_idx < 0) {
                 // Main flushed local_; re-extract from stash
                 PathORAM& po = oram_for_depth(pb_.depth);
-                Block block = po.extract_from_stash(pb_.cur_id);
+                Block block = extract_node(po, pb_.cur_id, "pb_target_local",
+                                           pb_.depth, pb_.cur_leaf);
                 BPlusNode nd = BPlusNode::decode(block.value);
                 int parent = INVALID_KEY;
                 for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
@@ -1182,9 +1246,12 @@ void BPlusOmap::step_process() {
             // Main op may have added this node to local_ earlier in the same round
             for (int i = 0; i < static_cast<int>(local_.size()); ++i)
                 if (local_[i].id == pb_.cur_id) { local_idx = i; break; }
+            if (local_idx < 0)
+                local_idx = promote_cached_sibling(pb_.cur_id);
             if (local_idx < 0) {
                 PathORAM& po = oram_for_depth(pb_.depth);
-                Block block = po.extract_from_stash(pb_.cur_id);
+                Block block = extract_node(po, pb_.cur_id, "pb_target",
+                                           pb_.depth, pb_.cur_leaf);
                 BPlusNode nd = BPlusNode::decode(block.value);
                 int parent = INVALID_KEY;
                 for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
@@ -1294,7 +1361,8 @@ void BPlusOmap::step_process() {
         int sib_depth = pb_.depth + 1;
         if (!pb_.sibling_is_dummy) {
             PathORAM& so = oram_for_depth(sib_depth);
-            Block block = so.extract_from_stash(pb_.sib_id);
+            Block block = extract_node(so, pb_.sib_id, "pb_sibling",
+                                       sib_depth, pb_.sib_leaf);
             BPlusNode nd = BPlusNode::decode(block.value);
             sibling_cache_.push_back({pb_.sib_id, block.leaf, nd,
                                       pb_.sib_parent_idx, pb_.sib_child_idx,
@@ -1309,12 +1377,16 @@ void BPlusOmap::step_process() {
             else
                 ++lower_op_count_;
         }
-
         if (pb_.leaf_reached || pb_.next_id == INVALID_KEY) {
             pb_.traverse_done = true;
             if (pb_.decision_enabled && !pb_.result.empty()) {
                 pb_.phase = StepPhase::DECISION;
             } else {
+                if (ss_.phase == StepPhase::PAD ||
+                    ss_.phase == StepPhase::DONE) {
+                    reassign_all_leaves();
+                    flush_all_to_stash();
+                }
                 pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
                 if (split_depth_ > 0)
                     pb_.partial_upper_pad = pb_.pad_remaining;
@@ -1379,11 +1451,19 @@ bool BPlusOmap::step_done() const {
 }
 
 Bytes BPlusOmap::step_finish() {
+    if (!local_.empty() || !sibling_cache_.empty()) {
+        reassign_all_leaves();
+        flush_all_to_stash();
+    }
     finalize_bw();
     return ss_.result;
 }
 
 void BPlusOmap::step_abort() {
+    reassign_all_leaves();
+    flush_all_to_stash();
+    local_.clear();
+    sibling_cache_.clear();
     finalize_bw();
     ss_.phase = StepPhase::DONE;
     pb_ = PBState{};
@@ -1403,6 +1483,7 @@ void BPlusOmap::begin_piggyback_search(int key) {
         if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
     } else {
         pb_.phase = StepPhase::TRAVERSE_TARGET;
+        root_leaf_ = oram_for_depth(0).get_leaf(root_id_);
         pb_.cur_id = root_id_;
         pb_.cur_leaf = root_leaf_;
         pb_.depth = 0;
@@ -1440,6 +1521,7 @@ void BPlusOmap::begin_piggyback_insert(int key, const Bytes& value) {
         if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
     } else {
         pb_.phase = StepPhase::TRAVERSE_TARGET;
+        root_leaf_ = oram_for_depth(0).get_leaf(root_id_);
         pb_.cur_id = root_id_;
         pb_.cur_leaf = root_leaf_;
         pb_.depth = 0;
@@ -1480,16 +1562,17 @@ Bytes BPlusOmap::step_get_traverse_result() {
 
 void BPlusOmap::step_commit_remove() {
     if (ss_.phase != StepPhase::DECISION) return;
-    if (!local_.empty() && local_.back().node.is_leaf) {
-        int idx = find_leaf_index(local_.back().node, ss_.key);
+    for (auto& ln : local_) {
+        if (!ln.node.is_leaf) continue;
+        int idx = find_leaf_index(ln.node, ss_.key);
         if (idx >= 0) {
-            local_.back().node.keys.erase(local_.back().node.keys.begin() + idx);
-            if (local_.back().node.is_index_leaf)
-                local_.back().node.child_ids.erase(local_.back().node.child_ids.begin() + idx);
+            ln.node.keys.erase(ln.node.keys.begin() + idx);
+            if (ln.node.is_index_leaf)
+                ln.node.child_ids.erase(ln.node.child_ids.begin() + idx);
             else
-                local_.back().node.values.erase(local_.back().node.values.begin() + idx);
+                ln.node.values.erase(ln.node.values.begin() + idx);
+            break;
         }
-        handle_delete_underflow();
     }
     reassign_all_leaves();
     flush_all_to_stash();
@@ -1517,24 +1600,16 @@ void BPlusOmap::set_piggyback_decision_enabled(bool enable) {
 
 void BPlusOmap::piggyback_commit_remove() {
     if (pb_.phase != StepPhase::DECISION) return;
-    if (!local_.empty()) {
-        int leaf_idx = -1;
-        for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
-            if (local_[i].node.is_leaf) { leaf_idx = i; break; }
-        }
-        if (leaf_idx >= 0) {
-            int idx = find_leaf_index(local_[leaf_idx].node, pb_.key);
-            if (idx >= 0) {
-                local_[leaf_idx].node.keys.erase(
-                    local_[leaf_idx].node.keys.begin() + idx);
-                if (local_[leaf_idx].node.is_index_leaf)
-                    local_[leaf_idx].node.child_ids.erase(
-                        local_[leaf_idx].node.child_ids.begin() + idx);
-                else
-                    local_[leaf_idx].node.values.erase(
-                        local_[leaf_idx].node.values.begin() + idx);
-            }
-            handle_delete_underflow();
+    for (auto& ln : local_) {
+        if (!ln.node.is_leaf) continue;
+        int idx = find_leaf_index(ln.node, pb_.key);
+        if (idx >= 0) {
+            ln.node.keys.erase(ln.node.keys.begin() + idx);
+            if (ln.node.is_index_leaf)
+                ln.node.child_ids.erase(ln.node.child_ids.begin() + idx);
+            else
+                ln.node.values.erase(ln.node.values.begin() + idx);
+            break;
         }
     }
     reassign_all_leaves();

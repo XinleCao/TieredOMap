@@ -1188,6 +1188,9 @@ Bytes AVLOmap::step_finish() {
 }
 
 void AVLOmap::step_abort() {
+    reassign_leaves();
+    flush_local_to_stash();
+    local_.clear();
     finalize_bw();
     ss_.phase = StepPhase::DONE;
     pb_ = PBState{};

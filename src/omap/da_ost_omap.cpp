@@ -692,7 +692,7 @@ Bytes DaOstOmap::step_finish() {
                 root_cache_[ss_.pos] = {nrk, nrl};
             }
         }
-    } else {
+    } else if (!ss_.is_partial_dummy) {
         ods_omap().step_finish();
     }
 
@@ -701,7 +701,14 @@ Bytes DaOstOmap::step_finish() {
 }
 
 void DaOstOmap::step_abort() {
-    ods_omap().step_abort();
+    if (!ss_.is_partial_dummy)
+        ods_omap().step_abort();
+    if (ss_.phase == StepPhase::ODS || ss_.phase == StepPhase::ODS_PAD) {
+        auto [nrk, nrl] = (tree_type_ == OdsTreeType::AVL)
+                              ? avl_ods_.get_root()
+                              : bplus_ods_.get_root();
+        root_cache_[ss_.pos] = {nrk, nrl};
+    }
     finalize_bw(ss_.ods_ops);
     ss_.phase = StepPhase::DONE;
     pb_ = PBState{};

@@ -68,6 +68,29 @@ bash scripts/run_paper_experiments.sh 20 500 <SERVER_IP> 12345
 
 所有 CSV 输出在 `results_YYYYMMDD_HHMMSS/` 目录下。
 
+### Revised Mainline: FO Client/Server + TEE Batch-TM
+
+新的主实验入口避免把 per-query TM 作为 client/server 主模式：
+
+```bash
+bash scripts/run_revised_experiments.sh 20 500
+```
+
+如果 client/server 存储端在另一台机器上：
+
+```bash
+bash scripts/run_revised_experiments.sh 20 500 <SERVER_IP> 12345
+```
+
+输出：
+
+| 输出 | 含义 |
+|------|------|
+| `client_server/client_fo.csv` | client/server 主线，只比较 standalone、fair baseline、TieredOMap-FO |
+| `tee_batch/tee_batch.csv` | TEE 主线，比较 flat EnigMap-style AVL、TieredOMap-FO、TieredOMap-BatchTM |
+
+Batch-TM 的代码口径是：每批 `beta` 个逻辑查询先全部经过 hot-index phase；命中的 hot results 作为一个 batch 释放；剩余 `beta-h` 个 cold continuations 再进入 cold OMAP，并作为 cold-result batch 释放。batch 内允许重复 key，不做预去重。
+
 ### Exp 1: backend_cmp — 后端对比 (单体 OMAP)
 
 ```bash

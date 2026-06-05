@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include "tiered_omap/tiered_omap.h"
+#include <algorithm>
+#include <unordered_set>
 
 using namespace tiered_omap;
 
@@ -8,6 +10,55 @@ static std::vector<std::pair<int, Bytes>> make_data(int N) {
     for (int i = 0; i < N; ++i)
         data.emplace_back(i, int_to_bytes(i * 100));
     return data;
+}
+
+static void expect_dynamic_invariants(
+    const TieredOMap& tmap, int expected_hot_size) {
+    auto st = tmap.dynamic_debug_state();
+
+    EXPECT_EQ(static_cast<int>(st.hot_keys.size()), expected_hot_size);
+    EXPECT_TRUE(std::is_sorted(st.hot_key_list.begin(), st.hot_key_list.end()));
+
+    std::unordered_set<int> listed_phys(
+        st.hot_key_list.begin(), st.hot_key_list.end());
+    EXPECT_EQ(listed_phys, st.phys_hot_keys);
+
+    std::unordered_set<int> maint_cache;
+    for (const auto& e : st.cache_entries) {
+        EXPECT_NE(e.key, INVALID_KEY);
+        EXPECT_TRUE(maint_cache.insert(e.key).second)
+            << "duplicate maintenance cache key " << e.key;
+    }
+    EXPECT_EQ(maint_cache, st.cache_keys);
+
+    for (int k : st.cache_keys) {
+        EXPECT_FALSE(st.phys_hot_keys.count(k))
+            << "key exists in both local cache and physical hot OMAP: " << k;
+        EXPECT_TRUE(st.hot_keys.count(k))
+            << "local cache entries are part of the effective hot set: " << k;
+    }
+
+    bool has_pending = st.pending_insert_key != INVALID_KEY;
+    if (st.swap_state == SwapState::Idle) {
+        EXPECT_FALSE(has_pending);
+        EXPECT_FALSE(st.pending_has_ref);
+    } else {
+        ASSERT_TRUE(has_pending);
+        EXPECT_TRUE(st.pending_has_ref);
+        EXPECT_FALSE(st.cache_keys.count(st.pending_insert_key));
+        EXPECT_FALSE(st.phys_hot_keys.count(st.pending_insert_key));
+        if (st.swap_state == SwapState::HotPend) {
+            EXPECT_TRUE(st.hot_keys.count(st.pending_insert_key));
+        } else {
+            EXPECT_FALSE(st.hot_keys.count(st.pending_insert_key));
+        }
+    }
+
+    std::unordered_set<int> effective_hot = st.phys_hot_keys;
+    effective_hot.insert(st.cache_keys.begin(), st.cache_keys.end());
+    if (st.swap_state == SwapState::HotPend)
+        effective_hot.insert(st.pending_insert_key);
+    EXPECT_EQ(effective_hot, st.hot_keys);
 }
 
 TEST(TieredOMap, FullObliviousBasic) {
@@ -174,6 +225,125 @@ TEST(TieredOMap, BPlusBackend_RepeatedAccess) {
         int key = round % 32;
         auto result = tmap.access(key);
         EXPECT_EQ(bytes_to_int(result.value), key * 100);
+    }
+}
+
+TEST(TieredOMap, StaticAllBackendsReadWrite) {
+    for (auto backend : {OmapBackend::AVL, OmapBackend::BPlus,
+                         OmapBackend::DaAvl, OmapBackend::DaBplus}) {
+        for (auto mode : {SecurityMode::FullOblivious,
+                          SecurityMode::TierMembership}) {
+            TieredOMapConfig cfg;
+            cfg.total_keys = 96;
+            cfg.hot_set_size = 12;
+            cfg.mode = mode;
+            cfg.backend = backend;
+            cfg.bplus_order = 8;
+
+            TieredOMap tmap(cfg);
+            auto data = make_data(96);
+            std::vector<int> hot_keys;
+            for (int i = 0; i < 12; ++i) hot_keys.push_back(i);
+            tmap.init(data, hot_keys);
+
+            Bytes hot_update = int_to_bytes(1111);
+            auto hot = tmap.access(3, &hot_update);
+            EXPECT_TRUE(hot.found_in_hot);
+            EXPECT_EQ(bytes_to_int(hot.value), 300);
+
+            Bytes cold_update = int_to_bytes(2222);
+            auto cold = tmap.access(73, &cold_update);
+            EXPECT_FALSE(cold.found_in_hot);
+            EXPECT_EQ(bytes_to_int(cold.value), 7300);
+
+            for (int k = 0; k < 96; ++k) {
+                auto r = tmap.access(k);
+                int expected = k * 100;
+                if (k == 3) expected = 1111;
+                if (k == 73) expected = 2222;
+                EXPECT_EQ(bytes_to_int(r.value), expected)
+                    << "backend=" << static_cast<int>(backend)
+                    << " mode=" << static_cast<int>(mode)
+                    << " key=" << k;
+                EXPECT_EQ(r.found_in_hot, k < 12);
+            }
+        }
+    }
+}
+
+TEST(RoundAccounting, StaticSequentialRoundsAreAdditive) {
+    for (auto mode : {SecurityMode::FullOblivious,
+                      SecurityMode::TierMembership}) {
+        TieredOMapConfig cfg;
+        cfg.total_keys = 64;
+        cfg.hot_set_size = 8;
+        cfg.mode = mode;
+        cfg.backend = OmapBackend::BPlus;
+        cfg.bplus_order = 4;
+
+        TieredOMap tmap(cfg);
+        auto data = make_data(64);
+        std::vector<int> hot_keys;
+        for (int i = 0; i < 8; ++i) hot_keys.push_back(i);
+        tmap.init(data, hot_keys);
+
+        int data_rounds = (mode == SecurityMode::FullOblivious) ? 2 : 1;
+
+        auto hot = tmap.access(3);
+        EXPECT_TRUE(hot.found_in_hot);
+        EXPECT_EQ(hot.total_bw.rounds,
+                  hot.hot_bw.rounds + hot.cold_bw.rounds + data_rounds);
+        EXPECT_EQ(hot.rounds_to_answer,
+                  static_cast<int>(hot.hot_bw.rounds) + 1);
+
+        auto cold = tmap.access(32);
+        EXPECT_FALSE(cold.found_in_hot);
+        EXPECT_EQ(cold.total_bw.rounds,
+                  cold.hot_bw.rounds + cold.cold_bw.rounds + data_rounds);
+        EXPECT_EQ(cold.rounds_to_answer,
+                  static_cast<int>(cold.total_bw.rounds));
+    }
+}
+
+TEST(RoundAccounting, DynamicSequentialRoundsAreAdditive) {
+    for (auto mode : {SecurityMode::FullOblivious,
+                      SecurityMode::TierMembership}) {
+        TieredOMapConfig cfg;
+        cfg.total_keys = 64;
+        cfg.hot_set_size = 8;
+        cfg.mode = mode;
+        cfg.backend = OmapBackend::BPlus;
+        cfg.bplus_order = 4;
+        cfg.maintenance.enabled = true;
+        cfg.maintenance.observation_window = 1000;
+        cfg.maintenance.swap_interval = 1000;
+        cfg.maintenance.cache_size = 2;
+
+        TieredOMap tmap(cfg);
+        auto data = make_data(64);
+        std::vector<int> hot_keys;
+        for (int i = 0; i < 8; ++i) hot_keys.push_back(i);
+        tmap.init(data, hot_keys);
+
+        auto cache_hot = tmap.access(0);
+        EXPECT_TRUE(cache_hot.found_in_hot);
+        EXPECT_EQ(cache_hot.total_bw.rounds,
+                  cache_hot.hot_bw.rounds + cache_hot.cold_bw.rounds + 1);
+        EXPECT_EQ(cache_hot.rounds_to_answer, 1);
+
+        auto physical_hot = tmap.access(3);
+        EXPECT_TRUE(physical_hot.found_in_hot);
+        EXPECT_EQ(physical_hot.total_bw.rounds,
+                  physical_hot.hot_bw.rounds + physical_hot.cold_bw.rounds + 1);
+        EXPECT_EQ(physical_hot.rounds_to_answer,
+                  static_cast<int>(physical_hot.hot_bw.rounds) + 1);
+
+        auto cold = tmap.access(32);
+        EXPECT_FALSE(cold.found_in_hot);
+        EXPECT_EQ(cold.total_bw.rounds,
+                  cold.hot_bw.rounds + cold.cold_bw.rounds + 1);
+        EXPECT_EQ(cold.rounds_to_answer,
+                  static_cast<int>(cold.total_bw.rounds));
     }
 }
 
@@ -358,6 +528,78 @@ TEST(DynamicMaintenance, DemoteStaleKey) {
     EXPECT_EQ(tmap.hot_set_size(), 4);
     EXPECT_TRUE(tmap.hot_keys().count(16))
         << "Frequently accessed cold key 16 should have been promoted";
+}
+
+TEST(DynamicMaintenance, PendingColdInsertKeepsColdLogicalMembership) {
+    int N = 32, n = 4;
+    TieredOMapConfig cfg;
+    cfg.total_keys = N;
+    cfg.hot_set_size = n;
+    cfg.mode = SecurityMode::TierMembership;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.observation_window = 4;
+    cfg.maintenance.swap_interval = 100;
+    cfg.maintenance.cache_size = 2;
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(N);
+    std::vector<int> hot_keys = {0, 1, 2, 3};
+    tmap.init(data, hot_keys);
+
+    // Initial maintenance cache holds keys 0 and 1. Repeatedly touching cold
+    // key 16 promotes it and evicts key 0 as a ColdPend entry before B3 fires.
+    for (int round = 0; round < 4; ++round)
+        tmap.access(16);
+
+    ASSERT_NE(tmap.maintenance_mgr(), nullptr);
+    ASSERT_EQ(tmap.maintenance_mgr()->swap_state(), SwapState::ColdPend);
+    ASSERT_FALSE(tmap.hot_keys().count(0));
+
+    auto r = tmap.access(0);
+    EXPECT_EQ(bytes_to_int(r.value), 0);
+    EXPECT_FALSE(r.found_in_hot)
+        << "ColdPend pending entries are local but logically cold";
+}
+
+TEST(DynamicMaintenance, LocationInvariantsHoldAcrossWorkload) {
+    for (auto backend : {OmapBackend::AVL, OmapBackend::BPlus}) {
+        for (auto mode : {SecurityMode::FullOblivious,
+                          SecurityMode::TierMembership}) {
+            int N = 64, n = 8;
+            TieredOMapConfig cfg;
+            cfg.total_keys = N;
+            cfg.hot_set_size = n;
+            cfg.mode = mode;
+            cfg.backend = backend;
+            cfg.bplus_order = 4;
+            cfg.maintenance.enabled = true;
+            cfg.maintenance.observation_window = 4;
+            cfg.maintenance.swap_interval = 12;
+            cfg.maintenance.cache_size = 4;
+
+            TieredOMap tmap(cfg);
+            auto data = make_data(N);
+            std::vector<int> hot_keys;
+            for (int i = 0; i < n; ++i) hot_keys.push_back(i);
+            tmap.init(data, hot_keys);
+            expect_dynamic_invariants(tmap, n);
+
+            std::vector<int> workload = {
+                0, 0, 16, 16, 16, 17, 18, 16,
+                24, 24, 24, 24, 1, 2, 25, 25,
+                26, 27, 28, 24, 16, 29, 30, 31,
+                3, 4, 32, 32, 33, 34, 35, 36
+            };
+            for (int key : workload) {
+                auto r = tmap.access(key);
+                EXPECT_EQ(bytes_to_int(r.value), key * 100)
+                    << "backend=" << static_cast<int>(backend)
+                    << " mode=" << static_cast<int>(mode)
+                    << " key=" << key;
+                expect_dynamic_invariants(tmap, n);
+            }
+        }
+    }
 }
 
 // ─── B+ Tree Physical Migration tests ────────────────────────────────────
