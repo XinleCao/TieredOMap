@@ -2,6 +2,18 @@
 build/
 cmake-build-*/
 
+# Local experiment outputs
+results_*/
+results_revised_*/
+results_local/*
+!results_local/paper_wan.csv
+!results_local/paper_wan_server.csv
+!results_local/storage_cost.csv
+
+# External baselines and local paper/review artifacts
+external/
+*.pdf
+
 # IDE / Editor
 .cache/
 .vscode/

@@ -5,9 +5,9 @@
 // Experiments (paper-aligned):
 //   bandwidth       — Bandwidth & rounds vs N (AVL, Single vs TM+split)
 //   modes           — Mode comparison: Single / TM+split / FO+split
-//   backend_cmp     — Standalone OMAP: all 4 backends
-//   tiered_backend  — All backends inside tiered (TM+split)
-//   latency         — End-to-end latency (TM+split, all backends)
+//   backend_cmp     — Standalone OMAP: AVL / BPlus / DaBplus
+//   tiered_backend  — Three paper OMAP backends inside tiered (TM+split)
+//   latency         — End-to-end latency (TM+split, three paper backends)
 //   throughput      — Throughput vs N (AVL + DA-B+)
 //   skewness        — Effect of Zipf s (AVL, TM+split)
 //   hotsize         — Effect of hot-set size n (AVL, FO+split)
@@ -18,6 +18,7 @@
 //   wan_dynamic     — WAN validation: dynamic maintenance
 //   all             — Run all of the above sequentially
 //   client_fo       — Revised client/server mainline: standalone/fair/FO only
+//   client_dynamic_bw — Client/server FO dynamic bandwidth overhead
 
 #include "tiered_omap/tiered_omap.h"
 #include "tiered_omap/omap/avl_omap.h"
@@ -60,6 +61,11 @@ struct Cfg {
     std::string host;
     int port = 12345;
     std::string backend_filter;
+    int dyn_obs = 256;
+    int dyn_swap = 32;
+    int dyn_cache = 8;
+    int dyn_warmup = 0;
+    bool dyn_piggyback = true;
     StorageCreator storage_creator;
     std::shared_ptr<TcpChannel> channel;
 };
@@ -85,6 +91,11 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--host" || k == "--server") c.host = v;
         else if (k == "--port") c.port = std::stoi(v);
         else if (k == "--backend") c.backend_filter = v;
+        else if (k == "--dyn_obs") c.dyn_obs = std::stoi(v);
+        else if (k == "--dyn_swap") c.dyn_swap = std::stoi(v);
+        else if (k == "--dyn_cache") c.dyn_cache = std::stoi(v);
+        else if (k == "--dyn_warmup") c.dyn_warmup = std::stoi(v);
+        else if (k == "--dyn_piggyback") c.dyn_piggyback = (std::stoi(v) != 0);
     }
 
     if (!c.host.empty()) {
@@ -132,10 +143,12 @@ struct BackendSpec {
     OmapBackend backend;
 };
 
-static const BackendSpec ALL_BACKENDS[] = {
+// Paper-facing comparisons use exactly three OMAP backends.  In tiered mode,
+// the DaBplus row means cold=DaBplus and hot=BPlus; the hot tier is small, so
+// the DA-OST construction is not a good fit there.
+static const BackendSpec PAPER_BACKENDS[] = {
     {"AVL",     OmapBackend::AVL},
     {"BPlus",   OmapBackend::BPlus},
-    {"DaAvl",   OmapBackend::DaAvl},
     {"DaBplus", OmapBackend::DaBplus},
 };
 
@@ -289,6 +302,7 @@ static std::unique_ptr<TieredOMap> setup_tiered(
         ser_int(payload, 0);
         ser_int(payload, static_cast<int>(hot_be));
         ser_int(payload, use_hot_be ? 1 : 0);
+        ser_int(payload, maint.enabled ? 1 : 0);
         cfg.channel->send_msg(MsgType::SETUP_BENCH, payload);
         MsgType resp_type; Bytes resp;
         cfg.channel->recv_msg(resp_type, resp);
@@ -311,6 +325,20 @@ static std::unique_ptr<TieredOMap> setup_tiered(
     auto tm = std::make_unique<TieredOMap>(tc);
     tm->init(data, hk);
     return tm;
+}
+
+static bool use_bplus_hot_for_backend(OmapBackend be) {
+    return be == OmapBackend::DaBplus;
+}
+
+static std::unique_ptr<TieredOMap> setup_paper_tiered(
+    const Cfg& cfg, OmapBackend be, int N, int n,
+    SecurityMode mode = SecurityMode::TierMembership,
+    bool use_split = true, int vs = 0,
+    MaintenanceConfig maint = {}) {
+    return setup_tiered(cfg, be, N, n, mode, use_split, vs,
+                        OmapBackend::BPlus, use_bplus_hot_for_backend(be),
+                        maint);
 }
 
 struct Progress {
@@ -423,8 +451,8 @@ static void exp_bandwidth(const Cfg& cfg) {
             {
             std::string tag = "logN=" + std::to_string(logN) + " TM+split";
                 g_progress.config(tag);
-            auto tm = setup_tiered(cfg, be, N, n,
-                                   SecurityMode::TierMembership, true);
+            auto tm = setup_paper_tiered(cfg, be, N, n,
+                                         SecurityMode::TierMembership, true);
                 ZipfSampler z(N, cfg.s, 42);
                 for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
                 double bw = 0, rnd = 0, ans = 0;
@@ -522,7 +550,7 @@ static void exp_modes(const Cfg& cfg) {
 
         for (auto& [ml, m] : modes) {
             g_progress.config("logN=" + std::to_string(logN) + " " + ml);
-            auto tm = setup_tiered(cfg, be, N, n, m, true);
+            auto tm = setup_paper_tiered(cfg, be, N, n, m, true);
             ZipfSampler z(N, cfg.s, 42);
             for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
             double bw = 0, rnd = 0, ans = 0;
@@ -562,7 +590,7 @@ static void exp_client_fo(const Cfg& cfg) {
     std::ofstream csv(cfg.outdir + "/client_fo.csv");
     csv << "backend,logN,type,avg_bw_KB,avg_rounds,avg_answer_rnd,hit_pct\n";
 
-    for (auto& [label, be] : ALL_BACKENDS) {
+    for (auto& [label, be] : PAPER_BACKENDS) {
         if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
             continue;
 
@@ -617,8 +645,8 @@ static void exp_client_fo(const Cfg& cfg) {
             {
                 g_progress.config(std::string(label) + " logN="
                                   + std::to_string(logN) + " tiered_FO");
-                auto fo = setup_tiered(cfg, be, N, n,
-                                       SecurityMode::FullOblivious, true);
+                auto fo = setup_paper_tiered(cfg, be, N, n,
+                                             SecurityMode::FullOblivious, true);
                 ZipfSampler z(N, cfg.s, 42);
                 for (int i = 0; i < cfg.warmup; ++i) fo->access(z.sample());
                 double bw = 0.0, rnd = 0.0, ans = 0.0;
@@ -627,7 +655,7 @@ static void exp_client_fo(const Cfg& cfg) {
                     auto r = fo->access(z.sample());
                     bw += r.total_bw.total_bytes();
                     rnd += r.total_bw.rounds;
-                    ans += r.total_bw.rounds;
+                    ans += r.rounds_to_answer;
                     if (r.found_in_hot) ++hot;
                     g_progress.query_tick(i, cfg.Q);
                 }
@@ -651,6 +679,163 @@ static void exp_client_fo(const Cfg& cfg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Exp: Client/server dynamic bandwidth — FO static vs FO dynamic
+// Measures the bandwidth cost of fixed-rate dynamic maintenance.  The dynamic
+// run warms through one observation window before measurement so maintenance is
+// active in the measured interval.
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct ClientBwSample {
+    double down = 0.0;
+    double up = 0.0;
+    double total = 0.0;
+    double rounds = 0.0;
+    double answer_rounds = 0.0;
+    int hot = 0;
+    int count = 0;
+
+    void add(const AccessResult& r) {
+        down += r.total_bw.bytes_downloaded;
+        up += r.total_bw.bytes_uploaded;
+        total += r.total_bw.total_bytes();
+        rounds += r.total_bw.rounds;
+        answer_rounds += r.rounds_to_answer;
+        if (r.found_in_hot) ++hot;
+        ++count;
+    }
+
+    double denom() const { return std::max(count, 1); }
+    double avg_down_kb() const { return down / denom() / 1024.0; }
+    double avg_up_kb() const { return up / denom() / 1024.0; }
+    double avg_total_kb() const { return total / denom() / 1024.0; }
+    double avg_rounds() const { return rounds / denom(); }
+    double avg_answer_rounds() const { return answer_rounds / denom(); }
+    double hit_pct() const { return count > 0 ? 100.0 * hot / count : 0.0; }
+};
+
+static MaintenanceConfig make_client_dynamic_config(const Cfg& cfg, int n) {
+    MaintenanceConfig mc;
+    mc.enabled = true;
+    mc.observation_window = std::max(1, cfg.dyn_obs);
+    mc.swap_interval = std::max(3, cfg.dyn_swap);
+    mc.cache_size = std::min(std::max(1, cfg.dyn_cache), std::max(1, n));
+    mc.piggyback = cfg.dyn_piggyback;
+    return mc;
+}
+
+static int client_dynamic_warmup_q(const Cfg& cfg, const MaintenanceConfig& mc) {
+    int warmup = cfg.dyn_warmup > 0
+        ? cfg.dyn_warmup
+        : (mc.observation_window + cfg.warmup);
+    int b = std::max(1, mc.swap_interval);
+    return ((warmup + b - 1) / b) * b;
+}
+
+static ClientBwSample measure_client_bw(TieredOMap& tm, int N, const Cfg& cfg,
+                                        int warmup_q, int warm_seed,
+                                        int measure_seed) {
+    ZipfSampler warm(N, cfg.s, warm_seed);
+    for (int i = 0; i < warmup_q; ++i)
+        tm.access(warm.sample());
+
+    ClientBwSample s;
+    ZipfSampler z(N, cfg.s, measure_seed);
+    for (int i = 0; i < cfg.Q; ++i) {
+        auto r = tm.access(z.sample());
+        s.add(r);
+        g_progress.query_tick(i, cfg.Q);
+    }
+    return s;
+}
+
+static void exp_client_dynamic_bw(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Client/Server Dynamic Bandwidth (FO) ===\n";
+    ensure_dir(cfg.outdir);
+    std::ofstream csv(cfg.outdir + "/client_dynamic_bw.csv");
+    csv << "backend,logN,config,B_obs,B_swap,cache_size,piggyback,warmup_q,"
+        << "avg_down_KB,avg_up_KB,avg_bw_KB,avg_rounds,avg_answer_rnd,"
+        << "hit_pct,delta_bw_KB,bw_over_static_pct,delta_rounds\n";
+
+    for (auto& [label, be] : PAPER_BACKENDS) {
+        if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
+            continue;
+
+        for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
+            int N = 1 << logN;
+            int n = std::min(cfg.n, N / 2);
+            MaintenanceConfig mc = make_client_dynamic_config(cfg, n);
+            int warmup_q = client_dynamic_warmup_q(cfg, mc);
+
+            ClientBwSample stat;
+            {
+                g_progress.config(std::string(label) + " logN="
+                                  + std::to_string(logN) + " static_fo");
+                auto tm = setup_paper_tiered(cfg, be, N, n,
+                                             SecurityMode::FullOblivious, true);
+                stat = measure_client_bw(*tm, N, cfg, warmup_q, 42, 4242);
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(1)
+                   << stat.avg_total_kb() << "KB "
+                   << stat.avg_rounds() << "rnd";
+                g_progress.config_done(ss.str());
+            }
+
+            ClientBwSample dyn;
+            {
+                g_progress.config(std::string(label) + " logN="
+                                  + std::to_string(logN) + " dynamic_fo");
+                auto tm = setup_paper_tiered(cfg, be, N, n,
+                                             SecurityMode::FullOblivious, true,
+                                             0, mc);
+                dyn = measure_client_bw(*tm, N, cfg, warmup_q, 42, 4242);
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(1)
+                   << dyn.avg_total_kb() << "KB "
+                   << dyn.avg_rounds() << "rnd";
+                g_progress.config_done(ss.str());
+            }
+
+            auto write_row = [&](const char* be_label, const char* cfg_label,
+                                 const ClientBwSample& s,
+                                 const ClientBwSample& base) {
+                double delta_bw = s.avg_total_kb() - base.avg_total_kb();
+                double bw_pct = base.avg_total_kb() > 0
+                    ? delta_bw / base.avg_total_kb() * 100.0 : 0.0;
+                double delta_rounds = s.avg_rounds() - base.avg_rounds();
+                csv << be_label << "," << logN << "," << cfg_label << ","
+                    << mc.observation_window << "," << mc.swap_interval << ","
+                    << mc.cache_size << "," << (mc.piggyback ? 1 : 0) << ","
+                    << warmup_q << ","
+                    << std::fixed << std::setprecision(2)
+                    << s.avg_down_kb() << "," << s.avg_up_kb() << ","
+                    << s.avg_total_kb() << ","
+                    << std::setprecision(1)
+                    << s.avg_rounds() << "," << s.avg_answer_rounds() << ","
+                    << s.hit_pct() << ","
+                    << std::setprecision(2) << delta_bw << ","
+                    << bw_pct << ","
+                    << std::setprecision(1) << delta_rounds << "\n";
+            };
+
+            write_row(label, "static_fo", stat, stat);
+            write_row(label, "dynamic_fo", dyn, stat);
+            csv.flush();
+
+            double over = stat.avg_total_kb() > 0
+                ? (dyn.avg_total_kb() - stat.avg_total_kb())
+                    / stat.avg_total_kb() * 100.0
+                : 0.0;
+            std::cout << "  " << label << " logN=" << logN
+                      << " dynamic bandwidth overhead="
+                      << std::fixed << std::setprecision(1) << over << "%\n";
+        }
+    }
+
+    csv.close();
+    std::cout << "  -> " << cfg.outdir << "/client_dynamic_bw.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Exp: Backend comparison — standalone OMAP performance  (Fig 3, 4)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -662,7 +847,7 @@ static void exp_backend_cmp(const Cfg& cfg) {
 
     for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
         int N = 1 << logN;
-        for (auto& [label, be] : ALL_BACKENDS) {
+        for (auto& [label, be] : PAPER_BACKENDS) {
             g_progress.config("logN=" + std::to_string(logN) + " " + label);
             auto omap = setup_standalone(cfg, be, N);
             ZipfSampler z(N, cfg.s, 42);
@@ -693,7 +878,7 @@ static void exp_backend_cmp(const Cfg& cfg) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Exp: Tiered backend comparison  (Tab 3)
-// Paper: All backends inside tiered (TM+split)
+// Paper: Three OMAP backends inside tiered (TM+split)
 // ═══════════════════════════════════════════════════════════════════════════
 
 static void exp_tiered_backend(const Cfg& cfg) {
@@ -709,12 +894,9 @@ static void exp_tiered_backend(const Cfg& cfg) {
         bool use_hot_be;
     };
     static const TieredSpec SPECS[] = {
-        {"AVL",             OmapBackend::AVL,     OmapBackend::AVL,    false},
-        {"BPlus",           OmapBackend::BPlus,   OmapBackend::BPlus,  false},
-        {"DaAvl",           OmapBackend::DaAvl,   OmapBackend::DaAvl,  false},
-        {"DaBplus",         OmapBackend::DaBplus,  OmapBackend::DaBplus, false},
-        {"BPlus+DaBplus",   OmapBackend::DaBplus,  OmapBackend::BPlus,  true},
-        {"BPlus+DaAvl",     OmapBackend::DaAvl,    OmapBackend::BPlus,  true},
+        {"AVL",     OmapBackend::AVL,    OmapBackend::AVL,   false},
+        {"BPlus",   OmapBackend::BPlus,  OmapBackend::BPlus, false},
+        {"DaBplus", OmapBackend::DaBplus, OmapBackend::BPlus, true},
     };
 
     std::vector<int> tier_logNs = {16, 20};
@@ -761,7 +943,7 @@ static void exp_tiered_backend(const Cfg& cfg) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Exp: End-to-end Latency  (Fig 5)
-// Paper: All backends, Single OMAP vs TM+split, measured wall-clock
+// Paper: Three OMAP backends, Single OMAP vs TM+split, measured wall-clock
 // ═══════════════════════════════════════════════════════════════════════════
 
 static void exp_latency(const Cfg& cfg) {
@@ -778,72 +960,72 @@ static void exp_latency(const Cfg& cfg) {
         int n = std::min(cfg.n, N / 2);
         std::cout << "\n  --- logN=" << logN << " (N=" << N << ", n=" << n << ") ---\n";
 
-    for (auto& [label, be] : ALL_BACKENDS) {
-        double bl_ms, bl_rnd;
-        {
+        for (auto& [label, be] : PAPER_BACKENDS) {
+            double bl_ms, bl_rnd;
+            {
                 g_progress.config("logN=" + std::to_string(logN) + " "
                                   + label + " standalone");
-            auto omap = setup_standalone(cfg, be, N);
-            ZipfSampler z(N, cfg.s, 42);
-            for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
-            double total_us = 0, rnd = 0;
-            for (int i = 0; i < cfg.Q; ++i) {
-                auto t0 = Clock::now();
-                omap->search(z.sample());
-                total_us += std::chrono::duration<double, std::micro>(
-                    Clock::now() - t0).count();
-                rnd += omap->last_stats().rounds;
-                g_progress.query_tick(i, cfg.Q);
-            }
-            bl_ms = total_us / cfg.Q / 1000.0;
-            bl_rnd = rnd / cfg.Q;
+                auto omap = setup_standalone(cfg, be, N);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) omap->search(z.sample());
+                double total_us = 0, rnd = 0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    auto t0 = Clock::now();
+                    omap->search(z.sample());
+                    total_us += std::chrono::duration<double, std::micro>(
+                        Clock::now() - t0).count();
+                    rnd += omap->last_stats().rounds;
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                bl_ms = total_us / cfg.Q / 1000.0;
+                bl_rnd = rnd / cfg.Q;
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(1)
                    << bl_ms << "ms " << (int)bl_rnd << "rnd";
                 g_progress.config_done(ss.str());
-        }
+            }
 
-        double tm_ms, tm_ans_ms, tm_rnd, tm_ans_rnd;
-        int hot_cnt = 0;
-        {
+            double tm_ms, tm_ans_ms, tm_rnd, tm_ans_rnd;
+            int hot_cnt = 0;
+            {
                 g_progress.config("logN=" + std::to_string(logN) + " "
                                   + label + " TM+split");
-                auto tm = setup_tiered(cfg, be, N, n,
-                                       SecurityMode::TierMembership, true);
-            ZipfSampler z(N, cfg.s, 42);
-            for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
-            double total_us = 0, ans_us = 0, rnd = 0, ans_rnd = 0;
-            for (int i = 0; i < cfg.Q; ++i) {
-                auto t0 = Clock::now();
-                auto r = tm->access(z.sample());
-                double elapsed = std::chrono::duration<double, std::micro>(
-                    Clock::now() - t0).count();
-                total_us += elapsed;
-                rnd += r.total_bw.rounds;
-                ans_rnd += r.rounds_to_answer;
-                if (r.found_in_hot) ++hot_cnt;
-                double ans_frac = (r.total_bw.rounds > 0)
-                    ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
-                ans_us += elapsed * ans_frac;
-                g_progress.query_tick(i, cfg.Q);
-            }
-            tm_ms = total_us / cfg.Q / 1000.0;
-            tm_ans_ms = ans_us / cfg.Q / 1000.0;
-            tm_rnd = rnd / cfg.Q;
-            tm_ans_rnd = ans_rnd / cfg.Q;
+                auto tm = setup_paper_tiered(cfg, be, N, n,
+                                             SecurityMode::TierMembership, true);
+                ZipfSampler z(N, cfg.s, 42);
+                for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
+                double total_us = 0, ans_us = 0, rnd = 0, ans_rnd = 0;
+                for (int i = 0; i < cfg.Q; ++i) {
+                    auto t0 = Clock::now();
+                    auto r = tm->access(z.sample());
+                    double elapsed = std::chrono::duration<double, std::micro>(
+                        Clock::now() - t0).count();
+                    total_us += elapsed;
+                    rnd += r.total_bw.rounds;
+                    ans_rnd += r.rounds_to_answer;
+                    if (r.found_in_hot) ++hot_cnt;
+                    double ans_frac = (r.total_bw.rounds > 0)
+                        ? (double)r.rounds_to_answer / r.total_bw.rounds : 1.0;
+                    ans_us += elapsed * ans_frac;
+                    g_progress.query_tick(i, cfg.Q);
+                }
+                tm_ms = total_us / cfg.Q / 1000.0;
+                tm_ans_ms = ans_us / cfg.Q / 1000.0;
+                tm_rnd = rnd / cfg.Q;
+                tm_ans_rnd = ans_rnd / cfg.Q;
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(1)
                    << tm_ans_ms << "ms(hot) " << tm_ms << "ms(total)";
                 g_progress.config_done(ss.str());
-        }
+            }
 
-        double hit_pct = 100.0 * hot_cnt / cfg.Q;
-        double expected_ms = tm_ans_ms * hit_pct / 100.0
-                           + tm_ms * (1.0 - hit_pct / 100.0);
+            double hit_pct = 100.0 * hot_cnt / cfg.Q;
+            double expected_ms = tm_ans_ms * hit_pct / 100.0
+                               + tm_ms * (1.0 - hit_pct / 100.0);
 
             csv << logN << "," << label << ",standalone,"
                 << std::fixed << std::setprecision(1)
-            << bl_ms << ",," << bl_rnd << ",,\n";
+                << bl_ms << ",," << bl_rnd << ",,\n";
             csv << logN << "," << label << ",tiered," << tm_ms << ","
                 << tm_ans_ms << "," << tm_rnd << "," << tm_ans_rnd << ","
                 << hit_pct << "\n";
@@ -898,8 +1080,8 @@ static void exp_throughput(const Cfg& cfg) {
             {
                 g_progress.config("logN=" + std::to_string(logN)
                                   + " " + label + " TM+split");
-                auto tm = setup_tiered(cfg, be, N, n,
-                                       SecurityMode::TierMembership, true);
+                auto tm = setup_paper_tiered(cfg, be, N, n,
+                                             SecurityMode::TierMembership, true);
                 ZipfSampler z(N, cfg.s, 42);
                 for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
                 auto t0 = Clock::now();
@@ -961,8 +1143,8 @@ static void run_skewness_backend(const Cfg& cfg, OmapBackend be,
             std::string tag = std::string(be_label) + " n=2^" +
                 std::to_string(log_n) + " s=" + std::to_string(s).substr(0,3);
             g_progress.config(tag);
-            auto tm = setup_tiered(cfg, be, N, n,
-                                   SecurityMode::TierMembership, true);
+            auto tm = setup_paper_tiered(cfg, be, N, n,
+                                         SecurityMode::TierMembership, true);
             ZipfSampler z(N, s, 42);
             for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
             double avg_ans = 0, hot_ans = 0, avg_bw = 0;
@@ -1052,8 +1234,8 @@ static void exp_hotsize(const Cfg& cfg) {
             std::string tag = "s=" + std::to_string(s).substr(0,3)
                 + " n=2^" + std::to_string(log_n);
             g_progress.config(tag);
-            auto tm = setup_tiered(cfg, be, N, n,
-                                   SecurityMode::TierMembership, true);
+            auto tm = setup_paper_tiered(cfg, be, N, n,
+                                         SecurityMode::TierMembership, true);
             ZipfSampler z(N, s, 42);
             for (int i = 0; i < cfg.warmup; ++i) tm->access(z.sample());
             double avg_ans = 0; int hot_cnt = 0;
@@ -2666,6 +2848,7 @@ int main(int argc, char** argv) {
     ExpEntry exps[] = {
         {"bandwidth",       exp_bandwidth},
         {"client_fo",       exp_client_fo},
+        {"client_dynamic_bw", exp_client_dynamic_bw},
         {"modes",           exp_modes},
         {"backend_cmp",     exp_backend_cmp},
         {"tiered_backend",  exp_tiered_backend},

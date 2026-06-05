@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "tiered_omap/tiered_omap.h"
 #include <algorithm>
+#include <inttypes.h>
 #include <unordered_set>
 
 using namespace tiered_omap;
@@ -269,6 +270,34 @@ TEST(TieredOMap, StaticAllBackendsReadWrite) {
             }
         }
     }
+}
+
+TEST(TieredOMap, DaBplusColdWithBPlusHot) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 96;
+    cfg.hot_set_size = 12;
+    cfg.mode = SecurityMode::TierMembership;
+    cfg.backend = OmapBackend::DaBplus;
+    cfg.use_hot_backend = true;
+    cfg.hot_backend = OmapBackend::BPlus;
+    cfg.bplus_order = 8;
+
+    EXPECT_EQ(cfg.backend, OmapBackend::DaBplus);
+    EXPECT_EQ(cfg.effective_hot_backend(), OmapBackend::BPlus);
+
+    TieredOMap tmap(cfg);
+    auto data = make_data(96);
+    std::vector<int> hot_keys;
+    for (int i = 0; i < 12; ++i) hot_keys.push_back(i);
+    tmap.init(data, hot_keys);
+
+    auto hot = tmap.access(3);
+    EXPECT_TRUE(hot.found_in_hot);
+    EXPECT_EQ(bytes_to_int(hot.value), 300);
+
+    auto cold = tmap.access(73);
+    EXPECT_FALSE(cold.found_in_hot);
+    EXPECT_EQ(bytes_to_int(cold.value), 7300);
 }
 
 TEST(RoundAccounting, StaticSequentialRoundsAreAdditive) {
@@ -873,7 +902,8 @@ TEST(Piggyback, RoundCountTheoryCheck) {
         int baseline_rounds = static_cast<int>(r_hot.total_bw.rounds);
 
         printf("\n=== piggyback=%s ===\n", pb ? "ON" : "OFF");
-        printf("baseline (hot key 0):  rounds=%d  bw_down=%zu  bw_up=%zu\n",
+        printf("baseline (hot key 0):  rounds=%d  bw_down=%" PRIu64
+               "  bw_up=%" PRIu64 "\n",
                baseline_rounds,
                r_hot.total_bw.bytes_downloaded,
                r_hot.total_bw.bytes_uploaded);

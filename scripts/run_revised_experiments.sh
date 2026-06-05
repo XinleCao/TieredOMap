@@ -1,6 +1,7 @@
 #!/bin/bash
 # Revised experiment runner:
 #   - client/server mainline uses FO only
+#   - client/server dynamic extension measures FO bandwidth overhead
 #   - TEE mainline compares FO against BatchTM
 
 set -e
@@ -35,12 +36,18 @@ echo " output=$OUTDIR"
 echo "============================================"
 
 echo ""
-echo "[1/2] Client/server mainline: FO only"
+echo "[1/3] Client/server mainline: FO only"
 "$BUILD_DIR/bench_paper" --exp=client_fo --Q=$Q --max_logN=$MAX_LOGN \
     --outdir="$OUTDIR/client_server" $NET_ARGS
 
 echo ""
-echo "[2/2] TEE mainline: FO vs BatchTM"
+echo "[2/3] Client/server dynamic: FO bandwidth overhead"
+"$BUILD_DIR/bench_paper" --exp=client_dynamic_bw --Q=$Q --max_logN=$MAX_LOGN \
+    --dyn_obs=256 --dyn_swap=32 --dyn_cache=8 \
+    --outdir="$OUTDIR/client_server_dynamic" $NET_ARGS
+
+echo ""
+echo "[3/3] TEE mainline: FO vs BatchTM"
 "$BUILD_DIR/bench_tee_batch" --min_logN 14 --max_logN "$MAX_LOGN" \
     --Q "$Q" --betas 10,32,100,300,1000 \
     --outdir "$OUTDIR/tee_batch"

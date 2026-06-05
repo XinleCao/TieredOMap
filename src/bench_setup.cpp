@@ -117,7 +117,6 @@ static void detach_register_patch_daost(
     std::memcpy(&rc_sz, scan, 4); scan += 4;
     scan += rc_sz * 3 * 4; // skip root_cache entries
 
-    int da_off = static_cast<int>(scan - blob.data());
     int da_len;
     std::memcpy(&da_len, scan, 4); scan += 4;
     int da_data_start = static_cast<int>(scan - blob.data());
@@ -264,10 +263,12 @@ Bytes setup_tiered_on_server(
     StorageServer::ClientState& stores,
     OmapBackend backend, int N, int n, int bucket_size, int value_size,
     SecurityMode mode, bool use_split,
-    OmapBackend hot_backend, bool use_hot_backend) {
+    OmapBackend hot_backend, bool use_hot_backend,
+    bool epoch_encoded_values) {
 
     std::cerr << "[bench_setup] tiered: backend=" << (int)backend
               << " hot_be=" << (int)hot_backend << " use_hot=" << use_hot_backend
+              << " epoch_values=" << epoch_encoded_values
               << " N=" << N << " n=" << n << " vs=" << value_size << "\n";
 
     auto data = make_data(N, value_size);
@@ -283,6 +284,7 @@ Bytes setup_tiered_on_server(
     cfg.backend = backend;
     cfg.use_hot_backend = use_hot_backend;
     cfg.hot_backend = hot_backend;
+    cfg.epoch_encoded_values = epoch_encoded_values;
     cfg.storage_creator = nullptr;
 
     TieredOMap tm(cfg);
@@ -422,8 +424,8 @@ static std::unique_ptr<OmapInterface> restore_by_backend(
 std::unique_ptr<OmapInterface> restore_standalone(
     const uint8_t*& p, std::shared_ptr<TcpChannel> channel) {
     int backend_i = di(p);
-    int N = di(p);
-    int bucket_size = di(p);
+    int N = di(p); (void)N;
+    int bucket_size = di(p); (void)bucket_size;
     int blob_len = di(p);
     (void)blob_len;
     auto be = static_cast<OmapBackend>(backend_i);

@@ -22,7 +22,8 @@ Bytes setup_tiered_on_server(
     StorageServer::ClientState& stores,
     OmapBackend backend, int N, int n, int bucket_size, int value_size,
     SecurityMode mode, bool use_split,
-    OmapBackend hot_backend = OmapBackend::AVL, bool use_hot_backend = false);
+    OmapBackend hot_backend = OmapBackend::AVL, bool use_hot_backend = false,
+    bool epoch_encoded_values = false);
 
 Bytes setup_index_data_on_server(
     StorageServer::ClientState& stores,

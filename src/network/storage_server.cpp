@@ -208,6 +208,7 @@ void StorageServer::dispatch(ClientState& state, MsgType type,
         int data_count = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
         int hot_be_i = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
         int use_hot_be = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
+        int epoch_values = (p < payload.data() + payload.size()) ? deser_int(p) : 0;
 
         auto backend = static_cast<OmapBackend>(backend_i);
         auto hot_be = static_cast<OmapBackend>(hot_be_i);
@@ -228,7 +229,8 @@ void StorageServer::dispatch(ClientState& state, MsgType type,
         } else {
             result = bench_setup::setup_tiered_on_server(
                 state, backend, N, n, bucket_size, value_size,
-                sec_mode, use_split != 0, hot_be, use_hot_be != 0);
+                sec_mode, use_split != 0, hot_be, use_hot_be != 0,
+                epoch_values != 0);
         }
         send_ok(result);
         std::cerr << "[StorageServer] SETUP_BENCH done, state_size="

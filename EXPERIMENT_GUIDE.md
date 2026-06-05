@@ -1,5 +1,9 @@
 # TieredOMap 实验测试指南
 
+> 文件布局、结果目录和当前主实验入口先看
+> `docs/experiment_layout.md`。本文件保留更详细的历史实验命令和
+> client/server 部署说明。
+
 ## 一、环境准备
 
 ### 依赖
@@ -87,9 +91,12 @@ bash scripts/run_revised_experiments.sh 20 500 <SERVER_IP> 12345
 | 输出 | 含义 |
 |------|------|
 | `client_server/client_fo.csv` | client/server 主线，只比较 standalone、fair baseline、TieredOMap-FO |
+| `client_server_dynamic/client_dynamic_bw.csv` | client/server dynamic 扩展，只比较 static-FO 与 dynamic-FO 的 bandwidth 变化 |
 | `tee_batch/tee_batch.csv` | TEE 主线，比较 flat EnigMap-style AVL、TieredOMap-FO、TieredOMap-BatchTM |
 
 Batch-TM 的代码口径是：每批 `beta` 个逻辑查询先全部经过 hot-index phase；命中的 hot results 作为一个 batch 释放；剩余 `beta-h` 个 cold continuations 再进入 cold OMAP，并作为 cold-result batch 释放。batch 内允许重复 key，不做预去重。
+
+Client/server dynamic bandwidth 的代码口径是：保持 FO 安全模式，分别运行 `static_fo` 和开启 fixed-rate maintenance 的 `dynamic_fo`。动态配置默认 `B_obs=256, B_swap=32, cache=8, piggyback=on`，并在正式测量前 warm up 至少一个 observation window，避免把尚未启动 maintenance 的阶段计入结果。该实验只解释动态维护带来的 bandwidth 增量；hot-set 恢复精度仍使用已有 dynamic convergence 数据。
 
 ### Exp 1: backend_cmp — 后端对比 (单体 OMAP)
 
@@ -99,7 +106,7 @@ Batch-TM 的代码口径是：每批 `beta` 个逻辑查询先全部经过 hot-i
 
 | 输出 | 论文位置 |
 |------|---------|
-| `backend_cmp.csv` | Table 1 (tab:comparison) 的数据支撑；验证 AVL / B+ / DAORAM+AVL / DAORAM+B+ 四种 OMAP 的 bandwidth 和 rounds |
+| `backend_cmp.csv` | Table 1 (tab:comparison) 的数据支撑；验证 AVL / B+ / DAORAM+B+ 三种 OMAP 的 bandwidth 和 rounds |
 
 **关键数据列**：`logN, backend, avg_bw_KB, avg_rounds, avg_comp_us`
 

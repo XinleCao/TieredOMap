@@ -37,6 +37,7 @@ struct TieredOMapConfig {
     OmapBackend backend = OmapBackend::AVL;       // cold backend (and default hot)
     OmapBackend hot_backend = OmapBackend::AVL;    // hot backend (use_hot_backend=false → same as backend)
     bool use_hot_backend = false;                  // true → hot uses hot_backend instead of backend
+    bool epoch_encoded_values = false;             // true → reserve epoch layout before maintenance is enabled
     int bplus_order = 8;
     MaintenanceConfig maintenance;
     StorageCreator storage_creator;

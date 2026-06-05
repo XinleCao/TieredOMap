@@ -1,5 +1,6 @@
 #include "tiered_omap/network/network_storage.h"
 #include "tiered_omap/network/storage_server.h"
+#include "tiered_omap/bench_setup.h"
 #include "tiered_omap/omap/avl_omap.h"
 #include "tiered_omap/omap/bplus_omap.h"
 #include "tiered_omap/omap/da_ost_omap.h"
@@ -314,5 +315,66 @@ TEST_F(NetworkTest, TieredOMap_DynamicPiggybackZipfWorkloadNoThrow) {
                    << " exception=" << e.what();
         }
         EXPECT_EQ(bytes_to_int(r.value), key);
+    }
+}
+
+TEST_F(NetworkTest, SetupBenchTieredDynamicRestorePreservesEpochValues) {
+    const int N = 128;
+    const int n = 16;
+    const int value_size = 32;
+
+    Bytes payload;
+    ser_int(payload, 1);  // tiered
+    ser_int(payload, static_cast<int>(OmapBackend::DaBplus));
+    ser_int(payload, N);
+    ser_int(payload, n);
+    ser_int(payload, 4);
+    ser_int(payload, value_size);
+    ser_int(payload, 0);  // FO
+    ser_int(payload, 1);  // split
+    ser_int(payload, 0);  // unused data_count
+    ser_int(payload, static_cast<int>(OmapBackend::BPlus));
+    ser_int(payload, 1);  // use hot backend
+    ser_int(payload, 1);  // pre-encode values for dynamic maintenance
+
+    channel_->send_msg(MsgType::SETUP_BENCH, payload);
+    MsgType resp_type;
+    Bytes resp;
+    channel_->recv_msg(resp_type, resp);
+    ASSERT_EQ(resp_type, MsgType::OK);
+
+    const uint8_t* p = resp.data();
+    auto tm = bench_setup::restore_tiered(p, channel_);
+    ASSERT_NE(tm, nullptr);
+    EXPECT_EQ(tm->config().backend, OmapBackend::DaBplus);
+    EXPECT_EQ(tm->config().effective_hot_backend(), OmapBackend::BPlus);
+
+    MaintenanceConfig mc;
+    mc.enabled = true;
+    mc.observation_window = 8;
+    mc.swap_interval = 6;
+    mc.cache_size = 4;
+    mc.piggyback = true;
+    tm->enable_maintenance(mc);
+
+    auto hot_cache = tm->access(3);
+    EXPECT_TRUE(hot_cache.found_in_hot);
+    EXPECT_EQ(bytes_to_int(hot_cache.value), 3);
+    EXPECT_EQ(hot_cache.value.size(), static_cast<size_t>(value_size))
+        << "server SETUP_BENCH must pre-encode epoch metadata before "
+        << "client-side dynamic maintenance is enabled";
+
+    auto cold = tm->access(64);
+    EXPECT_FALSE(cold.found_in_hot);
+    EXPECT_EQ(bytes_to_int(cold.value), 64);
+    EXPECT_EQ(cold.value.size(), static_cast<size_t>(value_size));
+
+    ZipfSampler z(N, 1.0, 42);
+    for (int i = 0; i < 40; ++i) {
+        int key = z.sample();
+        auto r = tm->access(key);
+        EXPECT_EQ(bytes_to_int(r.value), key);
+        EXPECT_EQ(r.value.size(), static_cast<size_t>(value_size))
+            << "op=" << i << " key=" << key;
     }
 }

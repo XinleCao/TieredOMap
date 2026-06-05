@@ -65,32 +65,25 @@ endif()
 
 # ─── Benchmark ───────────────────────────────────────────────────────────────
 
-add_executable(bench_tiered_omap benchmark/bench_tiered_omap.cpp)
-target_link_libraries(bench_tiered_omap PRIVATE tiered_omap)
+function(add_tiered_benchmark target)
+    add_executable(${target} benchmark/${target}.cpp)
+    target_link_libraries(${target} PRIVATE tiered_omap)
+endfunction()
 
-add_executable(bench_dynamic benchmark/bench_dynamic.cpp)
-target_link_libraries(bench_dynamic PRIVATE tiered_omap)
-
-add_executable(bench_latency benchmark/bench_latency.cpp)
-target_link_libraries(bench_latency PRIVATE tiered_omap)
-
-add_executable(bench_comptime benchmark/bench_comptime.cpp)
-target_link_libraries(bench_comptime PRIVATE tiered_omap)
-
-add_executable(bench_rounds benchmark/bench_rounds.cpp)
-target_link_libraries(bench_rounds PRIVATE tiered_omap)
-
-add_executable(bench_large benchmark/bench_large.cpp)
-target_link_libraries(bench_large PRIVATE tiered_omap)
-
-add_executable(bench_paper benchmark/bench_paper.cpp)
-target_link_libraries(bench_paper PRIVATE tiered_omap)
-
-add_executable(bench_tee benchmark/bench_tee.cpp)
-target_link_libraries(bench_tee PRIVATE tiered_omap)
-
-add_executable(bench_tee_batch benchmark/bench_tee_batch.cpp)
-target_link_libraries(bench_tee_batch PRIVATE tiered_omap)
+foreach(bench_target
+    bench_tiered_omap
+    bench_dynamic
+    bench_latency
+    bench_comptime
+    bench_rounds
+    bench_large
+    bench_paper
+    bench_tee
+    bench_tee_batch
+    bench_tee_e2e
+)
+    add_tiered_benchmark(${bench_target})
+endforeach()
 
 set(ENIGMAP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/EnigMap")
 set(ENIGMAP_COMMON_LIB "${ENIGMAP_ROOT}/build_noboost/ods/libcommon.a")
@@ -107,9 +100,6 @@ if(EXISTS "${ENIGMAP_ROOT}/ods/otree/otree.hpp" AND EXISTS "${ENIGMAP_COMMON_LIB
         OpenSSL::Crypto
     )
 endif()
-
-add_executable(bench_tee_e2e benchmark/bench_tee_e2e.cpp)
-target_link_libraries(bench_tee_e2e PRIVATE tiered_omap)
 
 # ─── ORAM Server ─────────────────────────────────────────────────────────────
 

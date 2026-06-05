@@ -55,7 +55,7 @@ void TieredOMap::init(
     hot_key_list_ = hot_keys;
     std::sort(hot_key_list_.begin(), hot_key_list_.end());
 
-    bool use_epoch = config_.maintenance.enabled;
+    bool use_epoch = config_.maintenance.enabled || config_.epoch_encoded_values;
     int bs = config_.bucket_size;
     auto& sc = config_.storage_creator;
 
