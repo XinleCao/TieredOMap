@@ -1,0 +1,10 @@
+backend,logN,N,n,value_size,total_client_storage_KB,hot_index_KB,cold_upper_routing_KB,full_position_map_KB,storage_vs_full_posmap_pct,hot_index_entries,cold_upper_nodes,cold_upper_node_bytes,model_note
+AVL,16,65536,1024,4096,35.97,8.00,27.97,256.00,14.0518,1024,1023,28,"hot refs local; cold AVL upper routing nodes local"
+AVL,20,1048576,1024,4096,35.97,8.00,27.97,4096.00,0.8782,1024,1023,28,"hot refs local; cold AVL upper routing nodes local"
+AVL,24,16777216,1024,4096,35.97,8.00,27.97,65536.00,0.0549,1024,1023,28,"hot refs local; cold AVL upper routing nodes local"
+BPlus,16,65536,1024,4096,9.96,8.00,1.96,256.00,3.8887,1024,22,91,"hot refs local; cold B+ upper routing nodes local"
+BPlus,20,1048576,1024,4096,11.97,8.00,3.97,4096.00,0.2922,1024,43,94,"hot refs local; cold B+ upper routing nodes local"
+BPlus,24,16777216,1024,4096,9.02,8.00,1.02,65536.00,0.0138,1024,13,80,"hot refs local; cold B+ upper routing nodes local"
+DaBplus,16,65536,1024,4096,8.00,8.00,0.00,256.00,3.1250,1024,0,0,"hot refs local; DaBplus cold index has no split upper in this implementation"
+DaBplus,20,1048576,1024,4096,8.00,8.00,0.00,4096.00,0.1953,1024,0,0,"hot refs local; DaBplus cold index has no split upper in this implementation"
+DaBplus,24,16777216,1024,4096,8.00,8.00,0.00,65536.00,0.0122,1024,0,0,"hot refs local; DaBplus cold index has no split upper in this implementation"
