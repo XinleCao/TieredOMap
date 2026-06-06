@@ -1,4 +1,9 @@
-mode,avg_bw,avg_rnd,avg_ans_rnd,hit_pct,wan30_latency_ms,wan30_ans_ms,wan80_latency_ms,wan80_ans_ms
-SingleOMAP,117504,24,24,0,720,720,1920,1920
-TierMembership,110191,18.69,18.69,59,560.7,560.7,1495.2,1495.2
-FullOblivious,147744,24,18.69,59,720,560.7,1920,1495.2
+logN,mode,avg_bw_KB,avg_rounds,avg_answer_rnd,hit_pct
+16,Single,2754.00,72.0,72.0,
+16,Fair,379.31,73.0,73.0,
+16,TM_split,298.96,75.6,68.0,69.5
+16,FO_split,536.72,119.0,68.3,69.5
+20,Single,4110.75,87.0,87.0,
+20,Fair,557.16,88.0,88.0,
+20,TM_split,410.15,89.3,83.0,57.5
+20,FO_split,711.56,134.0,83.4,57.5
