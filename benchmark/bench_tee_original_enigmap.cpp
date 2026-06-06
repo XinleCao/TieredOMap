@@ -4,6 +4,7 @@
 
 #include "oram/pathoram/oram.hpp"
 #include "otree/otree.hpp"
+#include "external_memory/server/serverBackend.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +27,7 @@ using EnigPathOram =
     _ORAM::PathORAM::ORAMClient::ORAMClient<_OBST::Node, ORAM__Z, false, 4>;
 using EnigOramClient = _OBST::OramClient::OramClient<EnigPathOram>;
 using EnigObst = _OBST::OBST::OBST<EnigOramClient>;
+using EnigStashedBlock = EnigObst::StashedBlock_t;
 
 struct Config {
     int min_logN = 8;
@@ -144,6 +146,28 @@ static uint64_t ceil_log2_u64(uint64_t n) {
     return l;
 }
 
+static uint64_t estimate_enig_backend_bytes(int capacity) {
+    using LargeBucket = EnigPathOram::ORAMClientInterface_t::LargeBucket_t;
+    uint64_t logical_n = static_cast<uint64_t>(std::max(capacity, 4)) + 2;
+    uint64_t levels = ceil_log2_u64(logical_n) + 1;
+    uint64_t packed_levels =
+        ((levels + ORAM_SERVER__LEVELS_PER_PACK - 1)
+         / ORAM_SERVER__LEVELS_PER_PACK)
+        * ORAM_SERVER__LEVELS_PER_PACK;
+    uint64_t packed_bucket_domain = uint64_t{1} << packed_levels;
+    uint64_t large_buckets =
+        packed_bucket_domain / LargeBucket::BUCKETS_PER_PACK + 2;
+    return large_buckets * sizeof(LargeBucket);
+}
+
+static void reset_enig_default_backend(uint64_t required_bytes) {
+    constexpr uint64_t kSlackBytes = 256ULL << 20;
+    uint64_t backend_bytes = required_bytes + kSlackBytes;
+    delete EM::Backend::g_DefaultBackend;
+    EM::Backend::g_DefaultBackend =
+        new EM::Backend::MemServerBackend(backend_bytes);
+}
+
 static std::vector<MemoryProfile> make_profiles(const Config& cfg) {
     if (cfg.env == "large") {
         return {{"large", 0, 0.0, false}};
@@ -243,15 +267,184 @@ static double modeled_total(const Measurement& m,
     return q > 0 ? total / q : 0.0;
 }
 
+static uint64_t heap_node_for_path_bucket(uint64_t leaf,
+                                          uint64_t depth,
+                                          uint64_t height) {
+    return (uint64_t{1} << depth) - 1 + (leaf >> (height - depth));
+}
+
+static std::pair<uint64_t, _ORAM::ORAMAddress> build_balanced_obst_nodes(
+    std::vector<EnigStashedBlock>& nodes,
+    uint64_t l,
+    uint64_t r,
+    const _ORAM::ORAMAddress& fake_node) {
+    uint64_t m = l + (r - l) / 2;
+    uint64_t left_h = 0;
+    uint64_t right_h = 0;
+    _ORAM::ORAMAddress children[2] = {fake_node, fake_node};
+
+    if (m > l) {
+        auto left = build_balanced_obst_nodes(nodes, l, m - 1, fake_node);
+        left_h = left.first;
+        children[0] = left.second;
+    }
+    if (r > m) {
+        auto right = build_balanced_obst_nodes(nodes, m + 1, r, fake_node);
+        right_h = right.first;
+        children[1] = right.second;
+    }
+
+    auto& node = nodes[m];
+    node.block.data.child[0] = children[0];
+    node.block.data.child[1] = children[1];
+    node.block.data.balance = _OBST::B_BALANCED;
+    if (right_h > left_h) {
+        node.block.data.balance = _OBST::B_RIGHT;
+    } else if (left_h > right_h) {
+        node.block.data.balance = _OBST::B_LEFT;
+    }
+    return {1 + std::max(left_h, right_h), node.oaddress};
+}
+
+static void place_blocks_in_enig_path_oram(
+    EnigObst& map,
+    const std::vector<EnigStashedBlock>& blocks) {
+    auto& path_oram = map.oram.oram;
+    auto& storage = path_oram.oramServerClient;
+    const uint64_t height = path_oram.L_;
+    const uint64_t bucket_count = (uint64_t{1} << (height + 1)) - 1;
+    std::vector<uint8_t> occupancy(bucket_count, 0);
+    std::vector<EnigStashedBlock> overflow;
+
+    for (const auto& block : blocks) {
+        const uint64_t leaf = block.oaddress.position;
+        bool placed = false;
+        for (int64_t depth = static_cast<int64_t>(height); depth >= 0; --depth) {
+            uint64_t node = heap_node_for_path_bucket(
+                leaf, static_cast<uint64_t>(depth), height);
+            if (occupancy[node] >= ORAM__Z) continue;
+
+            uint8_t slot = occupancy[node]++;
+            storage.WriteBlock(leaf, static_cast<_ORAM::Index>(depth), slot,
+                               block.block);
+            EnigPathOram::BucketMetadata_t md;
+            storage.ReadBucketMetadata(leaf, static_cast<_ORAM::Index>(depth),
+                                       md);
+            md.addresses[slot] = block.oaddress;
+            storage.WriteBucketMetadata(leaf, static_cast<_ORAM::Index>(depth),
+                                        md);
+            placed = true;
+            break;
+        }
+        if (!placed) {
+            overflow.push_back(block);
+        }
+    }
+
+    if (overflow.size() > path_oram.S_) {
+        throw std::runtime_error(
+            "EnigMap bulk setup overflow exceeds Path ORAM stash bound");
+    }
+    path_oram.stash_ = std::move(overflow);
+    path_oram.state.forcedIntoStash = false;
+    path_oram.state.savedPath = _ORAM::DUMMY_POSITION;
+}
+
+static std::unique_ptr<EnigObst> build_enigmap_bulk(
+    int capacity,
+    const std::vector<std::pair<_OBST::K, _OBST::V>>& points) {
+    int safe_capacity = std::max(capacity, 4);
+    auto map = std::make_unique<EnigObst>(safe_capacity, true);
+
+    map->oram.oram.stash_.clear();
+    map->oram.oram.state.forcedIntoStash = false;
+    map->oram.oram.state.savedPath = _ORAM::DUMMY_POSITION;
+    map->count = points.size();
+    map->oram.nextFreeBlock.address = points.size() + 2;
+
+    map->FAKE_NODE = {0, map->oram.GenRandomPosition()};
+    std::vector<EnigStashedBlock> real_nodes;
+    real_nodes.reserve(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        EnigStashedBlock block = EnigStashedBlock::DUMMY();
+        block.cached = false;
+        block.oaddress = {
+            static_cast<_ORAM::Address>(i + 2),
+            map->oram.GenRandomPosition(),
+        };
+        block.block.data = _OBST::Node{
+            points[i].first,
+            points[i].second,
+            {map->FAKE_NODE, map->FAKE_NODE},
+            _OBST::B_BALANCED,
+        };
+        real_nodes.push_back(block);
+    }
+
+    _ORAM::ORAMAddress tree_root = map->FAKE_NODE;
+    if (!real_nodes.empty()) {
+        tree_root = build_balanced_obst_nodes(
+            real_nodes, 0, real_nodes.size() - 1, map->FAKE_NODE).second;
+    }
+
+    map->root = {1, map->oram.GenRandomPosition()};
+    EnigStashedBlock fake_block = EnigStashedBlock::DUMMY();
+    fake_block.cached = false;
+    fake_block.oaddress = map->FAKE_NODE;
+    fake_block.block.data = _OBST::Node{
+        _OBST::INVALID_KEY,
+        _OBST::INVALID_VALUE,
+        {map->FAKE_NODE, map->FAKE_NODE},
+        _OBST::B_BALANCED,
+    };
+
+    EnigStashedBlock wrapper_root = EnigStashedBlock::DUMMY();
+    wrapper_root.cached = false;
+    wrapper_root.oaddress = map->root;
+    wrapper_root.block.data = _OBST::Node{
+        _OBST::INVALID_KEY,
+        _OBST::INVALID_VALUE,
+        {tree_root, map->FAKE_NODE},
+        _OBST::B_BALANCED,
+    };
+
+    std::vector<EnigStashedBlock> all_blocks;
+    all_blocks.reserve(real_nodes.size() + 2);
+    all_blocks.push_back(fake_block);
+    all_blocks.push_back(wrapper_root);
+    all_blocks.insert(all_blocks.end(), real_nodes.begin(), real_nodes.end());
+    place_blocks_in_enig_path_oram(*map, all_blocks);
+    return map;
+}
+
 class OriginalEnigMapRefs {
 public:
     OriginalEnigMapRefs(int capacity, int value_size)
-        : value_size_(value_size),
-          map_(std::make_unique<EnigObst>(std::max(capacity, 4))) {
+        : capacity_(std::max(capacity, 4)),
+          value_size_(value_size) {
         values_.push_back(Bytes(value_size_, 0));
     }
 
+    void bulk_load_sorted(const std::vector<std::pair<int, Bytes>>& data) {
+        values_.clear();
+        values_.push_back(Bytes(value_size_, 0));
+        std::vector<std::pair<_OBST::K, _OBST::V>> points;
+        points.reserve(data.size());
+        for (const auto& [key, value] : data) {
+            _OBST::V ref = values_.size();
+            values_.push_back(pad_bytes(value, value_size_));
+            points.push_back({
+                static_cast<_OBST::K>(key),
+                ref,
+            });
+        }
+        map_ = build_enigmap_bulk(capacity_, points);
+    }
+
     void insert_or_update(int key, const Bytes& value) {
+        if (!map_) {
+            map_ = std::make_unique<EnigObst>(capacity_);
+        }
         uint64_t ref = values_.size();
         values_.push_back(pad_bytes(value, value_size_));
         map_->Insert(static_cast<_OBST::K>(key), static_cast<_OBST::V>(ref));
@@ -266,6 +459,7 @@ public:
     }
 
 private:
+    int capacity_;
     int value_size_;
     std::unique_ptr<EnigObst> map_;
     std::vector<Bytes> values_;
@@ -298,13 +492,16 @@ public:
 
         std::vector<std::pair<int, Bytes>> hot_data;
         hot_data.reserve(hot_capacity_);
+        std::vector<std::pair<int, Bytes>> cold_data;
+        cold_data.reserve(std::max(0, total_keys_ - hot_capacity_));
         for (const auto& [k, v] : all_data) {
             if (0 <= k && k < total_keys_ && is_hot_key[k]) {
                 hot_data.push_back({k, pad_bytes(v, value_size_)});
             } else {
-                cold_->insert_or_update(k, v);
+                cold_data.push_back({k, v});
             }
         }
+        cold_->bulk_load_sorted(cold_data);
 
         Bytes dummy(value_size_, 0);
         for (int i = static_cast<int>(hot_data.size()); i < hot_capacity_; ++i)
@@ -395,6 +592,13 @@ static void run_all(const Config& cfg) {
     for (int logN = cfg.min_logN; logN <= cfg.max_logN; logN += 2) {
         int N = 1 << logN;
         int n = std::min(cfg.n, N / 2);
+        uint64_t backend_bytes = estimate_enig_backend_bytes(N);
+        reset_enig_default_backend(backend_bytes);
+        std::cout << "logN=" << logN
+                  << " EnigMap backend="
+                  << std::fixed << std::setprecision(2)
+                  << (backend_bytes / 1024.0 / 1024.0 / 1024.0)
+                  << " GiB required\n";
         auto data = make_data(N, cfg.value_size);
         auto hk = make_hot_keys(n);
         uint64_t hot_working_kb =

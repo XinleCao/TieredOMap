@@ -32,6 +32,24 @@ The target is optional. It is enabled only when
 `external/EnigMap/ods/otree/otree.hpp` and
 `external/EnigMap/build_noboost/ods/libcommon.a` exist.
 
+On Linux servers, rebuild `libcommon.a` on the server instead of reusing a
+locally copied archive:
+
+```bash
+cmake -S external/EnigMap -B external/EnigMap/build_noboost_linux \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build external/EnigMap/build_noboost_linux --target common -j$(nproc)
+cp external/EnigMap/build_noboost_linux/ods/libcommon.a \
+  external/EnigMap/build_noboost/ods/libcommon.a
+cmake --build build --target bench_tee_original_enigmap -j$(nproc)
+```
+
+The benchmark repairs only EnigMap artifact setup. It bulk-loads a balanced OBST
+into a valid Path-ORAM state, then leaves query execution on the original
+`OBST::Get()` path. It also resizes EnigMap's default memory backend per
+database size; the original artifact default is only `1 << 28` bytes and aborts
+around `2^15` keys.
+
 ## Environments
 
 The benchmark emits measured local timings and, optionally, a constrained trusted
