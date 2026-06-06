@@ -18,6 +18,7 @@
 //   wan_dynamic     — WAN validation: dynamic maintenance
 //   all             — Run all of the above sequentially
 //   client_fo       — Revised client/server mainline: standalone/fair/FO only
+//   client_local_index_fo — FO with hot index and cold upper index stored locally
 //   client_dynamic_bw — Client/server FO dynamic bandwidth overhead
 
 #include "tiered_omap/tiered_omap.h"
@@ -34,6 +35,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -69,6 +71,7 @@ struct Cfg {
     int dyn_warmup = 0;
     bool dyn_piggyback = true;
     bool client_fo_standalone = true;
+    std::string base_csv;
     StorageCreator storage_creator;
     std::shared_ptr<TcpChannel> channel;
 };
@@ -102,6 +105,7 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--dyn_warmup") c.dyn_warmup = std::stoi(v);
         else if (k == "--dyn_piggyback") c.dyn_piggyback = (std::stoi(v) != 0);
         else if (k == "--client_fo_standalone") c.client_fo_standalone = (std::stoi(v) != 0);
+        else if (k == "--base_csv") c.base_csv = v;
     }
 
     if (!c.host.empty()) {
@@ -174,6 +178,139 @@ static const BackendSpec PAPER_BACKENDS[] = {
     {"BPlus",   OmapBackend::BPlus},
     {"DaBplus", OmapBackend::DaBplus},
 };
+
+struct BaseClientFoRow {
+    double bw_kb = 0.0;
+    double rounds = 0.0;
+    double answer_rounds = 0.0;
+    double response_ms = 0.0;
+};
+
+static std::vector<std::string> split_csv_line(const std::string& line) {
+    std::vector<std::string> out;
+    std::stringstream ss(line);
+    std::string item;
+    while (std::getline(ss, item, ','))
+        out.push_back(item);
+    return out;
+}
+
+static std::map<std::pair<std::string, int>, BaseClientFoRow>
+read_base_client_fo_csv(const std::string& path) {
+    std::map<std::pair<std::string, int>, BaseClientFoRow> rows;
+    if (path.empty())
+        return rows;
+    std::ifstream in(path);
+    if (!in)
+        throw std::runtime_error("cannot open --base_csv=" + path);
+
+    std::string line;
+    std::getline(in, line); // header
+    while (std::getline(in, line)) {
+        auto cols = split_csv_line(line);
+        if (cols.size() < 11 || cols[3] != "fair")
+            continue;
+        BaseClientFoRow r;
+        r.bw_kb = std::stod(cols[4]);
+        r.rounds = std::stod(cols[5]);
+        r.answer_rounds = std::stod(cols[6]);
+        r.response_ms = cols[10].empty() ? 0.0 : std::stod(cols[10]);
+        rows[{cols[0], std::stoi(cols[1])}] = r;
+    }
+    return rows;
+}
+
+static int path_oram_level_for_capacity(int cap) {
+    return ceil_log2(std::max(cap, 1)) + 1;
+}
+
+static uint64_t path_oneway_bytes(int cap, int bucket_size, int block_size) {
+    return static_cast<uint64_t>(path_oram_level_for_capacity(cap)) *
+           static_cast<uint64_t>(bucket_size) *
+           static_cast<uint64_t>(block_size + 2 * static_cast<int>(sizeof(int)));
+}
+
+static uint64_t data_path_total_bytes(int N, int value_size) {
+    return 2 * path_oneway_bytes(N, 4, value_size);
+}
+
+static int avl_max_height(int cap) {
+    return std::max(1, static_cast<int>(
+        std::ceil(1.44 * std::log2(std::max(cap, 2)))));
+}
+
+static int bplus_index_max_height(int cap, int order = 8) {
+    int half = std::max(static_cast<int>(std::ceil(order / 2.0)), 2);
+    int h = std::max(1, static_cast<int>(
+        std::ceil(std::log(std::max(cap, 2)) / std::log(half))) + 1);
+    h = std::max(1, h - 1); // index mode removes the value leaf level
+    return h;
+}
+
+struct BPlusLocalTreeStats {
+    int total_nodes = 0;
+    int upper_nodes = 0;
+    int lower_nodes = 0;
+    int max_lower_node_bytes = 1 + 4;
+    uint64_t upper_bytes = 0;
+};
+
+static int bplus_index_leaf_bytes(int entries) {
+    return 1 + 4 + entries * 4 + entries * 4;
+}
+
+static int bplus_internal_bytes(int children) {
+    return 1 + 4 + std::max(children - 1, 0) * 4 + children * 2 * 4;
+}
+
+static BPlusLocalTreeStats bplus_local_tree_stats(
+    int entries, int split_depth, int order = 8) {
+    int max_leaf_keys = order * (order - 1);
+    std::vector<std::vector<int>> levels;
+    std::vector<int> cur;
+    for (int rem = entries; rem > 0; rem -= max_leaf_keys)
+        cur.push_back(bplus_index_leaf_bytes(std::min(max_leaf_keys, rem)));
+    if (cur.empty())
+        cur.push_back(bplus_index_leaf_bytes(0));
+    levels.push_back(cur);
+
+    while (cur.size() > 1) {
+        std::vector<int> parent;
+        for (size_t i = 0; i < cur.size(); i += static_cast<size_t>(order)) {
+            int children = static_cast<int>(
+                std::min(static_cast<size_t>(order), cur.size() - i));
+            parent.push_back(bplus_internal_bytes(children));
+        }
+        levels.push_back(parent);
+        cur = parent;
+    }
+    std::reverse(levels.begin(), levels.end());
+
+    BPlusLocalTreeStats st;
+    for (int depth = 0; depth < static_cast<int>(levels.size()); ++depth) {
+        for (int node_bytes : levels[depth]) {
+            ++st.total_nodes;
+            if (depth < split_depth) {
+                ++st.upper_nodes;
+                st.upper_bytes += static_cast<uint64_t>(node_bytes);
+            } else {
+                ++st.lower_nodes;
+                st.max_lower_node_bytes =
+                    std::max(st.max_lower_node_bytes, node_bytes);
+            }
+        }
+    }
+    return st;
+}
+
+static double sampled_hot_hit_pct(int N, int n, double s, int Q) {
+    ZipfSampler z(N, s, 42);
+    int hot = 0;
+    for (int i = 0; i < Q; ++i)
+        if (z.sample() < n)
+            ++hot;
+    return 100.0 * hot / std::max(Q, 1);
+}
 
 static std::unique_ptr<OmapInterface> make_standalone(OmapBackend be, int N,
                                                        int bs = 4,
@@ -730,6 +867,185 @@ static void exp_client_fo(const Cfg& cfg) {
     }
     csv.close();
     std::cout << "  -> " << cfg.outdir << "/client_fo.csv\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Exp: Client/server FO with local client indexes.
+// Model:
+//   - No remote hot-index OMAP exists. The client stores hot key -> data ref.
+//   - No remote cold split-upper ORAM exists. The client stores the cold
+//     upper routing index directly and only contacts the cold lower ORAM.
+//   - Every query still performs two data-ORAM paths and a fixed cold-index
+//     lower template, so the server sees the same FO shape.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void exp_client_local_index_fo(const Cfg& cfg) {
+    std::cout << "\n=== Exp: Client/Server FO with Local Client Indexes ===\n";
+    ensure_dir(cfg.outdir);
+    if (cfg.base_csv.empty())
+        throw std::runtime_error(
+            "--base_csv is required so Base rows match Table 2 exactly");
+
+    auto base_rows = read_base_client_fo_csv(cfg.base_csv);
+    std::ofstream perf(cfg.outdir + "/client_local_index_fo.csv");
+    std::ofstream storage(cfg.outdir + "/client_local_index_storage.csv");
+
+    perf << "backend,logN,value_size,type,avg_bw_KB,avg_rounds,"
+         << "avg_answer_rnd,avg_hot_answer_rnd,avg_cold_answer_rnd,"
+         << "hit_pct,response_ms,hot_response_ms,cold_response_ms,"
+         << "client_storage_KB\n";
+
+    storage << "backend,logN,N,n,value_size,"
+            << "total_client_storage_KB,hot_index_KB,"
+            << "cold_upper_routing_KB,full_position_map_KB,"
+            << "storage_vs_full_posmap_pct,"
+            << "hot_index_entries,cold_upper_nodes,cold_upper_node_bytes,"
+            << "model_note\n";
+
+    auto logNs = selected_logNs(cfg);
+    auto maybe_ms = [&](double rounds) -> std::string {
+        if (cfg.rtt_us <= 0)
+            return "";
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(1)
+           << rounds * cfg.rtt_us / 1000.0;
+        return ss.str();
+    };
+
+    for (auto& [label, be] : PAPER_BACKENDS) {
+        if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
+            continue;
+
+        for (int logN : logNs) {
+            int N = 1 << logN;
+            int n = std::min(cfg.n, N / 2);
+            int cold_n = std::max(N - n, 1);
+
+            auto key = std::make_pair(std::string(label), logN);
+            auto it = base_rows.find(key);
+            if (it == base_rows.end())
+                throw std::runtime_error("missing fair row in --base_csv for "
+                    + std::string(label) + " logN=" + std::to_string(logN));
+            const auto& base = it->second;
+
+            double hit = sampled_hot_hit_pct(N, n, cfg.s, cfg.Q);
+            double data_one_path = static_cast<double>(
+                data_path_total_bytes(N, cfg.value_size));
+            double two_data_paths = 2.0 * data_one_path;
+
+            int cold_index_rounds = 0;
+            double cold_index_bytes = 0.0;
+            uint64_t hot_index_bytes =
+                static_cast<uint64_t>(n) * 2 * sizeof(int);
+            uint64_t cold_upper_bytes = 0;
+            int cold_upper_nodes = 0;
+            int cold_upper_node_bytes = 0;
+            std::string note;
+
+            if (be == OmapBackend::AVL) {
+                int split_depth = ceil_log2(std::max(n, 2));
+                int h = avl_max_height(cold_n);
+                cold_index_rounds = std::max(0, 3 * h - split_depth);
+                int node_bytes = AVL_HEADER_SIZE + sizeof(int);
+                cold_index_bytes = static_cast<double>(
+                    2ULL * static_cast<uint64_t>(cold_index_rounds) *
+                    path_oneway_bytes(cold_n, 4, node_bytes));
+                cold_upper_nodes = std::min((1 << split_depth) - 1, cold_n);
+                cold_upper_node_bytes = node_bytes;
+                cold_upper_bytes = static_cast<uint64_t>(cold_upper_nodes) *
+                                   static_cast<uint64_t>(node_bytes);
+                note = "hot refs local; cold AVL upper routing nodes local";
+            } else if (be == OmapBackend::BPlus) {
+                int order = 8;
+                int split_depth = std::max(1, static_cast<int>(
+                    std::floor(std::log(std::max(n, 2)) /
+                               std::log(std::max(order, 2)))));
+                int h = bplus_index_max_height(cold_n, order);
+                int upper_budget = std::min(2 * split_depth - 1, 3 * h);
+                cold_index_rounds = std::max(0, 3 * h - upper_budget);
+                auto tree = bplus_local_tree_stats(cold_n, split_depth, order);
+                int lower_cap = std::max(tree.total_nodes, 1);
+                cold_index_bytes = static_cast<double>(
+                    2ULL * static_cast<uint64_t>(cold_index_rounds) *
+                    path_oneway_bytes(lower_cap, 4,
+                                      tree.max_lower_node_bytes));
+                cold_upper_nodes = tree.upper_nodes;
+                cold_upper_node_bytes = tree.upper_nodes > 0
+                    ? static_cast<int>(tree.upper_bytes / tree.upper_nodes)
+                    : 0;
+                cold_upper_bytes = tree.upper_bytes;
+                note = "hot refs local; cold B+ upper routing nodes local";
+            } else {
+                // The current DaBplus backend does not expose a split-upper
+                // cold-index ORAM.  We remove only the hot-index OMAP and keep
+                // the full cold DaBplus index server-side.
+                cold_index_rounds = std::max(0, static_cast<int>(
+                    std::round(base.rounds)) - 1);
+                cold_index_bytes = std::max(
+                    0.0, base.bw_kb * 1024.0 - data_one_path);
+                note = "hot refs local; DaBplus cold index has no split upper in this implementation";
+            }
+
+            double local_bw = two_data_paths + cold_index_bytes;
+            double local_rounds = cold_index_rounds + 1;
+            double hot_ans = 1.0;
+            double cold_ans = cold_index_rounds + 1.0;
+            double ans = (hit / 100.0) * hot_ans +
+                         (1.0 - hit / 100.0) * cold_ans;
+
+            uint64_t total_client_bytes = hot_index_bytes + cold_upper_bytes;
+            double full_posmap_bytes = static_cast<double>(N) * sizeof(int);
+            double storage_pct = full_posmap_bytes > 0
+                ? 100.0 * static_cast<double>(total_client_bytes) /
+                  full_posmap_bytes
+                : 0.0;
+
+            g_progress.config(std::string(label) + " logN="
+                              + std::to_string(logN) + " local_index_FO");
+
+            perf << label << "," << logN << "," << cfg.value_size
+                 << ",fair,"
+                 << std::fixed << std::setprecision(2) << base.bw_kb << ","
+                 << std::setprecision(1) << base.rounds << ","
+                 << base.answer_rounds << ",,,,"
+                 << maybe_ms(base.answer_rounds) << ",,,0\n";
+
+            perf << label << "," << logN << "," << cfg.value_size
+                 << ",local_index_FO,"
+                 << std::fixed << std::setprecision(2) << local_bw / 1024.0
+                 << "," << std::setprecision(1) << local_rounds << ","
+                 << ans << "," << hot_ans << "," << cold_ans << ","
+                 << hit << ","
+                 << maybe_ms(ans) << "," << maybe_ms(hot_ans) << ","
+                 << maybe_ms(cold_ans) << ","
+                 << std::setprecision(2)
+                 << static_cast<double>(total_client_bytes) / 1024.0
+                 << "\n";
+
+            storage << label << "," << logN << "," << N << "," << n << ","
+                    << cfg.value_size << ","
+                    << std::fixed << std::setprecision(2)
+                    << static_cast<double>(total_client_bytes) / 1024.0 << ","
+                    << static_cast<double>(hot_index_bytes) / 1024.0 << ","
+                    << static_cast<double>(cold_upper_bytes) / 1024.0 << ","
+                    << full_posmap_bytes / 1024.0 << ","
+                    << std::setprecision(4) << storage_pct << ","
+                    << n << "," << cold_upper_nodes << ","
+                    << cold_upper_node_bytes << ",\"" << note << "\"\n";
+
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(1)
+               << "ans=" << ans << "rnd hit=" << hit << "% storage="
+               << std::setprecision(2)
+               << static_cast<double>(total_client_bytes) / 1024.0 << "KB";
+            g_progress.config_done(ss.str());
+        }
+    }
+
+    perf.close();
+    storage.close();
+    std::cout << "  -> " << cfg.outdir << "/client_local_index_fo.csv\n";
+    std::cout << "  -> " << cfg.outdir << "/client_local_index_storage.csv\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2909,6 +3225,7 @@ int main(int argc, char** argv) {
     ExpEntry exps[] = {
         {"bandwidth",       exp_bandwidth},
         {"client_fo",       exp_client_fo},
+        {"client_local_index_fo", exp_client_local_index_fo},
         {"client_dynamic_bw", exp_client_dynamic_bw},
         {"modes",           exp_modes},
         {"backend_cmp",     exp_backend_cmp},
