@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(tiered_omap STATIC
     src/oram/binary_tree_storage.cpp
+    src/oram/disk_binary_tree_storage.cpp
     src/oram/path_oram.cpp
     src/oram/da_oram.cpp
     src/omap/avl_omap.cpp

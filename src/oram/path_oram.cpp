@@ -1,6 +1,7 @@
 #include "tiered_omap/oram/path_oram.h"
 #include "tiered_omap/network/network_storage.h"
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -47,6 +48,39 @@ void PathORAM::init(const std::unordered_map<int, Bytes>& data) {
         if (placed_keys.find(key) == placed_keys.end())
             stash_.push_back({key, pos_map_.at(key), value});
     }
+}
+
+void PathORAM::init_sequential(int count, int value_size) {
+    block_size_bytes_ = value_size;
+    stash_.clear();
+    pos_map_.clear();
+    pos_map_.reserve(static_cast<size_t>(count));
+    storage_->reset(num_data_, bucket_size_);
+
+    auto make_plain = [value_size](int key) {
+        Bytes value(static_cast<size_t>(value_size), 0);
+        if (value_size > 0) {
+            std::memcpy(value.data(), &key,
+                        std::min(sizeof(int), static_cast<size_t>(value_size)));
+        }
+        return value;
+    };
+
+    storage_->bulk_load_generated(
+        count,
+        static_cast<size_t>(value_size + AES_IV_LEN),
+        [&](int key) {
+            int leaf = random_leaf();
+            pos_map_[key] = leaf;
+            Bytes value = make_plain(key);
+            Bytes enc_val = value.empty() ? value : aes_encrypt(aes_key_, value);
+            return Block{key, leaf, std::move(enc_val)};
+        },
+        [&](int key) {
+            auto it = pos_map_.find(key);
+            int leaf = (it == pos_map_.end()) ? random_leaf() : it->second;
+            stash_.push_back(Block{key, leaf, make_plain(key)});
+        });
 }
 
 Bytes PathORAM::access(int key, const Bytes* new_value) {
@@ -149,9 +183,22 @@ void PathORAM::apply_fetched_path(
     std::unordered_map<int, std::vector<Block>> data) {
     for (auto& [node, bucket] : data) {
         decrypt_bucket(bucket);
-        for (auto& block : bucket)
-            if (!block.is_dummy())
+        for (auto& block : bucket) {
+            if (block.is_dummy())
+                continue;
+            Block* existing = find_in_stash(block.key);
+            if (!existing) {
                 stash_.push_back(std::move(block));
+                continue;
+            }
+            auto it = pos_map_.find(block.key);
+            bool incoming_current =
+                (it == pos_map_.end()) || (it->second == block.leaf);
+            bool existing_current =
+                (it == pos_map_.end()) || (it->second == existing->leaf);
+            if (incoming_current && !existing_current)
+                *existing = std::move(block);
+        }
     }
 }
 
@@ -305,6 +352,12 @@ Block PathORAM::extract_from_stash(int key) {
 }
 
 void PathORAM::add_to_stash(Block block) {
+    for (auto it = stash_.begin(); it != stash_.end();) {
+        if (it->key == block.key)
+            it = stash_.erase(it);
+        else
+            ++it;
+    }
     stash_.push_back(std::move(block));
 }
 

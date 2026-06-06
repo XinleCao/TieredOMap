@@ -2,7 +2,7 @@
 # Revised experiment runner:
 #   - client/server mainline uses FO only
 #   - client/server dynamic extension measures FO bandwidth overhead
-#   - TEE mainline compares FO against BatchTM
+#   - TEE mainline compares FO against BatchTM under large/constrained memory
 
 set -e
 
@@ -47,9 +47,10 @@ echo "[2/3] Client/server dynamic: FO bandwidth overhead"
     --outdir="$OUTDIR/client_server_dynamic" $NET_ARGS
 
 echo ""
-echo "[3/3] TEE mainline: FO vs BatchTM"
+echo "[3/3] TEE mainline: large/constrained memory x FO/BatchTM"
 "$BUILD_DIR/bench_tee_batch" --min_logN 14 --max_logN "$MAX_LOGN" \
-    --Q "$Q" --betas 10,32,100,300,1000 \
+    --Q "$Q" --val 32 --betas 10,32,100,300,1000 \
+    --env both --trusted_kb 8192 --page_us 8 \
     --outdir "$OUTDIR/tee_batch"
 
 echo ""

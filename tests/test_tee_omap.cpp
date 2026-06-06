@@ -385,6 +385,63 @@ TEST(TeeOmap, EarlyResponse) {
     EXPECT_TRUE(result.found_in_hot);
 }
 
+TEST(TeeOmap, BatchTierMembershipTwoPhase) {
+    TeeOmapConfig cfg;
+    cfg.total_keys = 64;
+    cfg.hot_set_size = 8;
+    cfg.value_size = 16;
+    cfg.mode = TeeSecurityMode::TierMembership;
+    cfg.use_split_oram = true;
+
+    TeeOmap omap(cfg);
+
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i)
+        data.push_back({i, int_to_bytes(i)});
+
+    std::vector<int> hot_keys;
+    for (int i = 0; i < 8; ++i)
+        hot_keys.push_back(i);
+
+    omap.init(data, hot_keys);
+
+    std::vector<int> batch = {3, 20, 3, 40};
+    bool hot_released = false;
+    bool final_released = false;
+
+    auto br = omap.access_batch_tier_membership(
+        batch,
+        [&](const std::vector<TeeAccessResult>& partial) {
+            hot_released = true;
+            ASSERT_EQ(partial.size(), batch.size());
+            EXPECT_TRUE(partial[0].found_in_hot);
+            EXPECT_EQ(bytes_to_int(partial[0].value), 3);
+            EXPECT_FALSE(partial[1].found_in_hot);
+            EXPECT_EQ(bytes_to_int(partial[1].value), 0);
+            EXPECT_TRUE(partial[2].found_in_hot);
+            EXPECT_EQ(bytes_to_int(partial[2].value), 3);
+            EXPECT_FALSE(partial[3].found_in_hot);
+            EXPECT_EQ(bytes_to_int(partial[3].value), 0);
+        },
+        [&](const std::vector<TeeAccessResult>& complete) {
+            EXPECT_TRUE(hot_released);
+            final_released = true;
+            ASSERT_EQ(complete.size(), batch.size());
+            for (size_t i = 0; i < batch.size(); ++i)
+                EXPECT_EQ(bytes_to_int(complete[i].value), batch[i]);
+        });
+
+    EXPECT_TRUE(hot_released);
+    EXPECT_TRUE(final_released);
+    EXPECT_EQ(br.hot_count, 2);
+    EXPECT_EQ(br.cold_count, 2);
+    EXPECT_GT(br.hot_phase_pages, 0u);
+    EXPECT_GT(br.cold_extra_pages, 0u);
+    EXPECT_EQ(br.results.size(), batch.size());
+    for (size_t i = 0; i < batch.size(); ++i)
+        EXPECT_EQ(bytes_to_int(br.results[i].value), batch[i]);
+}
+
 TEST(TeeOmap, PageMetrics) {
     TeeOmapConfig cfg;
     cfg.total_keys = 256;

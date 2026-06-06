@@ -309,8 +309,15 @@ Block BPlusOmap::extract_node(PathORAM& o, int id, const char* context,
     }
 }
 
+int BPlusOmap::current_leaf_for_depth(int id, int depth, int fallback) {
+    if (id == INVALID_KEY) return fallback;
+    int current = oram_for_depth(depth).get_leaf(id);
+    return current != INVALID_LEAF ? current : fallback;
+}
+
 void BPlusOmap::move_to_local(int id, int leaf, int parent_id, int depth) {
     PathORAM& o = oram_for_depth(depth);
+    leaf = current_leaf_for_depth(id, depth, leaf);
     o.read_path_to_stash(leaf);
     Block block = extract_node(o, id, "move_to_local", depth, leaf);
     BPlusNode nd = BPlusNode::decode(block.value);
@@ -327,6 +334,7 @@ void BPlusOmap::move_to_sibling_cache(int id, int leaf,
                                        int parent_local_idx, int child_idx,
                                        int depth) {
     PathORAM& o = oram_for_depth(depth);
+    leaf = current_leaf_for_depth(id, depth, leaf);
     o.read_path_to_stash(leaf);
     Block block = extract_node(o, id, "move_to_sibling_cache", depth, leaf);
     BPlusNode nd = BPlusNode::decode(block.value);
@@ -428,6 +436,9 @@ int BPlusOmap::traverse_with_siblings(int key) {
 
         int child_depth = d + 1;
         if (sib_idx >= 0) {
+            ln.node.child_leaves[sib_idx] = current_leaf_for_depth(
+                ln.node.child_ids[sib_idx], child_depth,
+                ln.node.child_leaves[sib_idx]);
             int ploc = static_cast<int>(local_.size()) - 1;
             move_to_sibling_cache(
                 ln.node.child_ids[sib_idx],
@@ -443,6 +454,8 @@ int BPlusOmap::traverse_with_siblings(int key) {
         }
 
         cur_id = ln.node.child_ids[ci];
+        ln.node.child_leaves[ci] = current_leaf_for_depth(
+            cur_id, child_depth, ln.node.child_leaves[ci]);
         cur_leaf = ln.node.child_leaves[ci];
     }
 
@@ -953,6 +966,11 @@ void BPlusOmap::begin_step_search(int key, const Bytes* update) {
     }
 }
 
+void BPlusOmap::begin_step_search_update(int key, const UpdateFn& update_fn) {
+    begin_step_search(key, nullptr);
+    ss_.update_fn = update_fn;
+}
+
 void BPlusOmap::begin_step_dummy() {
     last_bw_.reset();
     op_count_ = 0; upper_op_count_ = 0; lower_op_count_ = 0;
@@ -1120,9 +1138,16 @@ void BPlusOmap::step_process() {
             if (idx >= 0) {
                 if (ln.node.is_index_leaf) {
                     ss_.result = int_to_bytes(ln.node.child_ids[idx]);
+                    if (ss_.update_fn)
+                        ln.node.child_ids[idx] = bytes_to_int(ss_.update_fn(ss_.result));
+                    else if (ss_.update)
+                        ln.node.child_ids[idx] = bytes_to_int(*ss_.update);
                 } else {
                     ss_.result = ln.node.values[idx];
-                    if (ss_.update) ln.node.values[idx] = *ss_.update;
+                    if (ss_.update_fn)
+                        ln.node.values[idx] = ss_.update_fn(ss_.result);
+                    else if (ss_.update)
+                        ln.node.values[idx] = *ss_.update;
                 }
             }
             ss_.leaf_reached = true;
@@ -1133,13 +1158,18 @@ void BPlusOmap::step_process() {
             int num_ch = static_cast<int>(ln.node.child_ids.size());
             int sib_idx = (ci > 0) ? ci - 1
                                    : ((ci + 1 < num_ch) ? ci + 1 : -1);
+            int child_depth = ss_.depth + 1;
             ss_.next_id = ln.node.child_ids[ci];
-            ss_.next_leaf = ln.node.child_leaves[ci];
+            ss_.next_leaf = current_leaf_for_depth(
+                ss_.next_id, child_depth, ln.node.child_leaves[ci]);
+            ln.node.child_leaves[ci] = ss_.next_leaf;
 
             if (sib_idx >= 0) {
                 ss_.sibling_is_dummy = false;
                 ss_.sib_id = ln.node.child_ids[sib_idx];
-                ss_.sib_leaf = ln.node.child_leaves[sib_idx];
+                ss_.sib_leaf = current_leaf_for_depth(
+                    ss_.sib_id, child_depth, ln.node.child_leaves[sib_idx]);
+                ln.node.child_leaves[sib_idx] = ss_.sib_leaf;
                 ss_.sib_parent_idx = static_cast<int>(local_.size()) - 1;
                 ss_.sib_child_idx = sib_idx;
             } else {
@@ -1170,8 +1200,10 @@ void BPlusOmap::step_process() {
             if (ss_.decision_enabled && !ss_.result.empty()) {
                 ss_.phase = StepPhase::DECISION;
             } else {
-                reassign_all_leaves();
-                flush_all_to_stash();
+                if (!pb_.active || pb_.phase == StepPhase::DONE) {
+                    reassign_all_leaves();
+                    flush_all_to_stash();
+                }
                 ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
                 if (split_depth_ > 0)
                     ss_.partial_upper_pad = std::max(0,
@@ -1341,14 +1373,19 @@ void BPlusOmap::step_process() {
                 int num_ch = static_cast<int>(ln.node.child_ids.size());
                 int sib_idx = (ci > 0) ? ci - 1
                                        : ((ci + 1 < num_ch) ? ci + 1 : -1);
+                int child_depth = pb_.depth + 1;
                 pb_.next_id = ln.node.child_ids[ci];
-                pb_.next_leaf = ln.node.child_leaves[ci];
+                pb_.next_leaf = current_leaf_for_depth(
+                    pb_.next_id, child_depth, ln.node.child_leaves[ci]);
+                ln.node.child_leaves[ci] = pb_.next_leaf;
                 if (pb_.node_in_local && local_idx >= 0) {
                     pb_.sibling_is_dummy = true;
                 } else if (sib_idx >= 0) {
                     pb_.sibling_is_dummy = false;
                     pb_.sib_id = ln.node.child_ids[sib_idx];
-                    pb_.sib_leaf = ln.node.child_leaves[sib_idx];
+                    pb_.sib_leaf = current_leaf_for_depth(
+                        pb_.sib_id, child_depth, ln.node.child_leaves[sib_idx]);
+                    ln.node.child_leaves[sib_idx] = pb_.sib_leaf;
                     pb_.sib_parent_idx = local_idx;
                     pb_.sib_child_idx = sib_idx;
                 } else {
@@ -1574,8 +1611,11 @@ void BPlusOmap::step_commit_remove() {
             break;
         }
     }
-    reassign_all_leaves();
-    flush_all_to_stash();
+    handle_delete_underflow();
+    if (!pb_.active || pb_.phase == StepPhase::DONE) {
+        reassign_all_leaves();
+        flush_all_to_stash();
+    }
     ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
     if (split_depth_ > 0)
         ss_.partial_upper_pad = std::max(0,
@@ -1585,8 +1625,10 @@ void BPlusOmap::step_commit_remove() {
 
 void BPlusOmap::step_commit_noop() {
     if (ss_.phase != StepPhase::DECISION) return;
-    reassign_all_leaves();
-    flush_all_to_stash();
+    if (!pb_.active || pb_.phase == StepPhase::DONE) {
+        reassign_all_leaves();
+        flush_all_to_stash();
+    }
     ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
     if (split_depth_ > 0)
         ss_.partial_upper_pad = std::max(0,
@@ -1612,8 +1654,11 @@ void BPlusOmap::piggyback_commit_remove() {
             break;
         }
     }
-    reassign_all_leaves();
-    flush_all_to_stash();
+    handle_delete_underflow();
+    if (ss_.phase == StepPhase::PAD || ss_.phase == StepPhase::DONE) {
+        reassign_all_leaves();
+        flush_all_to_stash();
+    }
     pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
     if (split_depth_ > 0)
         pb_.partial_upper_pad = pb_.pad_remaining;
@@ -1622,8 +1667,10 @@ void BPlusOmap::piggyback_commit_remove() {
 
 void BPlusOmap::piggyback_commit_noop() {
     if (pb_.phase != StepPhase::DECISION) return;
-    reassign_all_leaves();
-    flush_all_to_stash();
+    if (ss_.phase == StepPhase::PAD || ss_.phase == StepPhase::DONE) {
+        reassign_all_leaves();
+        flush_all_to_stash();
+    }
     pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
     if (split_depth_ > 0)
         pb_.partial_upper_pad = pb_.pad_remaining;

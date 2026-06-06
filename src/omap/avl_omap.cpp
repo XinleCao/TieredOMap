@@ -250,8 +250,19 @@ void AVLOmap::flush_local_to_stash() {
 }
 
 void AVLOmap::reassign_leaves() {
+    auto parent_available = [&](const LocalNode& node) {
+        if (node.key == root_key_ || node.parent_key == INVALID_KEY)
+            return true;
+        for (auto& parent : local_)
+            if (parent.key == node.parent_key)
+                return true;
+        return false;
+    };
+
     for (int i = static_cast<int>(local_.size()) - 1; i >= 0; --i) {
         auto& nd = local_[i];
+        if (!parent_available(nd))
+            continue;
         PathORAM& oram = oram_for_depth(nd.depth);
         int new_leaf = oram.random_leaf();
         oram.set_leaf(nd.key, new_leaf);
@@ -826,6 +837,11 @@ void AVLOmap::begin_step_search(int key, const Bytes* update) {
     }
 }
 
+void AVLOmap::begin_step_search_update(int key, const UpdateFn& update_fn) {
+    begin_step_search(key, nullptr);
+    ss_.update_fn = update_fn;
+}
+
 void AVLOmap::begin_step_dummy() {
     last_bw_.reset();
     reset_op_counts();
@@ -866,8 +882,10 @@ void AVLOmap::begin_step_partial_dummy() {
 
 OramStepRound AVLOmap::step_next_round() {
     OramStepRound r;
-    ss_.round_read = (ss_.phase != StepPhase::DONE);
-    pb_.round_read = (pb_.active && pb_.phase != StepPhase::DONE);
+    ss_.round_read = (ss_.phase != StepPhase::DONE &&
+                      ss_.phase != StepPhase::DECISION);
+    pb_.round_read = (pb_.active && pb_.phase != StepPhase::DONE &&
+                      pb_.phase != StepPhase::DECISION);
 
     // ── Main operation read ──
     if (ss_.round_read) {
@@ -891,14 +909,183 @@ OramStepRound AVLOmap::step_next_round() {
 
     // ── Piggyback operation read ──
     if (pb_.round_read) {
+        auto local_index = [&](int key) {
+            for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+                if (local_[i].key == key) return i;
+            return -1;
+        };
+        auto finish_delete_to_pad = [&]() {
+            if (ss_.phase == StepPhase::PAD ||
+                ss_.phase == StepPhase::DONE) {
+                reassign_leaves();
+                flush_local_to_stash();
+            }
+            pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+            pb_.dummy_step = 0;
+            if (split_depth_ > 0)
+                pb_.dummy_split_boundary = std::max(0,
+                    std::min(split_depth_, pb_.budget) - upper_op_count_);
+            else
+                pb_.dummy_split_boundary = pb_.pad_remaining;
+            pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD
+                                                : StepPhase::DONE;
+        };
+        auto set_dummy_delete_round = [&](int depth) {
+            PathORAM& ro = oram_for_depth(depth);
+            pb_.delete_round_real = false;
+            pb_.delete_round_key = INVALID_KEY;
+            pb_.delete_round_leaf = ro.random_leaf();
+            pb_.delete_round_depth = depth;
+            pb_.delete_round_parent = INVALID_KEY;
+        };
+        auto set_real_delete_round = [&](int key, int leaf, int parent, int depth) {
+            pb_.delete_round_real = true;
+            pb_.delete_round_key = key;
+            pb_.delete_round_leaf = leaf;
+            pb_.delete_round_depth = depth;
+            pb_.delete_round_parent = parent;
+        };
+        auto prepare_rebalance_round = [&]() {
+            pb_.delete_round_real = false;
+            while (pb_.rebalance_pos >= 0) {
+                if (pb_.rebalance_stage == 0) {
+                    int nd_key = pb_.rebalance_path[pb_.rebalance_pos];
+                    int nd_idx = local_index(nd_key);
+                    if (nd_idx < 0) {
+                        pb_.rebalance_node_missing = true;
+                        pb_.rebalance_unbalanced = false;
+                        pb_.rebalance_node_key = nd_key;
+                        pb_.rebalance_node_depth = split_depth_;
+                        set_dummy_delete_round(split_depth_);
+                        return;
+                    }
+
+                    for (auto& c : local_) {
+                        if (c.key == local_[nd_idx].avl.l_key)
+                            local_[nd_idx].avl.l_height = c.avl.height();
+                        if (c.key == local_[nd_idx].avl.r_key)
+                            local_[nd_idx].avl.r_height = c.avl.height();
+                    }
+
+                    int bal = local_[nd_idx].avl.balance();
+                    int nd_depth = local_[nd_idx].depth;
+                    pb_.rebalance_node_missing = false;
+                    pb_.rebalance_node_key = nd_key;
+                    pb_.rebalance_node_depth = nd_depth;
+                    pb_.rebalance_balance = bal;
+                    pb_.rebalance_unbalanced = std::abs(bal) > 1;
+
+                    if (!pb_.rebalance_unbalanced) {
+                        set_dummy_delete_round(nd_depth);
+                        return;
+                    }
+
+                    pb_.rebalance_tall_key =
+                        (bal > 1) ? local_[nd_idx].avl.l_key
+                                  : local_[nd_idx].avl.r_key;
+                    pb_.rebalance_tall_leaf =
+                        (bal > 1) ? local_[nd_idx].avl.l_leaf
+                                  : local_[nd_idx].avl.r_leaf;
+                    pb_.rebalance_tall_depth = nd_depth + 1;
+                    if (pb_.rebalance_tall_key != INVALID_KEY &&
+                        local_index(pb_.rebalance_tall_key) < 0) {
+                        set_real_delete_round(pb_.rebalance_tall_key,
+                                              pb_.rebalance_tall_leaf,
+                                              nd_key,
+                                              pb_.rebalance_tall_depth);
+                    } else {
+                        set_dummy_delete_round(pb_.rebalance_tall_depth);
+                    }
+                    return;
+                }
+
+                if (pb_.rebalance_node_missing) {
+                    set_dummy_delete_round(pb_.rebalance_node_depth);
+                    return;
+                }
+                if (!pb_.rebalance_unbalanced) {
+                    set_dummy_delete_round(pb_.rebalance_node_depth);
+                    return;
+                }
+
+                int tall_idx = local_index(pb_.rebalance_tall_key);
+                int tall_depth = pb_.rebalance_tall_depth;
+                bool need_inner = false;
+                pb_.rebalance_inner_key = INVALID_KEY;
+                pb_.rebalance_inner_leaf = INVALID_LEAF;
+                if (tall_idx >= 0) {
+                    tall_depth = local_[tall_idx].depth;
+                    int tb_bal = local_[tall_idx].avl.balance();
+                    if (pb_.rebalance_balance > 1 && tb_bal < 0) {
+                        pb_.rebalance_inner_key = local_[tall_idx].avl.r_key;
+                        pb_.rebalance_inner_leaf = local_[tall_idx].avl.r_leaf;
+                        need_inner = true;
+                    } else if (pb_.rebalance_balance < -1 && tb_bal > 0) {
+                        pb_.rebalance_inner_key = local_[tall_idx].avl.l_key;
+                        pb_.rebalance_inner_leaf = local_[tall_idx].avl.l_leaf;
+                        need_inner = true;
+                    }
+                }
+                pb_.rebalance_inner_depth = tall_depth + 1;
+
+                if (need_inner && pb_.rebalance_inner_key != INVALID_KEY &&
+                    local_index(pb_.rebalance_inner_key) < 0) {
+                    set_real_delete_round(pb_.rebalance_inner_key,
+                                          pb_.rebalance_inner_leaf,
+                                          pb_.rebalance_tall_key,
+                                          pb_.rebalance_inner_depth);
+                } else {
+                    set_dummy_delete_round(pb_.rebalance_inner_depth);
+                }
+                return;
+            }
+            finish_delete_to_pad();
+        };
+
+        if (pb_.phase == StepPhase::DELETE_REBALANCE)
+            prepare_rebalance_round();
+        if (pb_.phase == StepPhase::DONE)
+            return r;
+
         PathORAM* oram = nullptr;
         int leaf = INVALID_LEAF;
-        if (pb_.phase == StepPhase::TRAVERSE) {
+        if (pb_.phase == StepPhase::TRAVERSE ||
+            pb_.phase == StepPhase::DELETE_SUCCESSOR) {
             pb_.node_in_local = false;
             for (auto& ln : local_)
                 if (ln.key == pb_.cur_key) { pb_.node_in_local = true; break; }
+            if (!pb_.node_in_local &&
+                ss_.round_read &&
+                ss_.phase == StepPhase::TRAVERSE &&
+                ss_.cur_key == pb_.cur_key &&
+                ss_.depth == pb_.depth) {
+                pb_.node_in_local = true;
+                pb_.round_read = false;
+                pb_.cur_round_oram = ss_.cur_round_oram;
+                pb_.cur_round_leaf = ss_.cur_round_leaf;
+                return r;
+            }
             oram = &oram_for_depth(pb_.depth);
             leaf = pb_.node_in_local ? oram->random_leaf() : pb_.cur_leaf;
+        } else if (pb_.phase == StepPhase::DELETE_REBALANCE) {
+            oram = &oram_for_depth(pb_.delete_round_depth);
+            pb_.node_in_local = pb_.delete_round_real &&
+                                local_index(pb_.delete_round_key) >= 0;
+            if (!pb_.node_in_local &&
+                pb_.delete_round_real &&
+                ss_.round_read &&
+                ss_.phase == StepPhase::TRAVERSE &&
+                ss_.cur_key == pb_.delete_round_key &&
+                ss_.depth == pb_.delete_round_depth) {
+                pb_.node_in_local = true;
+                pb_.round_read = false;
+                pb_.cur_round_oram = ss_.cur_round_oram;
+                pb_.cur_round_leaf = ss_.cur_round_leaf;
+                return r;
+            }
+            leaf = (pb_.delete_round_real && !pb_.node_in_local)
+                       ? pb_.delete_round_leaf
+                       : oram->random_leaf();
         } else {
             if (split_depth_ > 0)
                 oram = (pb_.dummy_step < pb_.dummy_split_boundary)
@@ -964,10 +1151,20 @@ std::vector<StepWriteReq> AVLOmap::step_prepare_writes() {
 void AVLOmap::step_process() {
     // ── Main operation ──
     if (ss_.phase == StepPhase::TRAVERSE) {
-        Block block = ss_.cur_round_oram->extract_from_stash(ss_.cur_key);
-        AVLNodeData nd = AVLNodeData::decode(block.value);
-        int parent = local_.empty() ? INVALID_KEY : local_.back().key;
-        local_.push_back({ss_.cur_key, block.leaf, nd, parent, ss_.depth});
+        int local_idx = -1;
+        for (int i = 0; i < static_cast<int>(local_.size()); ++i) {
+            if (local_[i].key == ss_.cur_key) {
+                local_idx = i;
+                break;
+            }
+        }
+        if (local_idx < 0) {
+            Block block = ss_.cur_round_oram->extract_from_stash(ss_.cur_key);
+            AVLNodeData nd = AVLNodeData::decode(block.value);
+            local_.push_back({ss_.cur_key, block.leaf, nd,
+                              ss_.parent_key, ss_.depth});
+            local_idx = static_cast<int>(local_.size()) - 1;
+        }
         ss_.ops++;
 
         if (split_depth_ > 0) {
@@ -977,10 +1174,14 @@ void AVLOmap::step_process() {
             ++op_count_;
         }
 
+        auto& cur_node = local_[local_idx];
         bool found = (ss_.key == ss_.cur_key);
         if (found) {
-            ss_.result = nd.data;
-            if (ss_.update) local_.back().avl.data = *ss_.update;
+            ss_.result = cur_node.avl.data;
+            if (ss_.update_fn)
+                cur_node.avl.data = ss_.update_fn(ss_.result);
+            else if (ss_.update)
+                cur_node.avl.data = *ss_.update;
         }
 
         bool end_traverse = found
@@ -988,13 +1189,14 @@ void AVLOmap::step_process() {
             || (ss_.depth >= max_height_ - 1);
 
         if (!found && !end_traverse) {
-            auto& node = local_.back();
             if (ss_.key < ss_.cur_key) {
-                ss_.cur_key = node.avl.l_key;
-                ss_.cur_leaf = node.avl.l_leaf;
+                ss_.parent_key = cur_node.key;
+                ss_.cur_key = cur_node.avl.l_key;
+                ss_.cur_leaf = cur_node.avl.l_leaf;
             } else {
-                ss_.cur_key = node.avl.r_key;
-                ss_.cur_leaf = node.avl.r_leaf;
+                ss_.parent_key = cur_node.key;
+                ss_.cur_key = cur_node.avl.r_key;
+                ss_.cur_leaf = cur_node.avl.r_leaf;
             }
             if (ss_.cur_key == INVALID_KEY)
                 end_traverse = true;
@@ -1003,8 +1205,10 @@ void AVLOmap::step_process() {
         ss_.depth++;
 
         if (end_traverse) {
-            reassign_leaves();
-            flush_local_to_stash();
+            if (!pb_.active || pb_.phase == StepPhase::DONE) {
+                reassign_leaves();
+                flush_local_to_stash();
+            }
             ss_.phase = StepPhase::PAD;
             ss_.pad_remaining = std::max(0, ss_.budget - ss_.ops);
             ss_.dummy_step = 0;
@@ -1037,6 +1241,116 @@ void AVLOmap::step_process() {
     // ── Piggyback operation ──
     if (!pb_.active || pb_.phase == StepPhase::DONE)
         return;
+
+    auto local_index = [&](int key) {
+        for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+            if (local_[i].key == key) return i;
+        return -1;
+    };
+    auto push_pb_path = [&](int key) {
+        if (key == INVALID_KEY) return;
+        if (pb_.path_keys.empty() || pb_.path_keys.back() != key)
+            pb_.path_keys.push_back(key);
+    };
+    auto count_pb_op = [&](int depth) {
+        pb_.ops++;
+        if (split_depth_ > 0) {
+            if (depth < split_depth_) ++upper_op_count_;
+            else ++lower_op_count_;
+        } else {
+            ++op_count_;
+        }
+    };
+    auto finish_pb_to_pad = [&]() {
+        if (ss_.phase == StepPhase::PAD ||
+            ss_.phase == StepPhase::DONE) {
+            reassign_leaves();
+            flush_local_to_stash();
+        }
+        pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+        pb_.dummy_step = 0;
+        if (split_depth_ > 0)
+            pb_.dummy_split_boundary = std::max(0,
+                std::min(split_depth_, pb_.budget) - upper_op_count_);
+        else
+            pb_.dummy_split_boundary = pb_.pad_remaining;
+        pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD
+                                            : StepPhase::DONE;
+    };
+    auto begin_pb_rebalance = [&]() {
+        pb_.rebalance_path.clear();
+        for (int key : pb_.path_keys) {
+            if (local_index(key) < 0) continue;
+            if (pb_.rebalance_path.empty() ||
+                pb_.rebalance_path.back() != key)
+                pb_.rebalance_path.push_back(key);
+        }
+        pb_.rebalance_pos =
+            static_cast<int>(pb_.rebalance_path.size()) - 1;
+        pb_.rebalance_stage = 0;
+        if (pb_.rebalance_pos < 0) {
+            finish_pb_to_pad();
+        } else {
+            pb_.phase = StepPhase::DELETE_REBALANCE;
+        }
+    };
+    auto complete_two_child_delete = [&](int succ_idx) {
+        int target_idx = local_index(pb_.key);
+        if (target_idx < 0 || succ_idx < 0 ||
+            succ_idx >= static_cast<int>(local_.size())) {
+            begin_pb_rebalance();
+            return;
+        }
+
+        int old_key = local_[target_idx].key;
+        int succ_key = local_[succ_idx].key;
+        Bytes succ_data = local_[succ_idx].avl.data;
+        int succ_parent = local_[succ_idx].parent_key;
+        int child_key = local_[succ_idx].avl.r_key;
+        int child_leaf = local_[succ_idx].avl.r_leaf;
+        int child_h = (child_key != INVALID_KEY)
+                          ? local_[succ_idx].avl.r_height : 0;
+
+        local_[target_idx].key = succ_key;
+        local_[target_idx].avl.data = succ_data;
+
+        int parent_of_target = local_[target_idx].parent_key;
+        if (parent_of_target != INVALID_KEY) {
+            for (auto& p : local_) {
+                if (p.key != parent_of_target) continue;
+                if (p.avl.l_key == old_key) p.avl.l_key = succ_key;
+                if (p.avl.r_key == old_key) p.avl.r_key = succ_key;
+                break;
+            }
+        }
+        if (root_key_ == old_key) root_key_ = succ_key;
+
+        for (auto& c : local_)
+            if (c.parent_key == old_key) c.parent_key = succ_key;
+
+        int parent_idx = (succ_parent == old_key)
+                             ? target_idx : local_index(succ_parent);
+        if (parent_idx >= 0) {
+            if (local_[parent_idx].avl.l_key == succ_key) {
+                local_[parent_idx].avl.l_key = child_key;
+                local_[parent_idx].avl.l_leaf = child_leaf;
+                local_[parent_idx].avl.l_height = child_h;
+            } else if (local_[parent_idx].avl.r_key == succ_key) {
+                local_[parent_idx].avl.r_key = child_key;
+                local_[parent_idx].avl.r_leaf = child_leaf;
+                local_[parent_idx].avl.r_height = child_h;
+            }
+        }
+        if (child_key != INVALID_KEY) {
+            int child_parent = (succ_parent == old_key) ? succ_key
+                                                        : succ_parent;
+            for (auto& c : local_)
+                if (c.key == child_key) { c.parent_key = child_parent; break; }
+        }
+
+        local_.erase(local_.begin() + succ_idx);
+        begin_pb_rebalance();
+    };
 
     if (pb_.phase == StepPhase::TRAVERSE) {
         int local_idx = -1;
@@ -1076,16 +1390,11 @@ void AVLOmap::step_process() {
                 local_idx = static_cast<int>(local_.size()) - 1;
             }
         }
-        pb_.ops++;
-        if (split_depth_ > 0) {
-            if (pb_.depth < split_depth_) ++upper_op_count_;
-            else ++lower_op_count_;
-        } else {
-            ++op_count_;
-        }
+        count_pb_op(pb_.depth);
 
         if (local_idx >= 0) {
             auto& node = local_[local_idx];
+            if (!pb_.is_insert) push_pb_path(node.key);
             bool found = (pb_.key == pb_.cur_key);
             bool end_pb = false;
 
@@ -1153,12 +1462,87 @@ void AVLOmap::step_process() {
                     rebalance();
                 }
                 pb_.traverse_done = true;
+                if (!pb_.is_insert && pb_.decision_enabled &&
+                    !pb_.result.empty()) {
+                    pb_.phase = StepPhase::DECISION;
+                    return;
+                }
+                if (ss_.phase == StepPhase::PAD ||
+                    ss_.phase == StepPhase::DONE) {
+                    reassign_leaves();
+                    flush_local_to_stash();
+                }
                 pb_.phase = StepPhase::PAD;
                 pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
                 pb_.dummy_step = 0;
                 pb_.dummy_split_boundary = pb_.pad_remaining;
                 if (pb_.pad_remaining == 0) pb_.phase = StepPhase::DONE;
             }
+        }
+    } else if (pb_.phase == StepPhase::DELETE_SUCCESSOR) {
+        int local_idx = -1;
+        if (pb_.node_in_local) {
+            local_idx = local_index(pb_.cur_key);
+            if (local_idx < 0) {
+                PathORAM& po = oram_for_depth(pb_.depth);
+                Block block = po.extract_from_stash(pb_.cur_key);
+                AVLNodeData nd = AVLNodeData::decode(block.value);
+                local_.push_back({pb_.cur_key, block.leaf, nd,
+                                  pb_.parent_key, pb_.depth});
+                local_idx = static_cast<int>(local_.size()) - 1;
+            }
+        } else {
+            local_idx = local_index(pb_.cur_key);
+            if (local_idx < 0) {
+                Block block = pb_.cur_round_oram->extract_from_stash(pb_.cur_key);
+                AVLNodeData nd = AVLNodeData::decode(block.value);
+                local_.push_back({pb_.cur_key, block.leaf, nd,
+                                  pb_.parent_key, pb_.depth});
+                local_idx = static_cast<int>(local_.size()) - 1;
+            }
+        }
+        count_pb_op(pb_.depth);
+
+        if (local_idx >= 0) {
+            auto& succ = local_[local_idx];
+            push_pb_path(succ.key);
+            bool end_successor =
+                succ.avl.l_key == INVALID_KEY ||
+                pb_.depth >= max_height_ - 1;
+            if (end_successor) {
+                complete_two_child_delete(local_idx);
+            } else {
+                pb_.parent_key = succ.key;
+                pb_.cur_key = succ.avl.l_key;
+                pb_.cur_leaf = succ.avl.l_leaf;
+                pb_.depth++;
+            }
+        }
+    } else if (pb_.phase == StepPhase::DELETE_REBALANCE) {
+        if (pb_.delete_round_real && !pb_.node_in_local) {
+            Block block = pb_.cur_round_oram->extract_from_stash(
+                pb_.delete_round_key);
+            AVLNodeData nd = AVLNodeData::decode(block.value);
+            local_.push_back({pb_.delete_round_key, block.leaf, nd,
+                              pb_.delete_round_parent,
+                              pb_.delete_round_depth});
+        }
+        count_pb_op(pb_.delete_round_depth);
+
+        if (pb_.rebalance_stage == 0) {
+            pb_.rebalance_stage = 1;
+        } else {
+            if (pb_.rebalance_unbalanced &&
+                !pb_.rebalance_node_missing) {
+                update_heights();
+                int ni = local_index(pb_.rebalance_node_key);
+                if (ni >= 0) balance_node(ni);
+                update_heights();
+            }
+            pb_.rebalance_pos--;
+            pb_.rebalance_stage = 0;
+            if (pb_.rebalance_pos < 0)
+                finish_pb_to_pad();
         }
     } else if (pb_.phase == StepPhase::PAD) {
         pb_.ops++;
@@ -1183,6 +1567,10 @@ bool AVLOmap::step_done() const {
 }
 
 Bytes AVLOmap::step_finish() {
+    if (!local_.empty()) {
+        reassign_leaves();
+        flush_local_to_stash();
+    }
     finalize_bw();
     return ss_.result;
 }
@@ -1273,8 +1661,12 @@ Bytes AVLOmap::finish_piggyback() {
     return pb_.result;
 }
 
+void AVLOmap::set_piggyback_decision_enabled(bool enable) {
+    pb_.decision_enabled = enable;
+}
+
 bool AVLOmap::piggyback_needs_decision() const {
-    return pb_.active && pb_.traverse_done && !pb_.result.empty();
+    return pb_.active && pb_.phase == StepPhase::DECISION;
 }
 
 Bytes AVLOmap::piggyback_get_traverse_result() {
@@ -1282,12 +1674,121 @@ Bytes AVLOmap::piggyback_get_traverse_result() {
 }
 
 void AVLOmap::piggyback_commit_remove() {
-    // Removal is handled externally (separate OMAP call).
-    // The pb continues padding within its 3h budget.
+    if (pb_.phase != StepPhase::DECISION) return;
+
+    auto local_index = [&](int key) {
+        for (int i = 0; i < static_cast<int>(local_.size()); ++i)
+            if (local_[i].key == key) return i;
+        return -1;
+    };
+    auto finish_to_pad = [&]() {
+        if (ss_.phase == StepPhase::PAD || ss_.phase == StepPhase::DONE) {
+            reassign_leaves();
+            flush_local_to_stash();
+        }
+        pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+        pb_.dummy_step = 0;
+        if (split_depth_ > 0)
+            pb_.dummy_split_boundary = std::max(0,
+                std::min(split_depth_, pb_.budget) - upper_op_count_);
+        else
+            pb_.dummy_split_boundary = pb_.pad_remaining;
+        pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD
+                                            : StepPhase::DONE;
+    };
+    auto delete_one_child_at = [&](int idx) {
+        if (idx < 0 || idx >= static_cast<int>(local_.size())) return;
+        int del_key = local_[idx].key;
+        int child_key = (local_[idx].avl.l_key != INVALID_KEY)
+                            ? local_[idx].avl.l_key
+                            : local_[idx].avl.r_key;
+        int child_leaf = (local_[idx].avl.l_key != INVALID_KEY)
+                             ? local_[idx].avl.l_leaf
+                             : local_[idx].avl.r_leaf;
+        int child_h = (local_[idx].avl.l_key != INVALID_KEY)
+                          ? local_[idx].avl.l_height
+                          : local_[idx].avl.r_height;
+        if (child_key == INVALID_KEY) child_h = 0;
+
+        int del_parent = local_[idx].parent_key;
+        if (del_parent != INVALID_KEY) {
+            for (auto& p : local_) {
+                if (p.key != del_parent) continue;
+                if (p.avl.l_key == del_key) {
+                    p.avl.l_key = child_key;
+                    p.avl.l_leaf = child_leaf;
+                    p.avl.l_height = child_h;
+                } else if (p.avl.r_key == del_key) {
+                    p.avl.r_key = child_key;
+                    p.avl.r_leaf = child_leaf;
+                    p.avl.r_height = child_h;
+                }
+                break;
+            }
+        } else {
+            root_key_ = child_key;
+            root_leaf_ = (child_key != INVALID_KEY) ? child_leaf
+                                                     : INVALID_LEAF;
+        }
+        if (child_key != INVALID_KEY) {
+            for (auto& c : local_)
+                if (c.key == child_key) { c.parent_key = del_parent; break; }
+        }
+        local_.erase(local_.begin() + idx);
+    };
+    auto begin_rebalance = [&]() {
+        pb_.rebalance_path.clear();
+        for (int key : pb_.path_keys) {
+            if (local_index(key) < 0) continue;
+            if (pb_.rebalance_path.empty() ||
+                pb_.rebalance_path.back() != key)
+                pb_.rebalance_path.push_back(key);
+        }
+        pb_.rebalance_pos =
+            static_cast<int>(pb_.rebalance_path.size()) - 1;
+        pb_.rebalance_stage = 0;
+        if (pb_.rebalance_pos < 0)
+            finish_to_pad();
+        else
+            pb_.phase = StepPhase::DELETE_REBALANCE;
+    };
+
+    int target_idx = local_index(pb_.key);
+    if (target_idx < 0) {
+        finish_to_pad();
+        return;
+    }
+
+    bool two_child = local_[target_idx].avl.l_key != INVALID_KEY &&
+                     local_[target_idx].avl.r_key != INVALID_KEY;
+    if (two_child) {
+        pb_.parent_key = local_[target_idx].key;
+        pb_.cur_key = local_[target_idx].avl.r_key;
+        pb_.cur_leaf = local_[target_idx].avl.r_leaf;
+        pb_.depth = local_[target_idx].depth + 1;
+        pb_.phase = StepPhase::DELETE_SUCCESSOR;
+        return;
+    }
+
+    delete_one_child_at(target_idx);
+    begin_rebalance();
 }
 
 void AVLOmap::piggyback_commit_noop() {
-    // Nothing to do — pb is already padding.
+    if (pb_.phase != StepPhase::DECISION) return;
+    if (ss_.phase == StepPhase::PAD || ss_.phase == StepPhase::DONE) {
+        reassign_leaves();
+        flush_local_to_stash();
+    }
+    pb_.pad_remaining = std::max(0, pb_.budget - pb_.ops);
+    pb_.dummy_step = 0;
+    if (split_depth_ > 0)
+        pb_.dummy_split_boundary = std::max(0,
+            std::min(split_depth_, pb_.budget) - upper_op_count_);
+    else
+        pb_.dummy_split_boundary = pb_.pad_remaining;
+    pb_.phase = (pb_.pad_remaining > 0) ? StepPhase::PAD
+                                        : StepPhase::DONE;
 }
 
 // ─── Non-step piggyback ─────────────────────────────────────────────────────

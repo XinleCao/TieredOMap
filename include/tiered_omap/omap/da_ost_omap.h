@@ -35,6 +35,7 @@ public:
 
     bool supports_interleaved() const override { return true; }
     void begin_step_search(int key, const Bytes* update = nullptr) override;
+    void begin_step_search_update(int key, const UpdateFn& update_fn) override;
     void begin_step_dummy() override;
     void begin_step_partial_dummy() override;
     OramStepRound step_next_round() override;
@@ -126,6 +127,7 @@ private:
         bool is_scan = false;
         int key = INVALID_KEY;
         const Bytes* update = nullptr;
+        UpdateFn update_fn;
         int pos = -1;
 
         int ods_ops = 0;

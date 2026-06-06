@@ -1,7 +1,14 @@
 #include "tiered_omap/bench_setup.h"
 #include "tiered_omap/oram/binary_tree_storage.h"
+#include "tiered_omap/oram/disk_binary_tree_storage.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
+#include <unistd.h>
 
 namespace tiered_omap {
 namespace bench_setup {
@@ -26,18 +33,132 @@ static std::vector<std::pair<int, Bytes>> make_data(int N, int value_size) {
     return d;
 }
 
-static int register_bts(StorageServer::ClientState& stores,
-                        std::unique_ptr<StorageInterface> s) {
-    auto* bts = dynamic_cast<BinaryTreeStorage*>(s.get());
-    if (!bts) return -1;
-    s.release();
-    return stores.register_store(
-        std::unique_ptr<BinaryTreeStorage>(bts));
+static int register_storage(StorageServer::ClientState& stores,
+                            std::unique_ptr<StorageInterface> s) {
+    if (!s) return -1;
+    return stores.register_store(std::move(s));
+}
+
+static StorageCreator make_data_storage_creator(
+    const StorageServer::ClientState& stores) {
+    if (stores.disk_store_dir.empty())
+        return nullptr;
+    return [dir = stores.disk_store_dir](int num_data, int bucket_size)
+        -> std::unique_ptr<StorageInterface> {
+        return std::make_unique<DiskBinaryTreeStorage>(
+            num_data, bucket_size, dir);
+    };
 }
 
 // Patch a store_id at a given byte offset in the blob.
 static void patch_sid(Bytes& blob, int offset, int sid) {
     std::memcpy(blob.data() + offset, &sid, 4);
+}
+
+static void write_bytes_file(const std::filesystem::path& path,
+                             const Bytes& data) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out)
+        throw std::runtime_error("write_bytes_file: open failed");
+    if (!data.empty()) {
+        out.write(reinterpret_cast<const char*>(data.data()),
+                  static_cast<std::streamsize>(data.size()));
+        if (!out)
+            throw std::runtime_error("write_bytes_file: write failed");
+    }
+}
+
+static Bytes read_bytes_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("read_bytes_file: open failed");
+    in.seekg(0, std::ios::end);
+    auto size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    Bytes data(static_cast<size_t>(size));
+    if (!data.empty()) {
+        in.read(reinterpret_cast<char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+        if (!in)
+            throw std::runtime_error("read_bytes_file: read failed");
+    }
+    return data;
+}
+
+static std::filesystem::path data_cache_dir(
+    const StorageServer::ClientState& stores, int N, int bucket_size,
+    int value_size) {
+    if (stores.data_oram_cache_dir.empty())
+        return {};
+    std::filesystem::path dir(stores.data_oram_cache_dir);
+    dir /= "pathoram-v1-N" + std::to_string(N)
+         + "-bs" + std::to_string(bucket_size)
+         + "-vs" + std::to_string(value_size);
+    return dir;
+}
+
+static Bytes setup_data_oram_blob(
+    StorageServer::ClientState& stores, int N, int bucket_size,
+    int value_size) {
+    auto cache_dir = data_cache_dir(stores, N, bucket_size, value_size);
+    if (!cache_dir.empty()) {
+        auto blob_path = cache_dir / "path_oram.bin";
+        auto meta_path = cache_dir / "store.meta";
+        auto data_path = cache_dir / "store.bin";
+        if (std::filesystem::exists(blob_path) &&
+            std::filesystem::exists(meta_path) &&
+            std::filesystem::exists(data_path)) {
+            try {
+                Bytes data_blob = read_bytes_file(blob_path);
+                auto store = DiskBinaryTreeStorage::load_file_snapshot(
+                    meta_path.string(), data_path.string(),
+                    stores.disk_store_dir);
+                int sid = register_storage(stores, std::move(store));
+                patch_sid(data_blob, 0, sid);
+                std::cerr << "[bench_setup] data_oram cache hit: "
+                          << cache_dir << "\n";
+                return data_blob;
+            } catch (const std::exception& e) {
+                std::cerr << "[bench_setup] data_oram cache load failed: "
+                          << e.what() << "\n";
+            }
+        }
+    }
+
+    PathORAM data_oram(N, bucket_size, 7, make_data_storage_creator(stores));
+    data_oram.init_sequential(N, value_size);
+    Bytes data_blob = data_oram.export_state(0);
+    auto storage = data_oram.detach_storage();
+
+    if (!cache_dir.empty()) {
+        if (auto* disk = dynamic_cast<DiskBinaryTreeStorage*>(storage.get())) {
+            std::filesystem::path tmp =
+                cache_dir.parent_path() /
+                (cache_dir.filename().string() + ".tmp." +
+                 std::to_string(::getpid()));
+            try {
+                if (!std::filesystem::exists(cache_dir)) {
+                    std::filesystem::create_directories(tmp);
+                    write_bytes_file(tmp / "path_oram.bin", data_blob);
+                    disk->save_file_snapshot(
+                        (tmp / "store.meta").string(),
+                        (tmp / "store.bin").string());
+                    std::filesystem::rename(tmp, cache_dir);
+                    std::cerr << "[bench_setup] data_oram cache saved: "
+                              << cache_dir << "\n";
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[bench_setup] data_oram cache save failed: "
+                          << e.what() << "\n";
+                std::error_code ec;
+                std::filesystem::remove_all(tmp, ec);
+            }
+        }
+    }
+
+    int sid = register_storage(stores, std::move(storage));
+    patch_sid(data_blob, 0, sid);
+    return data_blob;
 }
 
 // Walk ORAMs in a standalone OMAP: detach, register, patch.
@@ -56,7 +177,7 @@ static void detach_register_patch_avl(
     int b0_sid_offset = base_offset + hdr + 4; // first byte of PathORAM blob
 
     auto s0 = avl.oram().detach_storage();
-    int sid0 = register_bts(stores, std::move(s0));
+    int sid0 = register_storage(stores, std::move(s0));
     patch_sid(blob, b0_sid_offset, sid0);
 
     int split_depth;
@@ -68,7 +189,7 @@ static void detach_register_patch_avl(
         int b1_sid_offset = b1_offset + 4;
 
         auto s1 = avl.upper_oram().detach_storage();
-        int sid1 = register_bts(stores, std::move(s1));
+        int sid1 = register_storage(stores, std::move(s1));
         patch_sid(blob, b1_sid_offset, sid1);
     }
 }
@@ -86,7 +207,7 @@ static void detach_register_patch_bplus(
     int b0_sid_offset = base_offset + hdr + 4;
 
     auto s0 = bp.oram().detach_storage();
-    int sid0 = register_bts(stores, std::move(s0));
+    int sid0 = register_storage(stores, std::move(s0));
     patch_sid(blob, b0_sid_offset, sid0);
 
     int split_depth;
@@ -96,7 +217,7 @@ static void detach_register_patch_bplus(
         int b1_sid_offset = b1_offset + 4;
 
         auto s1 = bp.upper_oram().detach_storage();
-        int sid1 = register_bts(stores, std::move(s1));
+        int sid1 = register_storage(stores, std::move(s1));
         patch_sid(blob, b1_sid_offset, sid1);
     }
 }
@@ -133,7 +254,7 @@ static void detach_register_patch_daost(
 
     // 1) Patch data ORAM store_id (at byte 0 of DA blob)
     auto s_da = da.daoram().detach_storage();
-    int sid_da = register_bts(stores, std::move(s_da));
+    int sid_da = register_storage(stores, std::move(s_da));
     patch_sid(blob, da_data_start, sid_da);
 
     // 2) Walk into the DA blob to find and patch each pos_map PathORAM store_id
@@ -160,7 +281,7 @@ static void detach_register_patch_daost(
         int pm_sid_offset = static_cast<int>(da_scan - blob.data());
 
         auto pm_storage = da.daoram().pos_map_oram(i).detach_storage();
-        int pm_sid = register_bts(stores, std::move(pm_storage));
+        int pm_sid = register_storage(stores, std::move(pm_storage));
         patch_sid(blob, pm_sid_offset, pm_sid);
 
         da_scan += pm_len;
@@ -211,6 +332,47 @@ static std::unique_ptr<OmapInterface> make_omap(OmapBackend be, int N, int bs) {
         return std::make_unique<DaOstOmap>(N, OdsTreeType::BPlus, 0, bs);
     }
     return nullptr;
+}
+
+static std::unique_ptr<OmapInterface> make_tiered_index_omap(
+    OmapBackend be, int cap, bool is_cold, const TieredOMapConfig& cfg,
+    int hot_ref_count) {
+    int bs = cfg.bucket_size;
+    switch (be) {
+    case OmapBackend::BPlus: {
+        if (is_cold && cfg.use_split_oram && hot_ref_count > 0) {
+            int ord = cfg.bplus_order;
+            int split_depth = std::max(1,
+                static_cast<int>(std::floor(
+                    std::log(std::max(hot_ref_count, 2)) /
+                    std::log(std::max(ord, 2)))));
+            int upper_cap = static_cast<int>(
+                (std::pow(ord, split_depth) - 1) /
+                std::max(ord - 1, 1));
+            upper_cap = std::max(upper_cap, hot_ref_count);
+            auto bp = std::make_unique<BPlusOmap>(
+                cap, cfg.bplus_order, bs, split_depth, upper_cap);
+            bp->set_index_mode(true);
+            return bp;
+        }
+        auto bp = std::make_unique<BPlusOmap>(cap, cfg.bplus_order, bs);
+        bp->set_index_mode(true);
+        return bp;
+    }
+    case OmapBackend::DaAvl:
+        return std::make_unique<DaOstOmap>(
+            cap, OdsTreeType::AVL, 0, bs, 8);
+    case OmapBackend::DaBplus:
+        return std::make_unique<DaOstOmap>(
+            cap, OdsTreeType::BPlus, 0, bs, cfg.bplus_order);
+    default:
+        if (is_cold && cfg.use_split_oram && hot_ref_count > 0) {
+            int split_depth = ceil_log2(std::max(hot_ref_count, 2));
+            return std::make_unique<AVLOmap>(
+                cap, bs, split_depth, std::max(hot_ref_count, 1));
+        }
+        return std::make_unique<AVLOmap>(cap, bs);
+    }
 }
 
 static Bytes export_omap(OmapInterface* omap, OmapBackend be) {
@@ -268,10 +430,9 @@ Bytes setup_tiered_on_server(
 
     std::cerr << "[bench_setup] tiered: backend=" << (int)backend
               << " hot_be=" << (int)hot_backend << " use_hot=" << use_hot_backend
-              << " epoch_values=" << epoch_encoded_values
+              << " index_meta=" << epoch_encoded_values
               << " N=" << N << " n=" << n << " vs=" << value_size << "\n";
 
-    auto data = make_data(N, value_size);
     std::vector<int> hot_keys(n);
     for (int i = 0; i < n; ++i) hot_keys[i] = i;
 
@@ -286,9 +447,81 @@ Bytes setup_tiered_on_server(
     cfg.hot_backend = hot_backend;
     cfg.epoch_encoded_values = epoch_encoded_values;
     cfg.storage_creator = nullptr;
+    cfg.data_storage_creator = make_data_storage_creator(stores);
+
+    if (!epoch_encoded_values) {
+        Bytes data_blob = setup_data_oram_blob(
+            stores, N, bucket_size, value_size);
+
+        std::vector<std::pair<int, Bytes>> hot_refs;
+        std::vector<std::pair<int, Bytes>> cold_refs;
+        hot_refs.reserve(static_cast<size_t>(n));
+        cold_refs.reserve(static_cast<size_t>(std::max(N - n, 0)));
+        for (int k = 0; k < N; ++k) {
+            if (k < n)
+                hot_refs.emplace_back(k, int_to_bytes(k));
+            else
+                cold_refs.emplace_back(k, int_to_bytes(k));
+        }
+
+        int hot_cap = std::max(static_cast<int>(hot_refs.size()), 1);
+        int cold_cap = std::max(static_cast<int>(cold_refs.size()), 1);
+        auto hot = make_tiered_index_omap(
+            cfg.effective_hot_backend(), hot_cap, false, cfg,
+            static_cast<int>(hot_refs.size()));
+        auto cold = make_tiered_index_omap(
+            backend, cold_cap, true, cfg,
+            static_cast<int>(hot_refs.size()));
+        hot->init(hot_refs);
+        cold->init(cold_refs);
+
+        Bytes hot_blob = export_omap(hot.get(), cfg.effective_hot_backend());
+        detach_register_patch_omap(
+            stores, hot.get(), cfg.effective_hot_backend(), hot_blob, 0);
+
+        Bytes cold_blob = export_omap(cold.get(), backend);
+        detach_register_patch_omap(stores, cold.get(), backend, cold_blob, 0);
+
+        Bytes tm_blob;
+        si(tm_blob, N);
+        si(tm_blob, n);
+        si(tm_blob, static_cast<int>(mode));
+        si(tm_blob, use_split ? 1 : 0);
+        si(tm_blob, bucket_size);
+        si(tm_blob, static_cast<int>(backend));
+        si(tm_blob, cfg.bplus_order);
+        si(tm_blob, hot_cap);
+        si(tm_blob, N); // next_data_block_id
+        si(tm_blob, use_hot_backend ? 1 : 0);
+        si(tm_blob, static_cast<int>(hot_backend));
+
+        si(tm_blob, n);
+        for (int k = 0; k < n; ++k) si(tm_blob, k);
+        si(tm_blob, n);
+        for (int k = 0; k < n; ++k) si(tm_blob, k);
+        si(tm_blob, n);
+        for (int k = 0; k < n; ++k) si(tm_blob, k);
+
+        si(tm_blob, static_cast<int>(data_blob.size()));
+        tm_blob.insert(tm_blob.end(), data_blob.begin(), data_blob.end());
+        si(tm_blob, static_cast<int>(hot_blob.size()));
+        tm_blob.insert(tm_blob.end(), hot_blob.begin(), hot_blob.end());
+        si(tm_blob, static_cast<int>(cold_blob.size()));
+        tm_blob.insert(tm_blob.end(), cold_blob.begin(), cold_blob.end());
+
+        Bytes result;
+        si(result, 1);
+        si(result, static_cast<int>(tm_blob.size()));
+        result.insert(result.end(), tm_blob.begin(), tm_blob.end());
+
+        std::cerr << "[bench_setup] tiered done: stores="
+                  << stores.stores.size()
+                  << " blob=" << result.size() << " bytes\n";
+        return result;
+    }
 
     TieredOMap tm(cfg);
-    tm.init(data, hot_keys);
+    tm.init_sequential_values(N, value_size, hot_keys);
 
     // Export full TieredOMap state
     auto tm_blob = tm.export_state();
@@ -314,7 +547,7 @@ Bytes setup_tiered_on_server(
     int data_sid_offset = static_cast<int>(scan - tm_blob.data());
     {
         auto s = tm.data_oram().detach_storage();
-        int sid = register_bts(stores, std::move(s));
+        int sid = register_storage(stores, std::move(s));
         patch_sid(tm_blob, data_sid_offset, sid);
     }
     scan += data_blob_len;
@@ -361,32 +594,13 @@ Bytes setup_index_data_on_server(
     index->init(idata);
 
     // 2. Data PathORAM with full-size values
-    PathORAM data_oram(N, bucket_size, 7);
-    {
-        std::unordered_map<int, Bytes> dmap;
-        dmap.reserve(N);
-        for (int i = 0; i < N; ++i) {
-            Bytes v(value_size, 0);
-            std::memcpy(v.data(), &i,
-                        std::min(sizeof(int), static_cast<size_t>(value_size)));
-            dmap[i] = std::move(v);
-        }
-        data_oram.init(dmap);
-    }
+    Bytes data_blob = setup_data_oram_blob(stores, N, bucket_size, value_size);
 
     // 3. Export blobs
     auto index_blob = export_omap(index.get(), backend);
-    auto data_blob = data_oram.export_state(0);
 
     // 4. Detach/register/patch index OMAP stores
     detach_register_patch_omap(stores, index.get(), backend, index_blob, 0);
-
-    // 5. Detach/register/patch data ORAM store
-    {
-        auto s = data_oram.detach_storage();
-        int sid = register_bts(stores, std::move(s));
-        patch_sid(data_blob, 0, sid);
-    }
 
     // 6. Build result: backend(4) + N(4) + bucket_size(4)
     //                + index_blob_len(4) + index_blob

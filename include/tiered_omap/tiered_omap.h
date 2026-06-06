@@ -37,10 +37,11 @@ struct TieredOMapConfig {
     OmapBackend backend = OmapBackend::AVL;       // cold backend (and default hot)
     OmapBackend hot_backend = OmapBackend::AVL;    // hot backend (use_hot_backend=false → same as backend)
     bool use_hot_backend = false;                  // true → hot uses hot_backend instead of backend
-    bool epoch_encoded_values = false;             // true → reserve epoch layout before maintenance is enabled
+    bool epoch_encoded_values = false;             // true → reserve index-entry metadata before maintenance is enabled
     int bplus_order = 8;
     MaintenanceConfig maintenance;
     StorageCreator storage_creator;
+    StorageCreator data_storage_creator;
 
     OmapBackend effective_hot_backend() const {
         return use_hot_backend ? hot_backend : backend;
@@ -85,6 +86,8 @@ public:
 
     void init(const std::vector<std::pair<int, Bytes>>& all_data,
               const std::vector<int>& hot_keys);
+    void init_sequential_values(int total_keys, int value_size,
+                                const std::vector<int>& hot_keys);
 
     AccessResult access(int key, const Bytes* new_value = nullptr);
 
@@ -129,7 +132,6 @@ private:
         if (blk < 0) { data_oram_.dummy_access(); return {}; }
         return data_oram_.access(blk, new_value);
     }
-    Bytes data_epoch_access(int blk, const Bytes* new_value, EpochMeta* out_meta);
 
     // Staggered maintenance steps (paper B1/B2/B3)
     void do_scan_step();

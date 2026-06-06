@@ -1,7 +1,40 @@
 #include "tiered_omap/oram/binary_tree_storage.h"
 #include <algorithm>
+#include <cstdint>
+#include <ios>
+#include <istream>
+#include <ostream>
+#include <stdexcept>
 
 namespace tiered_omap {
+
+namespace {
+
+void write_i32(std::ostream& out, int v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    if (!out) throw std::runtime_error("BinaryTreeStorage::write_state failed");
+}
+
+int read_i32(std::istream& in) {
+    int v = 0;
+    in.read(reinterpret_cast<char*>(&v), sizeof(v));
+    if (!in) throw std::runtime_error("BinaryTreeStorage::read_state failed");
+    return v;
+}
+
+void write_u64(std::ostream& out, uint64_t v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof(v));
+    if (!out) throw std::runtime_error("BinaryTreeStorage::write_state failed");
+}
+
+uint64_t read_u64(std::istream& in) {
+    uint64_t v = 0;
+    in.read(reinterpret_cast<char*>(&v), sizeof(v));
+    if (!in) throw std::runtime_error("BinaryTreeStorage::read_state failed");
+    return v;
+}
+
+}  // namespace
 
 BinaryTreeStorage::BinaryTreeStorage(int num_data, int bucket_size)
     : bucket_size_(bucket_size) {
@@ -77,30 +110,42 @@ std::unordered_map<int, std::vector<Block>>
 BinaryTreeStorage::read_path(int leaf) const {
     auto indices = get_path_indices(leaf);
     std::unordered_map<int, std::vector<Block>> result;
-    for (int idx : indices)
+    for (int idx : indices) {
+        if (idx < 0 || idx >= static_cast<int>(storage_.size()))
+            throw std::runtime_error("BinaryTreeStorage::read_path: node out of range");
         result[idx] = storage_[idx];
+    }
     return result;
 }
 
 void BinaryTreeStorage::write_path(
     int /*leaf*/, const std::unordered_map<int, std::vector<Block>>& buckets) {
-    for (auto& [node, blocks] : buckets)
+    for (auto& [node, blocks] : buckets) {
+        if (node < 0 || node >= static_cast<int>(storage_.size()))
+            throw std::runtime_error("BinaryTreeStorage::write_path: node out of range");
         storage_[node] = blocks;
+    }
 }
 
 std::unordered_map<int, std::vector<Block>>
 BinaryTreeStorage::read_multiple_paths(const std::vector<int>& leaves) const {
     auto indices = get_merged_path_indices(level_, leaves);
     std::unordered_map<int, std::vector<Block>> result;
-    for (int idx : indices)
+    for (int idx : indices) {
+        if (idx < 0 || idx >= static_cast<int>(storage_.size()))
+            throw std::runtime_error("BinaryTreeStorage::read_multiple_paths: node out of range");
         result[idx] = storage_[idx];
+    }
     return result;
 }
 
 void BinaryTreeStorage::write_multiple_paths(
     const std::unordered_map<int, std::vector<Block>>& buckets) {
-    for (auto& [node, blocks] : buckets)
+    for (auto& [node, blocks] : buckets) {
+        if (node < 0 || node >= static_cast<int>(storage_.size()))
+            throw std::runtime_error("BinaryTreeStorage::write_multiple_paths: node out of range");
         storage_[node] = blocks;
+    }
 }
 
 bool BinaryTreeStorage::fill_block_to_path(
@@ -138,6 +183,69 @@ bool BinaryTreeStorage::fill_block_to_path(
         }
     }
     return false;
+}
+
+void BinaryTreeStorage::write_state(std::ostream& out) const {
+    write_i32(out, level_);
+    write_i32(out, leaf_range_);
+    write_i32(out, bucket_size_);
+    write_i32(out, total_nodes_);
+    write_u64(out, static_cast<uint64_t>(storage_.size()));
+    for (const auto& bucket : storage_) {
+        write_u64(out, static_cast<uint64_t>(bucket.size()));
+        for (const auto& block : bucket) {
+            write_i32(out, block.key);
+            write_i32(out, block.leaf);
+            write_u64(out, static_cast<uint64_t>(block.value.size()));
+            if (!block.value.empty()) {
+                out.write(reinterpret_cast<const char*>(block.value.data()),
+                          static_cast<std::streamsize>(block.value.size()));
+                if (!out)
+                    throw std::runtime_error("BinaryTreeStorage::write_state failed");
+            }
+        }
+    }
+}
+
+std::unique_ptr<BinaryTreeStorage>
+BinaryTreeStorage::read_state(std::istream& in) {
+    auto store = std::make_unique<BinaryTreeStorage>();
+    store->level_ = read_i32(in);
+    store->leaf_range_ = read_i32(in);
+    store->bucket_size_ = read_i32(in);
+    store->total_nodes_ = read_i32(in);
+    uint64_t node_count = read_u64(in);
+    if (node_count > static_cast<uint64_t>(store->total_nodes_) ||
+        node_count > static_cast<uint64_t>(1ULL << 32)) {
+        throw std::runtime_error("BinaryTreeStorage::read_state invalid node count");
+    }
+    store->storage_.clear();
+    store->storage_.resize(static_cast<size_t>(node_count));
+    for (auto& bucket : store->storage_) {
+        uint64_t bucket_count = read_u64(in);
+        if (bucket_count > static_cast<uint64_t>(store->bucket_size_)) {
+            throw std::runtime_error("BinaryTreeStorage::read_state invalid bucket size");
+        }
+        bucket.reserve(static_cast<size_t>(bucket_count));
+        for (uint64_t i = 0; i < bucket_count; ++i) {
+            Block block;
+            block.key = read_i32(in);
+            block.leaf = read_i32(in);
+            uint64_t value_size = read_u64(in);
+            if (value_size > static_cast<uint64_t>(1ULL << 32)) {
+                throw std::runtime_error("BinaryTreeStorage::read_state value too large");
+            }
+            block.value.resize(static_cast<size_t>(value_size));
+            if (!block.value.empty()) {
+                in.read(reinterpret_cast<char*>(block.value.data()),
+                        static_cast<std::streamsize>(block.value.size()));
+                if (!in)
+                    throw std::runtime_error("BinaryTreeStorage::read_state failed");
+            }
+            bucket.push_back(std::move(block));
+        }
+    }
+    return store;
 }
 
 }  // namespace tiered_omap

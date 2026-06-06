@@ -5,7 +5,8 @@ Use these scripts from the repository root.
 ## Current Mainline
 
 - `run_revised_experiments.sh`: current paper-facing runner.
-  It runs FO-only client/server experiments and TEE FO/BatchTM experiments.
+  It runs FO-only client/server experiments and TEE FO/BatchTM experiments
+  under large and constrained trusted-memory settings.
 - `run_server.sh`: starts the remote ORAM storage server for client/server runs.
 
 ## Historical Broad Runner

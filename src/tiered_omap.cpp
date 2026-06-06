@@ -18,6 +18,19 @@ static int ref_to_blk(const Bytes& ref) {
     return ref.empty() ? INVALID_BLOCK : bytes_to_int(ref);
 }
 
+static Bytes encode_index_entry(int blk, const EpochMeta& meta) {
+    return encode_with_epoch(int_to_bytes(blk), meta);
+}
+
+static Bytes make_index_entry(int blk, bool epoch_mode) {
+    return epoch_mode ? encode_index_entry(blk, {}) : int_to_bytes(blk);
+}
+
+static std::pair<int, EpochMeta> decode_index_entry(const Bytes& entry) {
+    auto [ref, meta] = decode_epoch(entry);
+    return {ref_to_blk(ref), meta};
+}
+
 TieredOMap::TieredOMap(const TieredOMapConfig& config)
     : config_(config) {
     if (config_.maintenance.enabled)
@@ -61,21 +74,18 @@ void TieredOMap::init(
 
     int N = std::max(static_cast<int>(all_data.size()), 1);
     int data_cap = use_epoch ? std::max(N * 2, N + 64) : N;
-    data_oram_ = PathORAM(data_cap, bs, 7, sc);
+    auto data_sc = config_.data_storage_creator ? config_.data_storage_creator : sc;
+    data_oram_ = PathORAM(data_cap, bs, 7, data_sc);
 
     std::unordered_map<int, Bytes> data_oram_blocks;
     next_data_block_id_ = 0;
 
     std::vector<std::pair<int, Bytes>> hot_refs, cold_refs;
     for (auto& [k, v] : all_data) {
-        Bytes stored = v;
-        if (use_epoch)
-            stored = encode_with_epoch(v, {0, 0});
-
         int blk_id = next_data_block_id_++;
-        data_oram_blocks[blk_id] = stored;
+        data_oram_blocks[blk_id] = v;
 
-        Bytes ref = int_to_bytes(blk_id);
+        Bytes ref = make_index_entry(blk_id, use_epoch);
         if (phys_hot_keys_.count(k))
             hot_refs.emplace_back(k, ref);
         else
@@ -104,15 +114,125 @@ void TieredOMap::init(
                 auto bp = std::make_unique<BPlusOmap>(
                     cap, config_.bplus_order, bs,
                     split_depth, upper_cap, sc);
-                bp->set_index_mode(true);
+                if (!use_epoch) bp->set_index_mode(true);
                 return bp;
             }
             auto bp = std::make_unique<BPlusOmap>(cap, config_.bplus_order, bs, sc);
-            bp->set_index_mode(true);
+            if (!use_epoch) bp->set_index_mode(true);
             return bp;
         }
         case OmapBackend::DaAvl:
             return std::make_unique<DaOstOmap>(cap, OdsTreeType::AVL, 0, bs, 8, sc);
+        case OmapBackend::DaBplus:
+            return std::make_unique<DaOstOmap>(
+                cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order, sc);
+        default: {
+            if (is_cold && config_.use_split_oram && n > 0) {
+                int split_depth = ceil_log2(std::max(n, 2));
+                return std::make_unique<AVLOmap>(
+                    cap, bs, split_depth, std::max(n, 1), sc);
+            }
+            return std::make_unique<AVLOmap>(cap, bs, sc);
+        }
+        }
+    };
+
+    OmapBackend hot_be = config_.effective_hot_backend();
+    hot_omap_ = make_omap(hot_be, hot_cap, false);
+    cold_omap_ = make_omap(config_.backend, cold_cap, true);
+    hot_omap_->init(hot_refs);
+    cold_omap_->init(cold_refs);
+    if (round_delay_us_ > 0)
+        set_round_delay_us(round_delay_us_);
+
+    if (maint_) {
+        int B = config_.maintenance.cache_size;
+        int extract_count = std::min(B, static_cast<int>(hot_key_list_.size()));
+        std::vector<CacheEntry> cache_entries;
+        std::vector<int> to_extract(hot_key_list_.begin(),
+                                     hot_key_list_.begin() + extract_count);
+        for (int k : to_extract) {
+            Bytes ref = hot_omap_->search(k);
+            hot_omap_->remove(k);
+            phys_hot_keys_.erase(k);
+            cache_keys_.insert(k);
+            cache_data_refs_[k] = ref;
+            cache_entries.push_back({k, 0});
+        }
+        hot_key_list_.erase(hot_key_list_.begin(),
+                            hot_key_list_.begin() + extract_count);
+        maint_->init_cache(cache_entries);
+    }
+}
+
+void TieredOMap::init_sequential_values(
+    int total_keys, int value_size, const std::vector<int>& hot_keys) {
+    config_.total_keys = total_keys;
+    config_.hot_set_size = static_cast<int>(hot_keys.size());
+    hot_keys_ = {hot_keys.begin(), hot_keys.end()};
+    phys_hot_keys_ = hot_keys_;
+    hot_key_list_ = hot_keys;
+    std::sort(hot_key_list_.begin(), hot_key_list_.end());
+
+    bool use_epoch = config_.maintenance.enabled || config_.epoch_encoded_values;
+    int bs = config_.bucket_size;
+    auto& sc = config_.storage_creator;
+
+    int N = std::max(total_keys, 1);
+    int data_cap = use_epoch ? std::max(N * 2, N + 64) : N;
+    auto data_sc = config_.data_storage_creator ? config_.data_storage_creator : sc;
+    data_oram_ = PathORAM(data_cap, bs, 7, data_sc);
+    data_oram_.init_sequential(total_keys, value_size);
+    next_data_block_id_ = total_keys;
+
+    std::vector<std::pair<int, Bytes>> hot_refs, cold_refs;
+    hot_refs.reserve(hot_keys_.size());
+    cold_refs.reserve(static_cast<size_t>(
+        std::max(total_keys - static_cast<int>(hot_keys_.size()), 0)));
+    for (int k = 0; k < total_keys; ++k) {
+        Bytes ref = make_index_entry(k, use_epoch);
+        if (phys_hot_keys_.count(k))
+            hot_refs.emplace_back(k, ref);
+        else
+            cold_refs.emplace_back(k, ref);
+    }
+
+    int n = static_cast<int>(hot_refs.size());
+    int N_cold = static_cast<int>(cold_refs.size());
+
+    int hot_cap = std::max(n, 1);
+    int cold_cap = use_epoch ? std::max(N_cold, config_.total_keys)
+                             : std::max(N_cold, 1);
+    hot_capacity_ = hot_cap;
+
+    auto make_omap = [&](OmapBackend be, int cap,
+                         bool is_cold) -> std::unique_ptr<OmapInterface> {
+        switch (be) {
+        case OmapBackend::BPlus: {
+            if (is_cold && config_.use_split_oram && n > 0) {
+                int ord = config_.bplus_order;
+                int split_depth = std::max(1,
+                    static_cast<int>(std::floor(
+                        std::log(std::max(n, 2)) /
+                        std::log(std::max(ord, 2)))));
+                int upper_cap = static_cast<int>(
+                    (std::pow(ord, split_depth) - 1) /
+                    std::max(ord - 1, 1));
+                upper_cap = std::max(upper_cap, n);
+                auto bp = std::make_unique<BPlusOmap>(
+                    cap, config_.bplus_order, bs,
+                    split_depth, upper_cap, sc);
+                if (!use_epoch) bp->set_index_mode(true);
+                return bp;
+            }
+            auto bp = std::make_unique<BPlusOmap>(
+                cap, config_.bplus_order, bs, sc);
+            if (!use_epoch) bp->set_index_mode(true);
+            return bp;
+        }
+        case OmapBackend::DaAvl:
+            return std::make_unique<DaOstOmap>(
+                cap, OdsTreeType::AVL, 0, bs, 8, sc);
         case OmapBackend::DaBplus:
             return std::make_unique<DaOstOmap>(
                 cap, OdsTreeType::BPlus, 0, bs, config_.bplus_order, sc);
@@ -172,26 +292,6 @@ DynamicDebugState TieredOMap::dynamic_debug_state() const {
     return st;
 }
 
-Bytes TieredOMap::data_epoch_access(
-    int blk, const Bytes* new_value, EpochMeta* out_meta) {
-    if (blk < 0) {
-        data_oram_.dummy_access();
-        if (out_meta) *out_meta = {};
-        return {};
-    }
-
-    Bytes plain;
-    EpochMeta updated;
-    data_oram_.access_update(blk, [&](const Bytes& raw) {
-        auto [val, meta] = decode_epoch(raw);
-        updated = maint_->update_meta(meta);
-        plain = new_value ? *new_value : val;
-        return encode_with_epoch(plain, updated);
-    });
-    if (out_meta) *out_meta = updated;
-    return plain;
-}
-
 // ─── Main access ────────────────────────────────────────────────────────────
 
 AccessResult TieredOMap::access(int key, const Bytes* new_value) {
@@ -211,6 +311,12 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         bool hot_dummy_pb = false;
         bool cold_dummy_pb = false;
         bool query_stats_ready = false;
+        auto touch_index_entry = [&](Bytes& entry) {
+            auto [blk, meta] = decode_index_entry(entry);
+            meta = maint_->update_meta(meta);
+            entry = encode_index_entry(blk, meta);
+            return std::pair<int, EpochMeta>{blk, meta};
+        };
 
         bool is_pending = (key == pending_insert_key_);
         bool is_in_cache = !is_pending && cache_keys_.count(key) > 0;
@@ -233,9 +339,8 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             // insertion into the destination OMAP. The logical tier is tracked
             // by hot_keys_: HotPend entries remain hot, ColdPend entries do not.
             result.found_in_hot = is_hot_logical;
-            int blk = ref_to_blk(pending_insert_ref_);
-            EpochMeta meta;
-            result.value = data_epoch_access(blk, new_value, &meta);
+            auto [blk, meta] = touch_index_entry(pending_insert_ref_);
+            result.value = data_access(blk, new_value);
             result.last_access_fp = meta.fp;
             if (config_.mode == SecurityMode::FullOblivious) {
                 hot_omap_->dummy_access();
@@ -383,10 +488,9 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             }
         } else if (is_in_cache) {
             // Cache hit: direct data access, dummy both OMAPs
-            Bytes ref = cache_data_refs_[key];
-            int blk = ref_to_blk(ref);
-            EpochMeta meta;
-            result.value = data_epoch_access(blk, new_value, &meta);
+            auto& ref = cache_data_refs_[key];
+            auto [blk, meta] = touch_index_entry(ref);
+            result.value = data_access(blk, new_value);
             result.last_access_fp = meta.fp;
             maint_->update_cache_fp(key, meta.fp);
             hot_omap_->dummy_access();
@@ -400,10 +504,17 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
                                                     : cold_omap_.get();
             OmapInterface* other  = is_hot_physical ? cold_omap_.get()
                                                     : hot_omap_.get();
-            Bytes ref = target->search(key);
-            int blk = ref_to_blk(ref);
             EpochMeta meta;
-            result.value = data_epoch_access(blk, new_value, &meta);
+            Bytes updated_ref;
+            Bytes ref = target->search_update(key, [&](const Bytes& old_ref) {
+                auto [blk, m] = decode_index_entry(old_ref);
+                meta = maint_->update_meta(m);
+                updated_ref = encode_index_entry(blk, meta);
+                return updated_ref;
+            });
+            Bytes current_ref = updated_ref.empty() ? ref : updated_ref;
+            int blk = ref_to_blk(current_ref);
+            result.value = data_access(blk, new_value);
             result.last_access_fp = meta.fp;
 
             if (config_.mode == SecurityMode::FullOblivious)
@@ -423,7 +534,7 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
                 cache_data_refs_.erase(evicted.key);
                 hot_keys_.erase(evicted.key);
                 cache_keys_.insert(key);
-                cache_data_refs_[key] = ref;
+                cache_data_refs_[key] = current_ref;
                 hot_keys_.insert(key);
                 maint_->set_swap_state(SwapState::ColdPend);
             } else if (!is_hot_logical && !ref.empty()) {
@@ -437,9 +548,8 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             auto* da_hot = static_cast<DaOstOmap*>(hot_omap_.get());
             auto sr = da_hot->piggyback_scan_step();
             if (sr.key != INVALID_KEY && !sr.value.empty()) {
-                int scan_blk = ref_to_blk(sr.value);
-                Bytes scan_raw = data_access(scan_blk);
-                auto [sv, sm] = decode_epoch(scan_raw);
+                auto [scan_blk, sm] = decode_index_entry(sr.value);
+                (void)scan_blk;
                 if (maint_->should_demote_cache(sm.fp))
                     da_pending_demotions_.push_back({sr.key, sm.fp});
             }
@@ -623,7 +733,6 @@ int TieredOMap::next_scan_key_excluding(int avoid_key) {
 void TieredOMap::do_scan_step() {
     if (maint_->swap_state() != SwapState::Idle) {
         hot_omap_->dummy_access();
-        data_oram_.dummy_access();
         return;
     }
 
@@ -666,7 +775,6 @@ void TieredOMap::do_scan_step() {
     // Non-DA path: sequential scan of hot_key_list_
     if (hot_key_list_.empty()) {
         hot_omap_->dummy_access();
-        data_oram_.dummy_access();
         return;
     }
 
@@ -680,9 +788,8 @@ void TieredOMap::do_scan_step() {
     maint_->set_scan_ptr(scan_key);
 
     Bytes ref = hot_omap_->search(scan_key);
-    int blk = ref_to_blk(ref);
-    Bytes raw = data_access(blk);
-    auto [val, meta] = decode_epoch(raw);
+    auto [blk, meta] = decode_index_entry(ref);
+    (void)blk;
 
     if (maint_->should_demote_cache(meta.fp)) {
         hot_omap_->remove(scan_key);
@@ -860,9 +967,26 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         return result;
     }
 
+    int computed_fp = 0;
+    Bytes hot_updated_ref, cold_updated_ref;
+    auto make_index_update = [&](Bytes* updated_ref) {
+        return [&, updated_ref](const Bytes& old_ref) {
+            auto [blk, meta] = decode_index_entry(old_ref);
+            meta = maint_->update_meta(meta);
+            computed_fp = meta.fp;
+            *updated_ref = encode_index_entry(blk, meta);
+            return *updated_ref;
+        };
+    };
+
     // ── Both OMAPs search in parallel (no searcher/dummy split) ──
-    hot_omap_->begin_step_search(key, nullptr);
-    cold_omap_->begin_step_search(key, nullptr);
+    if (epoch_mode && maint_) {
+        hot_omap_->begin_step_search_update(key, make_index_update(&hot_updated_ref));
+        cold_omap_->begin_step_search_update(key, make_index_update(&cold_updated_ref));
+    } else {
+        hot_omap_->begin_step_search(key, nullptr);
+        cold_omap_->begin_step_search(key, nullptr);
+    }
 
     // ── Piggybacking setup (epoch mode maintenance) ──
     bool scan_on_piggyback = false;
@@ -896,10 +1020,6 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
     int  cold_data_blk = INVALID_BLOCK;
     int  cold_data_leaf = -1, cold_data_new_leaf = -1;
 
-    // Scan data ORAM (epoch piggyback)
-    DStep scan_data_st = scan_on_piggyback ? IDLE : DONE;
-    int  scan_data_blk = INVALID_BLOCK;
-    int  scan_data_leaf = -1, scan_data_new_leaf = -1;
     bool scan_decision_triggered = false;
 
     bool hot_done_flag = false, cold_done_flag = false;
@@ -907,9 +1027,7 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
     Bytes hot_ref, cold_ref;
     int  total_rounds = 0;
     int  answer_round = 0;
-    int  computed_fp  = 0;
     bool decision_triggered = false;
-    bool decision_pending   = false;
     bool maintenance_transition_reserved = false;
 
     auto setup_data_oram = [&](DStep& st, int& blk, int& leaf, int& new_leaf,
@@ -930,8 +1048,7 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         bool h_act = !hot_done_flag  && !hot_omap_->step_done();
         bool c_act = !cold_done_flag && !cold_omap_->step_done();
         if (!h_act && !c_act
-            && hot_data_st  == DONE && cold_data_st == DONE
-            && scan_data_st == DONE)
+            && hot_data_st  == DONE && cold_data_st == DONE)
             break;
 
         ++total_rounds;
@@ -947,10 +1064,9 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         for (auto& r : cr.reads) reads.push_back({r.store_id, r.leaf});
         size_t c_cnt = cr.reads.size();
 
-        size_t hd_cnt = 0, cd_cnt = 0, sd_cnt = 0;
+        size_t hd_cnt = 0, cd_cnt = 0;
         if (hot_data_st  == NEED_READ) { reads.push_back({data_oram_.get_store_id(), hot_data_leaf});  hd_cnt = 1; }
         if (cold_data_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), cold_data_leaf}); cd_cnt = 1; }
-        if (scan_data_st == NEED_READ) { reads.push_back({data_oram_.get_store_id(), scan_data_leaf}); sd_cnt = 1; }
 
         auto fetched = batch_read_paths(*channel_, reads);
 
@@ -966,9 +1082,19 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                           fetched.begin() + off + c_cnt});
         }
         off += c_cnt;
-        if (hd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
-        if (cd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
-        if (sd_cnt) { data_oram_.apply_fetched_path(std::move(fetched[off])); ++off; }
+        PathData data_paths;
+        bool has_data_path = false;
+        auto merge_data_path = [&](PathData&& path) {
+            has_data_path = true;
+            for (auto& [node, blocks] : path) {
+                if (data_paths.find(node) == data_paths.end())
+                    data_paths.emplace(node, std::move(blocks));
+            }
+        };
+        if (hd_cnt) { merge_data_path(std::move(fetched[off])); ++off; }
+        if (cd_cnt) { merge_data_path(std::move(fetched[off])); ++off; }
+        if (has_data_path)
+            data_oram_.apply_fetched_path(std::move(data_paths));
 
         // ── Process OMAP steps ──
         if (h_act) hot_omap_->step_process();
@@ -978,19 +1104,8 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         if (hd_cnt) {
             if (hot_data_blk != INVALID_BLOCK) {
                 Block b = data_oram_.extract_from_stash(hot_data_blk);
-                Bytes sv;
-                if (epoch_mode && maint_) {
-                    auto [val, meta] = decode_epoch(b.value);
-                    meta = maint_->update_meta(meta);
-                    computed_fp = meta.fp;
-                    result.value = new_value ? *new_value : val;
-                    sv = encode_with_epoch(result.value, meta);
-                    if (cache_keys_.count(key))
-                        maint_->update_cache_fp(key, meta.fp);
-                } else {
-                    result.value = new_value ? *new_value : b.value;
-                    sv = new_value ? *new_value : b.value;
-                }
+                result.value = new_value ? *new_value : b.value;
+                Bytes sv = new_value ? *new_value : b.value;
                 data_oram_.add_to_stash({hot_data_blk, hot_data_new_leaf, std::move(sv)});
                 answer_round = total_rounds;
             }
@@ -1001,65 +1116,12 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
         if (cd_cnt) {
             if (cold_data_blk != INVALID_BLOCK) {
                 Block b = data_oram_.extract_from_stash(cold_data_blk);
-                Bytes sv;
-                if (epoch_mode && maint_) {
-                    auto [val, meta] = decode_epoch(b.value);
-                    meta = maint_->update_meta(meta);
-                    computed_fp = meta.fp;
-                    result.value = new_value ? *new_value : val;
-                    sv = encode_with_epoch(result.value, meta);
-                    if (cache_keys_.count(key))
-                        maint_->update_cache_fp(key, meta.fp);
-                } else {
-                    result.value = new_value ? *new_value : b.value;
-                    sv = new_value ? *new_value : b.value;
-                }
+                result.value = new_value ? *new_value : b.value;
+                Bytes sv = new_value ? *new_value : b.value;
                 data_oram_.add_to_stash({cold_data_blk, cold_data_new_leaf, std::move(sv)});
                 answer_round = total_rounds;
             }
             cold_data_st = NEED_WRITE;
-            if (decision_pending) {
-                bool should_prom = computed_fp > 0
-                    && maint_ && maint_->swap_state() == SwapState::Idle
-                    && !maintenance_transition_reserved
-                    && maint_->should_promote(computed_fp);
-                if (should_prom) {
-                    cold_omap_->step_commit_remove();
-                    result.cold_promotion_done = true;
-                    maintenance_transition_reserved = true;
-                } else {
-                    cold_omap_->step_commit_noop();
-                }
-                result.cold_decision_handled = true;
-                decision_pending = false;
-            }
-        }
-
-        // ── Scan data ORAM result processing ──
-        if (sd_cnt) {
-            if (scan_data_blk != INVALID_BLOCK) {
-                Block sb = data_oram_.extract_from_stash(scan_data_blk);
-                if (epoch_mode && maint_) {
-                    auto [sv, sm] = decode_epoch(sb.value);
-                    bool should_demote =
-                        maint_->swap_state() == SwapState::Idle
-                        && !maintenance_transition_reserved
-                        && maint_->should_demote_cache(sm.fp);
-                    if (should_demote) {
-                        hot_omap_->piggyback_commit_remove();
-                        result.scan_demoted = true;
-                        result.scan_fp = sm.fp;
-                        maintenance_transition_reserved = true;
-                    } else {
-                        hot_omap_->piggyback_commit_noop();
-                    }
-                    result.scan_decision_handled = true;
-                } else {
-                    hot_omap_->piggyback_commit_noop();
-                }
-                data_oram_.add_to_stash({scan_data_blk, scan_data_new_leaf, sb.value});
-            }
-            scan_data_st = NEED_WRITE;
         }
 
         // ── DECISION trigger: cold OMAP paused after traverse (epoch) ──
@@ -1067,9 +1129,23 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             && !cold_done_flag && cold_omap_->step_needs_decision()) {
             decision_triggered = true;
             Bytes trav_ref = cold_omap_->step_get_traverse_result();
+            if (!cold_updated_ref.empty())
+                trav_ref = cold_updated_ref;
+            cold_ref = trav_ref;
             setup_data_oram(cold_data_st, cold_data_blk, cold_data_leaf,
                             cold_data_new_leaf, trav_ref);
-            decision_pending = true;
+            bool should_prom = computed_fp > 0
+                && maint_ && maint_->swap_state() == SwapState::Idle
+                && !maintenance_transition_reserved
+                && maint_->should_promote(computed_fp);
+            if (should_prom) {
+                cold_omap_->step_commit_remove();
+                result.cold_promotion_done = true;
+                maintenance_transition_reserved = true;
+            } else {
+                cold_omap_->step_commit_noop();
+            }
+            result.cold_decision_handled = true;
         }
 
         // ── Scan DECISION trigger ──
@@ -1077,14 +1153,29 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             && hot_omap_->piggyback_needs_decision()) {
             scan_decision_triggered = true;
             Bytes scan_trav_ref = hot_omap_->piggyback_get_traverse_result();
-            setup_data_oram(scan_data_st, scan_data_blk, scan_data_leaf,
-                            scan_data_new_leaf, scan_trav_ref);
+            auto [scan_blk, sm] = decode_index_entry(scan_trav_ref);
+            (void)scan_blk;
+            bool should_demote =
+                maint_ && maint_->swap_state() == SwapState::Idle
+                && !maintenance_transition_reserved
+                && maint_->should_demote_cache(sm.fp);
+            if (should_demote) {
+                hot_omap_->piggyback_commit_remove();
+                result.scan_demoted = true;
+                result.scan_fp = sm.fp;
+                maintenance_transition_reserved = true;
+            } else {
+                hot_omap_->piggyback_commit_noop();
+            }
+            result.scan_decision_handled = true;
         }
 
         // ── Hot OMAP completion ──
         if (!hot_done_flag && hot_omap_->step_done()) {
             hot_done_flag = true;
             hot_ref = hot_omap_->step_finish();
+            if (!hot_updated_ref.empty())
+                hot_ref = hot_updated_ref;
             found_in_hot = !hot_ref.empty();
 
             if (found_in_hot) {
@@ -1116,6 +1207,8 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                 cold_ref = cold_omap_->step_finish();
             else
                 cold_omap_->step_finish();
+            if (!cold_updated_ref.empty())
+                cold_ref = cold_updated_ref;
 
             if (cold_data_st == IDLE) {
                 if (!found_in_hot && !cold_ref.empty()) {
@@ -1142,20 +1235,21 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             for (auto& w : cold_omap_->step_prepare_writes())
                 writes.push_back({w.store_id, std::move(w.data)});
         }
+        std::vector<int> data_write_leaves;
         if (hot_data_st == NEED_WRITE) {
-            writes.push_back({data_oram_.get_store_id(),
-                              data_oram_.prepare_eviction(hot_data_leaf)});
+            data_write_leaves.push_back(hot_data_leaf);
             hot_data_st = DONE;
         }
         if (cold_data_st == NEED_WRITE) {
-            writes.push_back({data_oram_.get_store_id(),
-                              data_oram_.prepare_eviction(cold_data_leaf)});
+            data_write_leaves.push_back(cold_data_leaf);
             cold_data_st = DONE;
         }
-        if (scan_data_st == NEED_WRITE) {
+        if (!data_write_leaves.empty()) {
+            PathData data_write = data_write_leaves.size() == 1
+                ? data_oram_.prepare_eviction(data_write_leaves.front())
+                : data_oram_.prepare_eviction_paths(data_write_leaves);
             writes.push_back({data_oram_.get_store_id(),
-                              data_oram_.prepare_eviction(scan_data_leaf)});
-            scan_data_st = DONE;
+                              std::move(data_write)});
         }
         batch_write_paths(*channel_, writes);
         inject_round_delay();
@@ -1191,7 +1285,6 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
 
     int dpbw = data_oram_.path_bandwidth_bytes();
     int nops = fo ? 2 : 1;
-    if (scan_on_piggyback) nops++;
     result.total_bw.bytes_downloaded =
         result.hot_bw.bytes_downloaded + result.cold_bw.bytes_downloaded +
         static_cast<size_t>(dpbw) * nops;
@@ -1217,24 +1310,25 @@ AccessResult TieredOMap::interleaved_da_piggyback(int key, const Bytes* new_valu
     OmapInterface* target = is_hot_physical ? hot_omap_.get() : cold_omap_.get();
     OmapInterface* other  = is_hot_physical ? cold_omap_.get() : hot_omap_.get();
 
-    target->begin_step_search(key, nullptr);
+    EpochMeta meta;
+    Bytes updated_ref;
+    target->begin_step_search_update(key, [&](const Bytes& old_ref) {
+        auto [blk, m] = decode_index_entry(old_ref);
+        meta = maint_->update_meta(m);
+        updated_ref = encode_index_entry(blk, meta);
+        return updated_ref;
+    });
     other->begin_step_partial_dummy();
     run_interleaved_loop(target, other);
     Bytes ref = target->step_finish();
+    if (!updated_ref.empty())
+        ref = updated_ref;
     other->step_finish();
 
     int blk = ref_to_blk(ref);
-    Bytes raw = data_access(blk);
+    result.value = data_access(blk, new_value);
     data_oram_.dummy_access();
-
-    auto [val, meta] = decode_epoch(raw);
-    meta = maint_->update_meta(meta);
-    Bytes wb = encode_with_epoch(new_value ? *new_value : val, meta);
-    result.value = new_value ? *new_value : val;
     result.last_access_fp = meta.fp;
-
-    data_access(blk, &wb);
-    data_oram_.dummy_access();
 
     auto* da_hot = static_cast<DaOstOmap*>(hot_omap_.get());
 
@@ -1245,9 +1339,8 @@ AccessResult TieredOMap::interleaved_da_piggyback(int key, const Bytes* new_valu
     auto sr = da_hot->step_finish_scan();
 
     if (sr.key != INVALID_KEY && !sr.value.empty()) {
-        int scan_blk = ref_to_blk(sr.value);
-        Bytes scan_raw = data_access(scan_blk);
-        auto [sv, sm] = decode_epoch(scan_raw);
+        auto [scan_blk, sm] = decode_index_entry(sr.value);
+        (void)scan_blk;
         if (maint_->should_demote_cache(sm.fp))
             da_pending_demotions_.push_back({sr.key, sm.fp});
     }

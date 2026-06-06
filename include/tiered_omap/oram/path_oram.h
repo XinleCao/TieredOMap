@@ -20,6 +20,7 @@ public:
              StorageCreator storage_creator = nullptr);
 
     void init(const std::unordered_map<int, Bytes>& data);
+    void init_sequential(int count, int value_size);
 
     Bytes export_state(int store_id) const;
     static PathORAM from_state_network(const uint8_t*& p,

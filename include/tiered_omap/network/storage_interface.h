@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tiered_omap/common.h"
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -24,6 +25,27 @@ public:
     // Fills all blocks into the tree and returns keys that were placed.
     virtual std::unordered_set<int>
     bulk_load(const std::vector<Block>& blocks) = 0;
+
+    // Streaming load used by large server-side data ORAM setup.  The default
+    // path preserves the existing in-memory behavior; disk-backed storage
+    // overrides this to avoid materializing all value blocks at once.
+    virtual void bulk_load_generated(
+        int count, size_t max_value_size,
+        const std::function<Block(int)>& make_block,
+        const std::function<void(int)>& on_overflow) {
+        (void)max_value_size;
+        std::vector<Block> blocks;
+        blocks.reserve(count);
+        for (int i = 0; i < count; ++i)
+            blocks.push_back(make_block(i));
+        auto placed = bulk_load(blocks);
+        if (on_overflow) {
+            for (int i = 0; i < count; ++i)
+                if (placed.find(blocks[static_cast<size_t>(i)].key) ==
+                    placed.end())
+                    on_overflow(i);
+        }
+    }
 
     virtual std::unordered_map<int, std::vector<Block>>
     read_path(int leaf) const = 0;

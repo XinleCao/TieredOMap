@@ -46,9 +46,20 @@ struct TeeAccessResult {
     uint64_t total_pages = 0;
 };
 
+struct TeeBatchAccessResult {
+    std::vector<TeeAccessResult> results;
+    int hot_count = 0;
+    int cold_count = 0;
+    uint64_t hot_phase_pages = 0;
+    uint64_t cold_extra_pages = 0;
+    uint64_t total_pages = 0;
+};
+
 class TeeOmap {
 public:
     using ResponseCallback = std::function<void(const Bytes& value, bool found)>;
+    using BatchResponseCallback =
+        std::function<void(const std::vector<TeeAccessResult>& results)>;
 
     explicit TeeOmap(const TeeOmapConfig& config);
 
@@ -58,6 +69,11 @@ public:
     TeeAccessResult access(int key, const Bytes* new_value = nullptr,
                            ResponseCallback early_cb = nullptr,
                            ResponseCallback final_cb = nullptr);
+
+    TeeBatchAccessResult access_batch_tier_membership(
+        const std::vector<int>& keys,
+        BatchResponseCallback hot_release_cb = nullptr,
+        BatchResponseCallback final_cb = nullptr);
 
     void promote(int key, const Bytes& value);
     void demote(int key);

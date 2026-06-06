@@ -15,7 +15,7 @@ Important current entry points:
 
 - `scripts/run_revised_experiments.sh`: current mainline runner.
   It runs the FO-only client/server experiment and the TEE FO/BatchTM
-  experiment.
+  experiment under large and constrained trusted-memory settings.
 - `scripts/run_paper_experiments.sh`: older broad paper runner that still covers
   backend, bandwidth, skewness, hotsize, mode, dynamic, workload, and drift
   experiments.

@@ -61,6 +61,7 @@ public:
 
     bool supports_interleaved() const override { return true; }
     void begin_step_search(int key, const Bytes* update = nullptr) override;
+    void begin_step_search_update(int key, const UpdateFn& update_fn) override;
     void begin_step_dummy() override;
     void begin_step_partial_dummy() override;
     OramStepRound step_next_round() override;
@@ -76,6 +77,7 @@ public:
     void begin_piggyback_insert(int key, const Bytes& value) override;
     void begin_piggyback_dummy() override;
     Bytes finish_piggyback() override;
+    void set_piggyback_decision_enabled(bool enable) override;
     bool piggyback_needs_decision() const override;
     Bytes piggyback_get_traverse_result() override;
     void piggyback_commit_remove() override;
@@ -125,14 +127,16 @@ private:
     void finalize_bw();
     void reset_op_counts();
 
-    enum class StepPhase { TRAVERSE, PAD, DONE };
+    enum class StepPhase { TRAVERSE, DECISION, DELETE_SUCCESSOR, DELETE_REBALANCE, PAD, DONE };
     struct StepState {
         StepPhase phase = StepPhase::DONE;
         int key = INVALID_KEY;
         const Bytes* update = nullptr;
+        UpdateFn update_fn;
         bool is_dummy = false;
         int cur_key = INVALID_KEY;
         int cur_leaf = INVALID_LEAF;
+        int parent_key = INVALID_KEY;
         int depth = 0;
         int budget = 0;
         int ops = 0;
@@ -152,6 +156,7 @@ private:
         int key = INVALID_KEY;
         int cur_key = INVALID_KEY;
         int cur_leaf = INVALID_LEAF;
+        int parent_key = INVALID_KEY;
         int depth = 0;
         int ops = 0;
         int budget = 0;
@@ -166,6 +171,28 @@ private:
         bool traverse_done = false;
         bool is_insert = false;
         Bytes insert_value;
+        bool decision_enabled = false;
+
+        std::vector<int> path_keys;
+        std::vector<int> rebalance_path;
+        int rebalance_pos = -1;
+        int rebalance_stage = 0;
+        bool rebalance_node_missing = false;
+        bool rebalance_unbalanced = false;
+        int rebalance_node_key = INVALID_KEY;
+        int rebalance_node_depth = 0;
+        int rebalance_balance = 0;
+        int rebalance_tall_key = INVALID_KEY;
+        int rebalance_tall_leaf = INVALID_LEAF;
+        int rebalance_tall_depth = 0;
+        int rebalance_inner_key = INVALID_KEY;
+        int rebalance_inner_leaf = INVALID_LEAF;
+        int rebalance_inner_depth = 0;
+        bool delete_round_real = false;
+        int delete_round_key = INVALID_KEY;
+        int delete_round_leaf = INVALID_LEAF;
+        int delete_round_depth = 0;
+        int delete_round_parent = INVALID_KEY;
     };
     PBState pb_;
 

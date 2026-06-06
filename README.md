@@ -4,7 +4,9 @@ Exploiting access skewness for efficient oblivious key-value stores.
 
 ## Overview
 
-TieredOMap partitions keys into independent **hot** and **cold** oblivious maps (OMAPs) and searches both in parallel on every query. It offers two operating modes:
+TieredOMap partitions keys into independent **hot** and **cold** oblivious maps (OMAPs) and searches both in parallel on every query. The current paper-facing evaluation uses **Full Obliviousness** for the client/server setting and **Batch Tier-Membership** only in the TEE setting; older per-query Tier-Membership experiments remain in the codebase as diagnostic baselines.
+
+The implementation supports two security modes:
 
 - **Full Obliviousness** — identical security to a standard OMAP (zero additional leakage), yet the client receives hot-key answers after only O(log n) rounds instead of O(log N).
 - **Tier-Membership Privacy** — reveals one bit (hot or cold) per query, reducing hot-key bandwidth to O(log²n + log N) via Split-ORAM.
@@ -33,7 +35,10 @@ ctest --output-on-failure
 ```bash
 cd build
 
-# 基础带宽/延迟实验（本地已测到 N=2^22）
+# Current paper-facing runner
+../scripts/run_revised_experiments.sh 20 500 <SERVER_IP> 12345 ../results_revised
+
+# Legacy diagnostics
 ./bench_latency --exp=bandwidth --Q=200 --warmup=50
 
 # 大规模实验（逐个跑，节省内存）

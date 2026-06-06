@@ -197,6 +197,50 @@ TEST_F(NetworkTest, TieredOMap_DynamicInterleavedRoundAccounting) {
     EXPECT_LE(hot.rounds_to_answer, static_cast<int>(hot.total_bw.rounds));
 }
 
+TEST_F(NetworkTest, TieredOMap_DynamicBPlusPromotionDeletesColdEntry) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 64;
+    cfg.hot_set_size = 8;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::BPlus;
+    cfg.bplus_order = 4;
+    cfg.storage_creator = creator_;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.observation_window = 2;
+    cfg.maintenance.swap_interval = 64;
+    cfg.maintenance.cache_size = 4;
+    cfg.maintenance.piggyback = false;
+
+    TieredOMap tm(cfg);
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < 64; ++i) data.emplace_back(i, int_to_bytes(i));
+    std::vector<int> hot_keys;
+    for (int i = 0; i < 8; ++i) hot_keys.push_back(i);
+
+    tm.init(data, hot_keys);
+    tm.set_channel(channel_);
+
+    auto r0 = tm.access(32);
+    EXPECT_FALSE(r0.found_in_hot);
+    EXPECT_EQ(bytes_to_int(r0.value), 32);
+
+    auto r1 = tm.access(32);
+    EXPECT_EQ(bytes_to_int(r1.value), 32);
+
+    auto st = tm.dynamic_debug_state();
+    EXPECT_EQ(st.swap_state, SwapState::ColdPend);
+    EXPECT_TRUE(st.hot_keys.count(32));
+    EXPECT_TRUE(st.cache_keys.count(32));
+    EXPECT_TRUE(tm.cold_omap()->search(32).empty())
+        << "B+ step promotion must delete the promoted key from cold OMAP";
+
+    for (int k = 0; k < 64; ++k) {
+        auto r = tm.access(k);
+        EXPECT_EQ(bytes_to_int(r.value), k)
+            << "value mismatch after B+ step promotion at key " << k;
+    }
+}
+
 TEST_F(NetworkTest, TieredOMap_TierMembershipDaColdInterleaved) {
     TieredOMapConfig cfg;
     cfg.total_keys = 128;
@@ -266,6 +310,9 @@ TEST_F(NetworkTest, TieredOMap_DynamicPiggybackSinglePendingTransition) {
     EXPECT_TRUE(st.phys_hot_keys.count(2))
         << "scan demotion must not also commit in the promotion access";
     EXPECT_TRUE(st.phys_hot_keys.count(3));
+    EXPECT_FALSE(st.phys_hot_keys.count(1));
+    EXPECT_TRUE(tm.hot_omap()->search(1).empty())
+        << "piggyback demotion must delete the key inside the AVL OMAP";
 
     std::unordered_set<int> effective_hot = st.phys_hot_keys;
     effective_hot.insert(st.cache_keys.begin(), st.cache_keys.end());
@@ -318,6 +365,62 @@ TEST_F(NetworkTest, TieredOMap_DynamicPiggybackZipfWorkloadNoThrow) {
     }
 }
 
+TEST_F(NetworkTest, TieredOMap_DynamicPiggybackAvlLargeHotNoThrow) {
+    TieredOMapConfig cfg;
+    cfg.total_keys = 4096;
+    cfg.hot_set_size = 1024;
+    cfg.mode = SecurityMode::FullOblivious;
+    cfg.backend = OmapBackend::AVL;
+    cfg.use_split_oram = true;
+    cfg.storage_creator = creator_;
+    cfg.maintenance.enabled = true;
+    cfg.maintenance.piggyback = true;
+    cfg.maintenance.observation_window = 32;
+    cfg.maintenance.swap_interval = 32;
+    cfg.maintenance.cache_size = 4;
+
+    TieredOMap tm(cfg);
+    std::vector<std::pair<int, Bytes>> data;
+    for (int i = 0; i < cfg.total_keys; ++i)
+        data.emplace_back(i, int_to_bytes(i));
+    std::vector<int> hot_keys;
+    for (int i = 0; i < cfg.hot_set_size; ++i)
+        hot_keys.push_back(i);
+
+    tm.init(data, hot_keys);
+    tm.set_channel(channel_);
+
+    ZipfSampler warm(cfg.total_keys, 1.0, 42);
+    for (int i = 0; i < 64; ++i) {
+        int key = warm.sample();
+        SCOPED_TRACE("warmup op=" + std::to_string(i) +
+                     " key=" + std::to_string(key));
+        AccessResult r;
+        try {
+            r = tm.access(key);
+        } catch (const std::exception& e) {
+            FAIL() << "warmup op=" << i << " key=" << key
+                   << " exception=" << e.what();
+        }
+        EXPECT_EQ(bytes_to_int(r.value), key);
+    }
+
+    ZipfSampler z(cfg.total_keys, 1.0, 4242);
+    for (int i = 0; i < 40; ++i) {
+        int key = z.sample();
+        SCOPED_TRACE("measure op=" + std::to_string(i) +
+                     " key=" + std::to_string(key));
+        AccessResult r;
+        try {
+            r = tm.access(key);
+        } catch (const std::exception& e) {
+            FAIL() << "measure op=" << i << " key=" << key
+                   << " exception=" << e.what();
+        }
+        EXPECT_EQ(bytes_to_int(r.value), key);
+    }
+}
+
 TEST_F(NetworkTest, SetupBenchTieredDynamicRestorePreservesEpochValues) {
     const int N = 128;
     const int n = 16;
@@ -335,7 +438,7 @@ TEST_F(NetworkTest, SetupBenchTieredDynamicRestorePreservesEpochValues) {
     ser_int(payload, 0);  // unused data_count
     ser_int(payload, static_cast<int>(OmapBackend::BPlus));
     ser_int(payload, 1);  // use hot backend
-    ser_int(payload, 1);  // pre-encode values for dynamic maintenance
+    ser_int(payload, 1);  // reserve index-entry metadata for dynamic maintenance
 
     channel_->send_msg(MsgType::SETUP_BENCH, payload);
     MsgType resp_type;
@@ -361,7 +464,7 @@ TEST_F(NetworkTest, SetupBenchTieredDynamicRestorePreservesEpochValues) {
     EXPECT_TRUE(hot_cache.found_in_hot);
     EXPECT_EQ(bytes_to_int(hot_cache.value), 3);
     EXPECT_EQ(hot_cache.value.size(), static_cast<size_t>(value_size))
-        << "server SETUP_BENCH must pre-encode epoch metadata before "
+        << "server SETUP_BENCH must reserve epoch metadata before "
         << "client-side dynamic maintenance is enabled";
 
     auto cold = tm->access(64);

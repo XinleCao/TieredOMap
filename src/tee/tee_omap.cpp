@@ -1,5 +1,6 @@
 #include "tiered_omap/tee/tee_omap.h"
 #include <algorithm>
+#include <stdexcept>
 
 namespace tiered_omap {
 namespace tee {
@@ -110,12 +111,14 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
 
     Bytes hot_val(config_.value_size, 0);
     EpochMeta hot_meta{};
+    uint64_t hot_oram_pages = 0;
 
     if (!skip_hot_oram) {
         int new_hot_leaf = hot_oram_->random_leaf();
         int dummy_leaf = hot_oram_->random_leaf();
         int use_leaf = o_select_i(hot_hit_i, old_pos, dummy_leaf);
 
+        hot_oram_->begin_page_tracking();
         hot_oram_->read_path_to_stash(use_leaf);
         Block blk = hot_oram_->extract_from_stash(
             o_select_i(hot_hit_i, key, -2));
@@ -137,6 +140,7 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
         hot_oram_->add_to_stash(
             o_select_i(hot_hit_i, key, blk.key), new_hot_leaf, wb_stored);
         hot_oram_->evict_one_path(use_leaf);
+        hot_oram_pages = hot_oram_->end_page_tracking();
 
         hot_dir_->update_pos(key, o_select_i(hot_hit_i, new_hot_leaf, INVALID_LEAF));
     }
@@ -145,7 +149,7 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
         hot_dir_->bump_freq(key, current_epoch_);
 
     result.hot_pages = static_cast<uint64_t>(dir_pages) * 2
-                     + (skip_hot_oram ? 0 : hot_oram_->last_stats().pages_touched);
+                     + (skip_hot_oram ? 0 : hot_oram_pages);
 
     result.value.resize(config_.value_size, 0);
     Bytes padded_hot = pad_bytes(hot_val, config_.value_size);
@@ -221,6 +225,99 @@ TeeAccessResult TeeOmap::access(int key, const Bytes* new_value,
     }
 
     return result;
+}
+
+TeeBatchAccessResult TeeOmap::access_batch_tier_membership(
+        const std::vector<int>& keys,
+        BatchResponseCallback hot_release_cb,
+        BatchResponseCallback final_cb) {
+    if (config_.mode != TeeSecurityMode::TierMembership) {
+        throw std::runtime_error(
+            "access_batch_tier_membership requires TierMembership mode");
+    }
+    if (config_.maintenance.enabled) {
+        throw std::runtime_error(
+            "access_batch_tier_membership currently supports static TEE runs only");
+    }
+
+    TeeBatchAccessResult batch;
+    batch.results.resize(keys.size());
+    std::vector<size_t> cold_indices;
+    cold_indices.reserve(keys.size());
+
+    int sv = stored_value_size();
+    int dir_pages = (hot_dir_->capacity() * 20 + EnclaveOram::PAGE_SIZE - 1)
+                  / EnclaveOram::PAGE_SIZE;
+
+    // Phase 1: every logical query first goes through the hot directory phase.
+    // Hot hits also read/update the hot ORAM; cold queries continue later.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        int key = keys[i];
+        auto& r = batch.results[i];
+        r.value.assign(config_.value_size, 0);
+
+        int old_pos = hot_dir_->lookup(key);
+        bool hot_hit = (old_pos != INVALID_LEAF);
+        r.found_in_hot = hot_hit;
+        r.hot_pages = static_cast<uint64_t>(dir_pages) * 2;
+
+        if (hot_hit) {
+            int new_hot_leaf = hot_oram_->random_leaf();
+
+            hot_oram_->begin_page_tracking();
+            hot_oram_->read_path_to_stash(old_pos);
+            Block blk = hot_oram_->extract_from_stash(key);
+
+            auto decoded = unwrap_value(blk.value);
+            Bytes hot_val = pad_bytes(decoded.first, config_.value_size);
+            EpochMeta new_hot_meta = bump_epoch(decoded.second);
+
+            Bytes wb_stored = wrap_value(hot_val, new_hot_meta);
+            wb_stored = pad_bytes(wb_stored, sv);
+
+            hot_oram_->add_to_stash(key, new_hot_leaf, wb_stored);
+            hot_oram_->evict_one_path(old_pos);
+            r.hot_pages += hot_oram_->end_page_tracking();
+
+            hot_dir_->update_pos(key, new_hot_leaf);
+
+            r.value = hot_val;
+            ++batch.hot_count;
+        } else {
+            cold_indices.push_back(i);
+            ++batch.cold_count;
+        }
+
+        batch.hot_phase_pages += r.hot_pages;
+    }
+
+    if (hot_release_cb)
+        hot_release_cb(batch.results);
+
+    // Phase 2: only cold continuations enter the cold OMAP. This is the actual
+    // batch-level TM execution shape used by the TEE BatchTM benchmark.
+    for (size_t idx : cold_indices) {
+        int key = keys[idx];
+        auto& r = batch.results[idx];
+
+        Bytes cold_stored = cold_omap_->search_or_dummy(
+            key, true, nullptr, nullptr);
+        auto decoded = unwrap_value(cold_stored);
+        r.value = pad_bytes(decoded.first, config_.value_size);
+        r.cold_up_pages = cold_omap_->last_stats().upper_pages;
+        r.cold_low_pages = cold_omap_->last_stats().lower_pages;
+        batch.cold_extra_pages += r.cold_up_pages + r.cold_low_pages;
+    }
+
+    for (auto& r : batch.results) {
+        r.total_pages = r.hot_pages + r.cold_up_pages + r.cold_low_pages;
+        batch.total_pages += r.total_pages;
+    }
+
+    if (final_cb)
+        final_cb(batch.results);
+
+    return batch;
 }
 
 // ── Maintenance: one demote + one promote per epoch boundary ─────────────

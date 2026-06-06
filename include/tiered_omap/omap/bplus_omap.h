@@ -62,6 +62,7 @@ public:
 
     bool supports_interleaved() const override { return true; }
     void begin_step_search(int key, const Bytes* update = nullptr) override;
+    void begin_step_search_update(int key, const UpdateFn& update_fn) override;
     void begin_step_dummy() override;
     void begin_step_partial_dummy() override;
     OramStepRound step_next_round() override;
@@ -136,6 +137,7 @@ private:
     };
 
     PathORAM& oram_for_depth(int depth);
+    int current_leaf_for_depth(int id, int depth, int fallback);
     Block extract_node(PathORAM& o, int id, const char* context,
                        int depth, int requested_leaf);
     void move_to_local(int id, int leaf, int parent_id, int depth);
@@ -173,6 +175,7 @@ private:
         StepPhase phase = StepPhase::DONE;
         int key = INVALID_KEY;
         const Bytes* update = nullptr;
+        UpdateFn update_fn;
         bool is_dummy = false;
         bool decision_enabled = false;
         int budget = 0;

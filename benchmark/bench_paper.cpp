@@ -56,16 +56,19 @@ struct Cfg {
     int n = 1024;
     int max_logN = 20;
     int min_logN = 0;
+    std::string logN_list;
     int value_size = 256;
     std::string outdir = "results";
     std::string host;
     int port = 12345;
     std::string backend_filter;
+    int recv_timeout = 7200;
     int dyn_obs = 256;
     int dyn_swap = 32;
     int dyn_cache = 8;
     int dyn_warmup = 0;
     bool dyn_piggyback = true;
+    bool client_fo_standalone = true;
     StorageCreator storage_creator;
     std::shared_ptr<TcpChannel> channel;
 };
@@ -86,22 +89,25 @@ Cfg parse_args(int argc, char** argv) {
         else if (k == "--n") c.n = std::stoi(v);
         else if (k == "--max_logN") c.max_logN = std::stoi(v);
         else if (k == "--min_logN") c.min_logN = std::stoi(v);
+        else if (k == "--logNs") c.logN_list = v;
         else if (k == "--outdir") c.outdir = v;
         else if (k == "--value_size") c.value_size = std::stoi(v);
         else if (k == "--host" || k == "--server") c.host = v;
         else if (k == "--port") c.port = std::stoi(v);
         else if (k == "--backend") c.backend_filter = v;
+        else if (k == "--recv_timeout") c.recv_timeout = std::stoi(v);
         else if (k == "--dyn_obs") c.dyn_obs = std::stoi(v);
         else if (k == "--dyn_swap") c.dyn_swap = std::stoi(v);
         else if (k == "--dyn_cache") c.dyn_cache = std::stoi(v);
         else if (k == "--dyn_warmup") c.dyn_warmup = std::stoi(v);
         else if (k == "--dyn_piggyback") c.dyn_piggyback = (std::stoi(v) != 0);
+        else if (k == "--client_fo_standalone") c.client_fo_standalone = (std::stoi(v) != 0);
     }
 
     if (!c.host.empty()) {
         c.channel = std::make_shared<TcpChannel>(
             TcpChannel::connect(c.host, c.port));
-        c.channel->set_recv_timeout(300);
+        c.channel->set_recv_timeout(c.recv_timeout);
         c.storage_creator = make_network_creator(c.channel);
         std::cout << "Connected to ORAM server at "
                   << c.host << ":" << c.port << "\n";
@@ -136,6 +142,23 @@ static std::vector<int> make_hot_keys(int n) {
     std::vector<int> h(n);
     std::iota(h.begin(), h.end(), 0);
     return h;
+}
+
+static std::vector<int> selected_logNs(const Cfg& cfg, int default_start = 12) {
+    std::vector<int> out;
+    if (!cfg.logN_list.empty()) {
+        std::stringstream ss(cfg.logN_list);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty())
+                out.push_back(std::stoi(item));
+        }
+        return out;
+    }
+    int start = cfg.min_logN > 0 ? cfg.min_logN : default_start;
+    for (int logN = start; logN <= cfg.max_logN; logN += 2)
+        out.push_back(logN);
+    return out;
 }
 
 struct BackendSpec {
@@ -587,18 +610,35 @@ static void exp_modes(const Cfg& cfg) {
 static void exp_client_fo(const Cfg& cfg) {
     std::cout << "\n=== Exp: Revised Client/Server Mainline (FO only) ===\n";
     ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/client_fo.csv");
-    csv << "backend,logN,type,avg_bw_KB,avg_rounds,avg_answer_rnd,hit_pct\n";
+    const std::string csv_path = cfg.outdir + "/client_fo.csv";
+    std::ifstream existing(csv_path);
+    bool append = existing.peek() != std::ifstream::traits_type::eof();
+    existing.close();
+    std::ofstream csv(csv_path, append ? std::ios::app : std::ios::out);
+    if (!append)
+        csv << "backend,logN,value_size,type,avg_bw_KB,avg_rounds,"
+            << "avg_answer_rnd,avg_hot_answer_rnd,avg_cold_answer_rnd,"
+            << "hit_pct,response_ms,hot_response_ms,cold_response_ms\n";
+
+    auto logNs = selected_logNs(cfg);
+    auto maybe_ms = [&](double rounds) -> std::string {
+        if (cfg.rtt_us <= 0)
+            return "";
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(1)
+           << rounds * cfg.rtt_us / 1000.0;
+        return ss.str();
+    };
 
     for (auto& [label, be] : PAPER_BACKENDS) {
         if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
             continue;
 
-        for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
+        for (int logN : logNs) {
             int N = 1 << logN;
             int n = std::min(cfg.n, N / 2);
 
-            {
+            if (cfg.client_fo_standalone) {
                 g_progress.config(std::string(label) + " logN="
                                   + std::to_string(logN) + " standalone");
                 auto omap = setup_standalone(cfg, be, N);
@@ -612,9 +652,10 @@ static void exp_client_fo(const Cfg& cfg) {
                     g_progress.query_tick(i, cfg.Q);
                 }
                 bw /= cfg.Q; rnd /= cfg.Q;
-                csv << label << "," << logN << ",standalone,"
+                csv << label << "," << logN << "," << cfg.value_size << ",standalone,"
                     << std::fixed << std::setprecision(2) << bw / 1024 << ","
-                    << std::setprecision(1) << rnd << "," << rnd << ",\n";
+                    << std::setprecision(1) << rnd << "," << rnd << ",,,,"
+                    << maybe_ms(rnd) << ",,\n";
                 std::ostringstream ss;
                 ss << (int)(bw / 1024) << "KB " << (int)rnd << "rnd";
                 g_progress.config_done(ss.str());
@@ -634,9 +675,10 @@ static void exp_client_fo(const Cfg& cfg) {
                     g_progress.query_tick(i, cfg.Q);
                 }
                 bw /= cfg.Q; rnd /= cfg.Q;
-                csv << label << "," << logN << ",fair,"
+                csv << label << "," << logN << "," << cfg.value_size << ",fair,"
                     << std::fixed << std::setprecision(2) << bw / 1024 << ","
-                    << std::setprecision(1) << rnd << "," << rnd << ",\n";
+                    << std::setprecision(1) << rnd << "," << rnd << ",,,,"
+                    << maybe_ms(rnd) << ",,\n";
                 std::ostringstream ss;
                 ss << (int)(bw / 1024) << "KB " << (int)rnd << "rnd";
                 g_progress.config_done(ss.str());
@@ -650,21 +692,33 @@ static void exp_client_fo(const Cfg& cfg) {
                 ZipfSampler z(N, cfg.s, 42);
                 for (int i = 0; i < cfg.warmup; ++i) fo->access(z.sample());
                 double bw = 0.0, rnd = 0.0, ans = 0.0;
-                int hot = 0;
+                double hot_ans = 0.0, cold_ans = 0.0;
+                int hot = 0, cold = 0;
                 for (int i = 0; i < cfg.Q; ++i) {
                     auto r = fo->access(z.sample());
                     bw += r.total_bw.total_bytes();
                     rnd += r.total_bw.rounds;
                     ans += r.rounds_to_answer;
-                    if (r.found_in_hot) ++hot;
+                    if (r.found_in_hot) {
+                        ++hot;
+                        hot_ans += r.rounds_to_answer;
+                    } else {
+                        ++cold;
+                        cold_ans += r.rounds_to_answer;
+                    }
                     g_progress.query_tick(i, cfg.Q);
                 }
                 bw /= cfg.Q; rnd /= cfg.Q; ans /= cfg.Q;
+                double hot_avg = hot > 0 ? hot_ans / hot : 0.0;
+                double cold_avg = cold > 0 ? cold_ans / cold : 0.0;
                 double hit = 100.0 * hot / cfg.Q;
-                csv << label << "," << logN << ",tiered_FO,"
+                csv << label << "," << logN << "," << cfg.value_size << ",tiered_FO,"
                     << std::fixed << std::setprecision(2) << bw / 1024 << ","
                     << std::setprecision(1) << rnd << "," << ans << ","
-                    << hit << "\n";
+                    << hot_avg << "," << cold_avg << ","
+                    << hit << ","
+                    << maybe_ms(ans) << "," << maybe_ms(hot_avg) << ","
+                    << maybe_ms(cold_avg) << "\n";
                 std::ostringstream ss;
                 ss << (int)(bw / 1024) << "KB " << (int)rnd
                    << "rnd hit=" << (int)hit << "%";
@@ -751,16 +805,23 @@ static ClientBwSample measure_client_bw(TieredOMap& tm, int N, const Cfg& cfg,
 static void exp_client_dynamic_bw(const Cfg& cfg) {
     std::cout << "\n=== Exp: Client/Server Dynamic Bandwidth (FO) ===\n";
     ensure_dir(cfg.outdir);
-    std::ofstream csv(cfg.outdir + "/client_dynamic_bw.csv");
-    csv << "backend,logN,config,B_obs,B_swap,cache_size,piggyback,warmup_q,"
-        << "avg_down_KB,avg_up_KB,avg_bw_KB,avg_rounds,avg_answer_rnd,"
-        << "hit_pct,delta_bw_KB,bw_over_static_pct,delta_rounds\n";
+    const std::string csv_path = cfg.outdir + "/client_dynamic_bw.csv";
+    std::ifstream existing(csv_path);
+    bool append = existing.peek() != std::ifstream::traits_type::eof();
+    existing.close();
+    std::ofstream csv(csv_path, append ? std::ios::app : std::ios::out);
+    if (!append)
+        csv << "backend,logN,config,B_obs,B_swap,cache_size,piggyback,warmup_q,"
+            << "avg_down_KB,avg_up_KB,avg_bw_KB,avg_rounds,avg_answer_rnd,"
+            << "hit_pct,delta_bw_KB,bw_over_static_pct,delta_rounds\n";
+
+    auto logNs = selected_logNs(cfg);
 
     for (auto& [label, be] : PAPER_BACKENDS) {
         if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
             continue;
 
-        for (int logN = 12; logN <= cfg.max_logN; logN += 2) {
+        for (int logN : logNs) {
             int N = 1 << logN;
             int n = std::min(cfg.n, N / 2);
             MaintenanceConfig mc = make_client_dynamic_config(cfg, n);

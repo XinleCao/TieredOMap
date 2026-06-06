@@ -466,6 +466,26 @@ void DaOstOmap::begin_step_search(int key, const Bytes* update) {
     ss_.phase = StepPhase::DAORAM;
 }
 
+void DaOstOmap::begin_step_search_update(int key, const UpdateFn& update_fn) {
+    last_bw_.reset();
+    ss_ = StepState{};
+    ss_.key = key;
+    ss_.update_fn = update_fn;
+    ss_.pos = hash_to_position(key);
+    auto [rk, rl] = root_cache_[ss_.pos];
+
+    daoram_.begin_step_access(ss_.pos);
+
+    if (tree_type_ == OdsTreeType::AVL) {
+        avl_ods_.set_root(rk, rl);
+        avl_ods_.begin_step_search_update(key, update_fn);
+    } else {
+        bplus_ods_.set_root(rk, rl);
+        bplus_ods_.begin_step_search_update(key, update_fn);
+    }
+    ss_.phase = StepPhase::DAORAM;
+}
+
 void DaOstOmap::begin_step_dummy() {
     last_bw_.reset();
     ss_ = StepState{};

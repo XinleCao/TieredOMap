@@ -2,6 +2,8 @@
 
 #include "tiered_omap/common.h"
 #include "tiered_omap/network/storage_interface.h"
+#include <iosfwd>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,6 +48,9 @@ public:
         std::unordered_map<int, std::vector<Block>>& path,
         const std::vector<int>& leaves,
         int level, int bucket_size);
+
+    void write_state(std::ostream& out) const;
+    static std::unique_ptr<BinaryTreeStorage> read_state(std::istream& in);
 
 private:
     int leaf_to_node(int leaf) const { return leaf_range_ - 1 + leaf; }

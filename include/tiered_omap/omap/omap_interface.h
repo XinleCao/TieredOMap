@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tiered_omap/common.h"
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -24,9 +25,19 @@ struct OramStepRound {
 
 class OmapInterface {
 public:
+    using UpdateFn = std::function<Bytes(const Bytes&)>;
+
     virtual ~OmapInterface() = default;
 
     virtual Bytes search(int key, const Bytes* update = nullptr) = 0;
+    virtual Bytes search_update(int key, const UpdateFn& update_fn) {
+        Bytes old = search(key);
+        if (!old.empty() && update_fn) {
+            Bytes updated = update_fn(old);
+            search(key, &updated);
+        }
+        return old;
+    }
     virtual void insert(int key, const Bytes& value) = 0;
     virtual void remove(int key) = 0;
     virtual void dummy_access() = 0;
@@ -62,6 +73,9 @@ public:
     //             step_process → step_prepare_writes → batch write.
     virtual bool supports_interleaved() const { return false; }
     virtual void begin_step_search(int /*key*/, const Bytes* /*update*/ = nullptr) {}
+    virtual void begin_step_search_update(int key, const UpdateFn& /*update_fn*/) {
+        begin_step_search(key, nullptr);
+    }
     virtual void begin_step_dummy() {}
     virtual void begin_step_partial_dummy() { begin_step_dummy(); }
     virtual OramStepRound step_next_round() { return {}; }
