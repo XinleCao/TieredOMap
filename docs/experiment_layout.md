@@ -16,6 +16,8 @@ Important current entry points:
 - `scripts/run_revised_experiments.sh`: current mainline runner.
   It runs the FO-only client/server experiment and the TEE FO/BatchTM
   experiment under large and constrained trusted-memory settings.
+- `scripts/run_stash_ablation_experiments.sh`: paper-facing runner for the
+  stash-only client-state appendix ablation.
 - `scripts/run_paper_experiments.sh`: older broad paper runner that still covers
   backend, bandwidth, skewness, hotsize, mode, dynamic, workload, and drift
   experiments.
@@ -44,6 +46,13 @@ results_local/client_state/stash_ablation/
 When a result becomes paper-facing, move or copy only the selected CSV into a
 tracked result directory with a clear name.  Do not commit large raw run
 directories unless they are needed for reproducibility.
+
+For the paper-facing stash-only ablation, use:
+
+```bash
+OUTDIR=results/client_state_stash_ablation_<date> \
+  bash scripts/run_stash_ablation_experiments.sh
+```
 
 ## External Baselines
 

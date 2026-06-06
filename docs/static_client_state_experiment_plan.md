@@ -107,8 +107,23 @@ Metrics:
 - index-stash-only hit rate
 - total early-answer hit rate
 - mean data/index stash occupancy
-- mean answer rounds and response time
+- mean and max data/index stash occupancy
+- mean answer rounds and response time, normalized against the full answer
+  template
 - full-template bandwidth
+
+Runner:
+
+```bash
+bash scripts/run_stash_ablation_experiments.sh
+```
+
+The runner writes `stash_ablation.csv` and `summary.md`. The reduction metric is
+computed against the no-early-answer baseline:
+
+```text
+first data-ORAM path + full index OMAP lookup/update + second data-ORAM path
+```
 
 Recommended placement:
 report as an appendix ablation. Its role is not to compete with the local hot

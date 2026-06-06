@@ -7,6 +7,8 @@ Use these scripts from the repository root.
 - `run_revised_experiments.sh`: current paper-facing runner.
   It runs FO-only client/server experiments and TEE FO/BatchTM experiments
   under large and constrained trusted-memory settings.
+- `run_stash_ablation_experiments.sh`: paper-facing runner for the stash-only
+  client-state appendix ablation.
 - `run_server.sh`: starts the remote ORAM storage server for client/server runs.
 
 ## Historical Broad Runner
