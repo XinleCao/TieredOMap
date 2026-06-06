@@ -1,0 +1,24 @@
+Table 2 client/server FO run
+  Q=1024 warmup=0 value_size=4096 rtt_ms=28.87
+  recv_timeout=7200
+  host=127.0.0.1 port=12345
+  backends=AVL
+  logNs=24
+  outdir=/root/tieredomap_runs/results/table2_client_fo_20260606_212627
+
+==== 2026-06-06 22:20:20 backend=AVL logN=24 ====
+               total        used        free      shared  buff/cache   available
+Mem:           121Gi       1.8Gi       118Gi       2.0Mi       1.5Gi       118Gi
+Swap:             0B          0B          0B
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda3      1008G   13G  954G   2% /
+Connected to ORAM server at 127.0.0.1:12345
+TieredOMap Paper Experiments
+  exp=client_fo  Q=1024  s=1  n=1024  max_logN=20  value_size=4096
+
+╔══ [1/1] client_fo  (total elapsed: 0m0s)
+
+=== Exp: Revised Client/Server Mainline (FO only) ===
+  ▸ AVL logN=24 fairterminate called after throwing an instance of 'std::runtime_error'
+  what():  SETUP_BENCH index_data failed
+scripts/run_table2_client_fo_remote.sh: line 34: 15425 Aborted                 (core dumped) "$BUILD_DIR/bench_paper" --exp=client_fo --Q="$Q" --warmup="$WARMUP" --logNs="$logN" --backend="$backend" --value_size="$VALUE_SIZE" --client_fo_standalone=0 --rtt_ms="$RTT_MS" --recv_timeout="$RECV_TIMEOUT" --outdir="$OUTDIR" --host="$HOST" --port="$PORT"
