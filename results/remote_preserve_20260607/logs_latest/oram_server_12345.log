@@ -1,0 +1,96 @@
+ORAM Storage Server starting on port 12345
+[StorageServer] setup cache dir: /root/tieredomap_runs/setup_cache
+[StorageServer] disk data dir: /root/tieredomap_runs/disk_runtime
+[StorageServer] listening on port 12345
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=0 N=16777216 n=0 value_size=4096
+[bench_setup] index_data: backend=0 N=16777216 bs=4 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N16777216-bs4-vs4096"
+[bench_setup] index_data done: stores=2 blob=268435616 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=268435616 stores=2
+[StorageServer] SETUP_BENCH: mode=1 backend=0 N=16777216 n=1024 value_size=4096
+[bench_setup] tiered: backend=0 hot_be=1 use_hot=0 index_meta=0 N=16777216 n=1024 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N16777216-bs4-vs4096"
+[bench_setup] tiered done: stores=4 blob=268448104 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=268448104 stores=4
+[StorageServer] client disconnected (0 stores freed)
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=1 N=65536 n=0 value_size=4096
+[StorageServer] SETUP_CACHE hit path=/root/tieredomap_runs/setup_cache/setup-v2-0200000001000000000001000000000004000000001000000000000000000000.bin stores=2
+[StorageServer] SETUP_BENCH cached, state_size=535184 stores=2
+[StorageServer] SETUP_BENCH: mode=1 backend=1 N=65536 n=1024 value_size=4096
+[StorageServer] SETUP_CACHE hit path=/root/tieredomap_runs/setup_cache/setup-v2-010000000100000000000100000400000400000000100000000000000100000000000000010000000000000000000000.bin stores=4
+[StorageServer] SETUP_BENCH cached, state_size=547680 stores=4
+[StorageServer] client disconnected (0 stores freed)
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=1 N=1048576 n=0 value_size=4096
+[bench_setup] index_data: backend=1 N=1048576 bs=4 vs=4096
+[bench_setup] data_oram cache saved: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N1048576-bs4-vs4096"
+[bench_setup] index_data done: stores=2 blob=8559992 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=8559992 stores=2
+[StorageServer] SETUP_BENCH: mode=1 backend=1 N=1048576 n=1024 value_size=4096
+[bench_setup] tiered: backend=1 hot_be=1 use_hot=0 index_meta=0 N=1048576 n=1024 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N1048576-bs4-vs4096"
+[bench_setup] tiered done: stores=4 blob=8572512 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=8572512 stores=4
+[StorageServer] client disconnected (0 stores freed)
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=1 N=16777216 n=0 value_size=4096
+[bench_setup] index_data: backend=1 N=16777216 bs=4 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N16777216-bs4-vs4096"
+[bench_setup] index_data done: stores=2 blob=136957088 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=136957088 stores=2
+[StorageServer] SETUP_BENCH: mode=1 backend=1 N=16777216 n=1024 value_size=4096
+[bench_setup] tiered: backend=1 hot_be=1 use_hot=0 index_meta=0 N=16777216 n=1024 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N16777216-bs4-vs4096"
+[bench_setup] tiered done: stores=4 blob=136969584 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=136969584 stores=4
+[StorageServer] client disconnected (0 stores freed)
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=3 N=65536 n=0 value_size=4096
+[bench_setup] index_data: backend=3 N=65536 bs=4 vs=4096
+[bench_setup] data_oram cache saved: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N65536-bs4-vs4096"
+[bench_setup] index_data done: stores=5 blob=1843876 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=1843876 stores=5
+[StorageServer] SETUP_BENCH: mode=1 backend=3 N=65536 n=1024 value_size=4096
+[bench_setup] tiered: backend=3 hot_be=1 use_hot=1 index_meta=0 N=65536 n=1024 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N65536-bs4-vs4096"
+[bench_setup] tiered done: stores=6 blob=1820464 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=1820464 stores=6
+[StorageServer] client disconnected (0 stores freed)
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=3 N=1048576 n=0 value_size=4096
+[bench_setup] index_data: backend=3 N=1048576 bs=4 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N1048576-bs4-vs4096"
+[bench_setup] index_data done: stores=5 blob=29494216 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=29494216 stores=5
+[StorageServer] SETUP_BENCH: mode=1 backend=3 N=1048576 n=1024 value_size=4096
+[bench_setup] tiered: backend=3 hot_be=1 use_hot=1 index_meta=0 N=1048576 n=1024 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N1048576-bs4-vs4096"
+[bench_setup] tiered done: stores=6 blob=29461652 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=29461652 stores=6
+[StorageServer] client disconnected (0 stores freed)
+[StorageServer] client connected
+[StorageServer] SETUP_BENCH: mode=2 backend=3 N=16777216 n=0 value_size=4096
+[bench_setup] index_data: backend=3 N=16777216 bs=4 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N16777216-bs4-vs4096"
+[bench_setup] index_data done: stores=6 blob=471893092 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=471893092 stores=6
+[StorageServer] SETUP_BENCH: mode=1 backend=3 N=16777216 n=1024 value_size=4096
+[bench_setup] tiered: backend=3 hot_be=1 use_hot=1 index_meta=0 N=16777216 n=1024 vs=4096
+[bench_setup] data_oram cache hit: "/root/tieredomap_runs/setup_cache/data_oram/pathoram-v1-N16777216-bs4-vs4096"
+[bench_setup] tiered done: stores=7 blob=471762224 bytes
+[StorageServer] SETUP_CACHE skipped full config cache because disk data store is cached separately
+[StorageServer] SETUP_BENCH done, state_size=471762224 stores=7
+[StorageServer] client disconnected (0 stores freed)
