@@ -70,10 +70,6 @@ def main():
     hot_n_logs = [6, 8, 10, 12, 14, 16]
 
     be = "AVL"
-    bl = baselines[be]
-    base_rnd = bl["base_rnd"]
-    base_ms = bl["base_ms"]
-
     # ── (a) Average round reduction vs skewness ──
     print("\n=== Fig (a): Avg round reduction vs skewness (AVL) ===")
     for log_n in skew_n_logs:
@@ -82,6 +78,7 @@ def main():
         if r is None:
             print(f"  n=2^{log_n}: MISSING DATA")
             continue
+        base_rnd = r["base_rnd"]
         hot_rnd = r["hot_rnd"]
         cold_rnd = r["cold_rnd"]
         pts = []
@@ -99,6 +96,7 @@ def main():
         r = rows.get((be, log_n))
         if r is None:
             continue
+        base_ms = r["base_ms"]
         hot_ms = r["hot_ms"]
         cold_ms = r["cold_ms"]
         pts = []
@@ -115,6 +113,7 @@ def main():
         r = rows.get((be, log_n))
         if r is None:
             continue
+        base_rnd = r["base_rnd"]
         hot_rnd = r["hot_rnd"]
         red = (base_rnd - hot_rnd) / base_rnd * 100
         pts = [(s, red) for s in s_vals]
@@ -126,6 +125,7 @@ def main():
         r = rows.get((be, log_n))
         if r is None:
             continue
+        base_ms = r["base_ms"]
         hot_ms = r["hot_ms"]
         red = (base_ms - hot_ms) / base_ms * 100 if base_ms > 0 else 0
         pts = [(s, red) for s in s_vals]
@@ -141,6 +141,7 @@ def main():
             r = rows.get((be, log_n))
             if r is None:
                 continue
+            base_rnd = r["base_rnd"]
             hot_rnd = r["hot_rnd"]
             cold_rnd = r["cold_rnd"]
             h = zipf_hit_rate(s, n, N)
@@ -158,6 +159,7 @@ def main():
             r = rows.get((be, log_n))
             if r is None:
                 continue
+            base_ms = r["base_ms"]
             hot_ms = r["hot_ms"]
             cold_ms = r["cold_ms"]
             h = zipf_hit_rate(s, n, N)
@@ -170,13 +172,8 @@ def main():
     for be_app in ["BPlus", "DaBplus"]:
         if be_app not in baselines:
             continue
-        bl_app = baselines[be_app]
-        base_rnd_app = bl_app["base_rnd"]
-        base_ms_app = bl_app["base_ms"]
-
         print(f"\n{'='*70}")
-        print(f"=== Appendix: {be_app} (base_rnd={base_rnd_app:.1f}, "
-              f"base_ms={base_ms_app:.1f}) ===")
+        print(f"=== Appendix: {be_app} ===")
 
         print(f"\n  -- Avg round reduction vs skewness --")
         for log_n in skew_n_logs:
@@ -184,6 +181,7 @@ def main():
             r = rows.get((be_app, log_n))
             if r is None:
                 continue
+            base_rnd_app = r["base_rnd"]
             pts = []
             for s in s_vals:
                 h = zipf_hit_rate(s, n, N)
@@ -192,11 +190,27 @@ def main():
                 pts.append((s, red))
             print(f"    n=2^{log_n}: {fmt_coords(pts)}")
 
+        print(f"\n  -- Avg ms reduction vs skewness --")
+        for log_n in skew_n_logs:
+            n = 1 << log_n
+            r = rows.get((be_app, log_n))
+            if r is None:
+                continue
+            base_ms_app = r["base_ms"]
+            pts = []
+            for s in s_vals:
+                h = zipf_hit_rate(s, n, N)
+                avg = h * r["hot_ms"] + (1 - h) * r["cold_ms"]
+                red = (base_ms_app - avg) / base_ms_app * 100
+                pts.append((s, red))
+            print(f"    n=2^{log_n}: {fmt_coords(pts)}")
+
         print(f"\n  -- Hot-query round reduction vs skewness --")
         for log_n in skew_n_logs:
             r = rows.get((be_app, log_n))
             if r is None:
                 continue
+            base_rnd_app = r["base_rnd"]
             red = (base_rnd_app - r["hot_rnd"]) / base_rnd_app * 100
             pts = [(s, red) for s in s_vals]
             print(f"    n=2^{log_n}: {fmt_coords(pts)}")
@@ -208,11 +222,10 @@ def main():
           f"{'cold_rnd':>9} {'hot_red%':>8} {'base_ms':>8} {'hot_ms':>8} "
           f"{'cold_ms':>8}")
     for (be_k, log_n), r in sorted(rows.items()):
-        bl_k = baselines[be_k]
-        h_red = (bl_k["base_rnd"] - r["hot_rnd"]) / bl_k["base_rnd"] * 100
-        print(f"{be_k:<10} {log_n:>5} {bl_k['base_rnd']:>9.1f} "
+        h_red = (r["base_rnd"] - r["hot_rnd"]) / r["base_rnd"] * 100
+        print(f"{be_k:<10} {log_n:>5} {r['base_rnd']:>9.1f} "
               f"{r['hot_rnd']:>8.1f} {r['cold_rnd']:>9.1f} {h_red:>8.1f} "
-              f"{bl_k['base_ms']:>8.1f} {r['hot_ms']:>8.1f} "
+              f"{r['base_ms']:>8.1f} {r['hot_ms']:>8.1f} "
               f"{r['cold_ms']:>8.1f}")
 
 
