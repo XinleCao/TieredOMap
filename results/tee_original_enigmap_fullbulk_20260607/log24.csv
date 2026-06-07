@@ -1,4 +1,4 @@
-profile,logN,N,n,s,value_size,Q,config,measured_hot_us,measured_cold_us,measured_total_us,modeled_total_us,hit_pct,speedup_measured,speedup_modeled,trusted_kb,page_us,hot_working_kb,cold_working_kb,cold_pages_est,hot_pages_avg
-large,24,16777216,128,1.200,256,200,flat_original_enigmap,5188.552,5188.552,5188.552,5188.552,-1.000,1.000,1.000,0,0.000,266,20971520,1976.000,0.000
-large,24,16777216,128,1.200,256,200,packed_FO_original_enigmap,5396.241,5328.876,5376.705,5376.705,71.000,0.965,0.965,0,0.000,266,20971520,1976.000,2.000
-large,24,16777216,128,1.200,256,200,packed_TM_original_enigmap,161.065,5147.948,1607.261,1607.261,71.000,3.228,3.228,0,0.000,266,20971520,1976.000,2.000
+profile,logN,N,n,s,value_size,Q,config,measured_hot_us,measured_cold_us,measured_total_us,measured_answer_us,modeled_total_us,hit_pct,speedup_measured,speedup_answer_measured,speedup_modeled,trusted_kb,page_us,hot_working_kb,cold_working_kb,cold_pages_est,hot_pages_avg
+large,24,16777216,128,1.200,256,200,flat_original_enigmap,5189.755,5189.755,5189.755,5189.755,5189.755,-1.000,1.000,1.000,1.000,0,0.000,266,20971520,1976.000,0.000
+large,24,16777216,128,1.200,256,200,packed_FO_original_enigmap,160.476,5325.795,5370.560,1658.419,5370.560,71.000,0.966,3.129,0.966,0,0.000,266,20971520,1976.000,2.000
+large,24,16777216,128,1.200,256,200,packed_TM_original_enigmap,159.745,5150.748,1607.158,1607.136,1607.136,71.000,3.229,3.229,3.229,0,0.000,266,20971520,1976.000,2.000

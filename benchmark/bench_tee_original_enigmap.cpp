@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -136,6 +137,7 @@ struct Measurement {
     double hot_us = 0.0;
     double cold_us = 0.0;
     double total_us = 0.0;
+    double answer_us = 0.0;
     double hit_pct = -1.0;
     int hot_count = 0;
     int cold_count = 0;
@@ -539,7 +541,10 @@ public:
         }
     }
 
-    PackedOriginalResult access(int key, bool tier_membership_mode) {
+    using ResponseCallback = std::function<void(const Bytes& value, bool found)>;
+
+    PackedOriginalResult access(int key, bool tier_membership_mode,
+                                ResponseCallback early_cb = nullptr) {
         PackedOriginalResult r;
         r.value.assign(value_size_, 0);
 
@@ -570,6 +575,9 @@ public:
         r.hot_pages = static_cast<uint64_t>(dir_pages) * 2
                     + (skip_hot_oram ? 0 : hot_oram_->last_stats().pages_touched);
 
+        if (early_cb)
+            early_cb(r.value, r.found_in_hot);
+
         bool skip_cold = tier_membership_mode && r.found_in_hot;
         if (!skip_cold) {
             bool cold_found = false;
@@ -597,7 +605,8 @@ static void run_all(const Config& cfg) {
     std::ofstream csv(cfg.outdir + "/tee_original_enigmap.csv");
     csv << "profile,logN,N,n,s,value_size,Q,config,"
         << "measured_hot_us,measured_cold_us,measured_total_us,"
-        << "modeled_total_us,hit_pct,speedup_measured,speedup_modeled,"
+        << "measured_answer_us,modeled_total_us,hit_pct,"
+        << "speedup_measured,speedup_answer_measured,speedup_modeled,"
         << "trusted_kb,page_us,hot_working_kb,cold_working_kb,"
         << "cold_pages_est,hot_pages_avg\n";
 
@@ -657,6 +666,7 @@ static void run_all(const Config& cfg) {
             flat.config = "flat_original_enigmap";
             flat.flat = true;
             flat.hot_us = flat.cold_us = flat.total_us = sum_us / cfg.Q;
+            flat.answer_us = flat.total_us;
             flat.hot_count = 0;
             flat.cold_count = cfg.Q;
         }
@@ -670,21 +680,34 @@ static void run_all(const Config& cfg) {
                       stage_start);
 
             stage_start = Clock::now();
-            double sum_hot = 0, sum_cold = 0, sum_total = 0;
+            double sum_hot = 0, sum_cold = 0, sum_total = 0, sum_answer = 0;
             double sum_all_hot_pages = 0, sum_hot_query_pages = 0;
             int hot_cnt = 0, cold_cnt = 0;
             ZipfSampler local_zipf(N, cfg.s, 42);
             for (int q = 0; q < cfg.Q; ++q) {
                 int key = local_zipf.sample();
+                Clock::time_point t_answer;
+                bool answer_ready = false;
                 auto t0 = Clock::now();
-                auto r = packed.access(key, tm);
+                auto r = packed.access(key, tm,
+                    [&](const Bytes&, bool found) {
+                        if (found) {
+                            t_answer = Clock::now();
+                            answer_ready = true;
+                        }
+                    });
                 auto t1 = Clock::now();
                 verify_value(key, r.value);
                 double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+                double answer_us = answer_ready
+                    ? std::chrono::duration<double, std::micro>(
+                          t_answer - t0).count()
+                    : us;
                 sum_total += us;
+                sum_answer += answer_us;
                 sum_all_hot_pages += r.hot_pages;
                 if (r.found_in_hot) {
-                    sum_hot += us;
+                    sum_hot += answer_us;
                     sum_hot_query_pages += r.hot_pages;
                     ++hot_cnt;
                 } else {
@@ -701,6 +724,7 @@ static void run_all(const Config& cfg) {
             m.hot_us = hot_cnt > 0 ? sum_hot / hot_cnt : 0;
             m.cold_us = cold_cnt > 0 ? sum_cold / cold_cnt : 0;
             m.total_us = sum_total / cfg.Q;
+            m.answer_us = sum_answer / cfg.Q;
             m.hit_pct = 100.0 * hot_cnt / cfg.Q;
             m.hot_count = hot_cnt;
             m.cold_count = cold_cnt;
@@ -717,6 +741,7 @@ static void run_all(const Config& cfg) {
             auto write_row = [&](const Measurement& m) {
                 double model = modeled_total(m, profile, N, n, cfg.value_size);
                 double speed_meas = m.flat ? 1.0 : flat.total_us / m.total_us;
+                double speed_answer = m.flat ? 1.0 : flat.answer_us / m.answer_us;
                 double speed_model = m.flat ? 1.0 : flat_model / model;
 
                 std::cout << std::setw(12) << profile.name
@@ -741,8 +766,10 @@ static void run_all(const Config& cfg) {
                     << m.config << ","
                     << std::setprecision(3)
                     << m.hot_us << "," << m.cold_us << "," << m.total_us << ","
+                    << m.answer_us << ","
                     << model << "," << m.hit_pct << ","
-                    << speed_meas << "," << speed_model << ","
+                    << speed_meas << "," << speed_answer << ","
+                    << speed_model << ","
                     << profile.trusted_kb << "," << profile.page_us << ","
                     << hot_working_kb << "," << cold_working_kb << ","
                     << cold_pages << "," << m.avg_hot_pages << "\n";

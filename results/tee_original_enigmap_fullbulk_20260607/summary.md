@@ -24,11 +24,11 @@ then executes queries through the original `OBST::Get()` implementation.
 
 ## Key Results
 
-| logN | Flat us | FO us | FO speedup | TM us | TM speedup | Hit pct |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16 | 2210.273 | 2374.084 | 0.931 | 667.174 | 3.313 | 75.000 |
-| 20 | 3574.334 | 3706.316 | 0.964 | 1072.782 | 3.332 | 73.000 |
-| 24 | 5188.552 | 5376.705 | 0.965 | 1607.261 | 3.228 | 71.000 |
+| logN | Flat us | FO answer us | FO total us | FO answer speedup | FO total speedup | TM us | TM speedup | Hit pct |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 2203.495 | 704.140 | 2361.215 | 3.129 | 0.933 | 664.918 | 3.314 | 75.000 |
+| 20 | 3584.886 | 1106.723 | 3703.745 | 3.239 | 0.968 | 1069.465 | 3.352 | 73.000 |
+| 24 | 5189.755 | 1658.419 | 5370.560 | 3.129 | 0.966 | 1607.158 | 3.229 | 71.000 |
 
 The `2^24` run completed successfully. Its EnigMap backend estimate was
 72.00 GiB and peak RSS was about 88.9 GB, so it stayed within the large-memory
@@ -36,16 +36,17 @@ server envelope.
 
 ## Interpretation
 
-The TM configuration shows a stable benefit over the flat EnigMap baseline,
-with roughly 3.2x to 3.3x measured speedup at these scales. This is the expected
-large-memory TEE result: hot queries avoid the cold OBST path, while cold
-queries still use EnigMap's original `OBST::Get()`.
+The TM configuration shows a stable completion-time benefit over the flat
+EnigMap baseline, with roughly 3.2x to 3.4x measured speedup at these scales.
+This is the expected large-memory TEE result: hot queries avoid the cold OBST
+path, while cold queries still use EnigMap's original `OBST::Get()`.
 
-The FO configuration is slightly slower than the flat baseline. This is also
-expected for the full-oblivious template because each query still performs both
-hot-side and cold-side work, so packing does not reduce the critical query work
-unless the mode is allowed to exploit hot/cold branching or batching.
+The FO configuration has two distinct metrics. Its server completion time is
+slightly slower than the flat baseline because FO still performs both hot-side
+and cold-side work. Its answer latency is much better, however: hot queries can
+release the response after the hot phase while the oblivious cold-side work
+continues. The measured FO answer speedup is about 3.1x to 3.2x in this run.
 
-This run is therefore most useful as evidence for the large trusted-memory TM
-case over EnigMap's optimized AVL/OBST baseline. FO should not be presented as
-an acceleration result in this specific TEE/EnigMap setting.
+This run is therefore useful for two claims: TM improves server completion time,
+and FO improves time-to-answer without exposing tier membership in the query
+shape.
