@@ -23,6 +23,8 @@ public:
     void init_sequential(int count, int value_size);
 
     Bytes export_state(int store_id) const;
+    static PathORAM from_state_with_storage(
+        const Bytes& blob, std::unique_ptr<StorageInterface> storage);
     static PathORAM from_state_network(const uint8_t*& p,
                                        std::shared_ptr<TcpChannel> channel);
     std::unique_ptr<StorageInterface> detach_storage() {

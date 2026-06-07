@@ -1,0 +1,3 @@
+backend,logN,value_size,type,avg_bw_KB,avg_rounds,avg_answer_rnd,avg_hot_answer_rnd,avg_cold_answer_rnd,hit_pct,response_ms,hot_response_ms,cold_response_ms
+BPlus,16,4096,fair,1582.31,25.0,25.0,,,,721.8,,
+BPlus,16,4096,tiered_FO,2280.54,25.0,19.4,16.0,25.0,62.5,559.4,461.9,721.8

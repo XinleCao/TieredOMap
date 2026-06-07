@@ -1,0 +1,4 @@
+profile,logN,N,n,s,value_size,data_value_size,Q,config,measured_hot_us,measured_cold_us,measured_total_us,measured_answer_us,avg_map_us,avg_data_us,modeled_total_us,hit_pct,speedup_measured,speedup_answer_measured,speedup_modeled,trusted_kb,page_us,hot_working_kb,cold_working_kb,cold_pages_est,hot_pages_avg
+large,14,16384,128,1.200,8,4096,200,flat_original_enigmap,1835.998,1835.998,1835.998,1835.998,1675.563,159.921,1835.998,-1.000,1.000,1.000,1.000,0,0.000,19,20480,736.000,0.000
+large,14,16384,128,1.200,8,4096,200,packed_FO_original_enigmap,134.375,1927.045,1937.252,474.982,1669.805,266.625,1937.252,81.000,0.948,3.865,0.948,0,0.000,19,20480,736.000,2.000
+large,14,16384,128,1.200,8,4096,200,packed_TM_original_enigmap,139.473,1795.986,454.257,454.211,313.975,139.673,454.211,81.000,4.042,4.042,4.042,0,0.000,19,20480,736.000,2.000

@@ -392,6 +392,28 @@ Bytes PathORAM::export_state(int store_id) const {
     return buf;
 }
 
+PathORAM PathORAM::from_state_with_storage(
+    const Bytes& blob, std::unique_ptr<StorageInterface> storage) {
+    const uint8_t* p = blob.data();
+    auto di = [&]() -> int { int v; std::memcpy(&v,p,4); p+=4; return v; };
+    auto db = [&]() -> Bytes { int n=di(); Bytes v(p,p+n); p+=n; return v; };
+    auto dblk = [&]() -> Block { int k=di(); int l=di(); Bytes v=db(); return {k,l,std::move(v)}; };
+    (void)di(); // store_id
+    int level = di();
+    int leaf_range = di();
+    PathORAM o;
+    o.num_data_ = di(); o.bucket_size_ = di(); o.stash_max_size_ = di(); o.block_size_bytes_ = di();
+    o.aes_key_ = db();
+    int pm_sz = di();
+    for (int i = 0; i < pm_sz; ++i) { int k=di(); int v=di(); o.pos_map_[k]=v; }
+    int st_sz = di();
+    for (int i = 0; i < st_sz; ++i) o.stash_.push_back(dblk());
+    o.cached_level_ = level;
+    o.cached_leaf_range_ = leaf_range;
+    o.storage_ = std::move(storage);
+    return o;
+}
+
 PathORAM PathORAM::from_state_network(const uint8_t*& p,
                                       std::shared_ptr<TcpChannel> channel) {
     auto di = [&]() -> int { int v; std::memcpy(&v,p,4); p+=4; return v; };
