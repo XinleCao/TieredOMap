@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_map>
 #include <vector>
 
 using namespace tiered_omap;
@@ -28,6 +29,7 @@ using EnigPathOram =
 using EnigOramClient = _OBST::OramClient::OramClient<EnigPathOram>;
 using EnigObst = _OBST::OBST::OBST<EnigOramClient>;
 using EnigStashedBlock = EnigObst::StashedBlock_t;
+using EnigLargeBucket = EnigPathOram::ORAMClientInterface_t::LargeBucket_t;
 
 struct Config {
     int min_logN = 8;
@@ -100,6 +102,17 @@ static std::vector<int> make_hot_keys(int n) {
 
 static void ensure_dir(const std::string& dir) {
     ::mkdir(dir.c_str(), 0755);
+}
+
+static double seconds_since(Clock::time_point start) {
+    return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+static void log_stage(int logN, const std::string& stage,
+                      Clock::time_point start) {
+    std::cout << "logN=" << logN << " stage=" << stage
+              << " sec=" << std::fixed << std::setprecision(3)
+              << seconds_since(start) << "\n";
 }
 
 static void verify_value(int key, const Bytes& value) {
@@ -310,11 +323,12 @@ static void place_blocks_in_enig_path_oram(
     EnigObst& map,
     const std::vector<EnigStashedBlock>& blocks) {
     auto& path_oram = map.oram.oram;
-    auto& storage = path_oram.oramServerClient;
     const uint64_t height = path_oram.L_;
     const uint64_t bucket_count = (uint64_t{1} << (height + 1)) - 1;
     std::vector<uint8_t> occupancy(bucket_count, 0);
     std::vector<EnigStashedBlock> overflow;
+    std::unordered_map<uint64_t, EnigLargeBucket> large_buckets;
+    large_buckets.reserve(blocks.size() / 8 + 16);
 
     for (const auto& block : blocks) {
         const uint64_t leaf = block.oaddress.position;
@@ -325,20 +339,32 @@ static void place_blocks_in_enig_path_oram(
             if (occupancy[node] >= ORAM__Z) continue;
 
             uint8_t slot = occupancy[node]++;
-            storage.WriteBlock(leaf, static_cast<_ORAM::Index>(depth), slot,
-                               block.block);
-            EnigPathOram::BucketMetadata_t md;
-            storage.ReadBucketMetadata(leaf, static_cast<_ORAM::Index>(depth),
-                                       md);
-            md.addresses[slot] = block.oaddress;
-            storage.WriteBucketMetadata(leaf, static_cast<_ORAM::Index>(depth),
-                                        md);
+            auto root_depth =
+                static_cast<_ORAM::Index>(depth)
+                - (static_cast<_ORAM::Index>(depth)
+                   % ORAM_SERVER__LEVELS_PER_PACK);
+            auto root_idx =
+                _ORAM::Indexers::GetHBIndex<ORAM_SERVER__LEVELS_PER_PACK>(
+                    height, leaf, root_depth);
+            auto inner_idx =
+                _ORAM::Indexers::GetLBIndex<ORAM_SERVER__LEVELS_PER_PACK>(
+                    height, leaf, static_cast<_ORAM::Index>(depth));
+            auto [it, inserted] =
+                large_buckets.emplace(root_idx, EnigLargeBucket::DUMMY());
+            auto& bucket = it->second.buckets[inner_idx];
+            bucket.blocks[slot] = block.block;
+            bucket.md.addresses[slot] = block.oaddress;
             placed = true;
             break;
         }
         if (!placed) {
             overflow.push_back(block);
         }
+    }
+
+    auto& storage = path_oram.oramServerClient;
+    for (const auto& [root_idx, large_bucket] : large_buckets) {
+        storage.server.Write(root_idx, large_bucket);
     }
 
     if (overflow.size() > path_oram.S_) {
@@ -599,8 +625,10 @@ static void run_all(const Config& cfg) {
                   << std::fixed << std::setprecision(2)
                   << (backend_bytes / 1024.0 / 1024.0 / 1024.0)
                   << " GiB required\n";
+        auto stage_start = Clock::now();
         auto data = make_data(N, cfg.value_size);
         auto hk = make_hot_keys(n);
+        log_stage(logN, "data_generation", stage_start);
         uint64_t hot_working_kb =
             (estimate_packed_hot_working_bytes(n, cfg.value_size) + 1023) / 1024;
         uint64_t cold_working_kb =
@@ -611,8 +639,11 @@ static void run_all(const Config& cfg) {
         {
             ZipfSampler zipf(N, cfg.s, 42);
             OriginalEnigMapRefs flat_map(N, cfg.value_size);
-            for (const auto& [k, v] : data) flat_map.insert_or_update(k, v);
+            stage_start = Clock::now();
+            flat_map.bulk_load_sorted(data);
+            log_stage(logN, "flat_bulk_setup", stage_start);
 
+            stage_start = Clock::now();
             double sum_us = 0;
             for (int q = 0; q < cfg.Q; ++q) {
                 int key = zipf.sample();
@@ -622,6 +653,7 @@ static void run_all(const Config& cfg) {
                 verify_value(key, value);
                 sum_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
             }
+            log_stage(logN, "flat_queries", stage_start);
             flat.config = "flat_original_enigmap";
             flat.flat = true;
             flat.hot_us = flat.cold_us = flat.total_us = sum_us / cfg.Q;
@@ -632,8 +664,12 @@ static void run_all(const Config& cfg) {
         std::vector<Measurement> packed_rows;
         for (bool tm : {false, true}) {
             PackedOriginalEnigMap packed(N, n, cfg.value_size);
+            stage_start = Clock::now();
             packed.init(data, hk);
+            log_stage(logN, tm ? "packed_TM_setup" : "packed_FO_setup",
+                      stage_start);
 
+            stage_start = Clock::now();
             double sum_hot = 0, sum_cold = 0, sum_total = 0;
             double sum_all_hot_pages = 0, sum_hot_query_pages = 0;
             int hot_cnt = 0, cold_cnt = 0;
@@ -656,6 +692,8 @@ static void run_all(const Config& cfg) {
                     ++cold_cnt;
                 }
             }
+            log_stage(logN, tm ? "packed_TM_queries" : "packed_FO_queries",
+                      stage_start);
             Measurement m;
             m.config = tm ? "packed_TM_original_enigmap"
                           : "packed_FO_original_enigmap";

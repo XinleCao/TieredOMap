@@ -44,6 +44,14 @@ cp external/EnigMap/build_noboost_linux/ods/libcommon.a \
 cmake --build build --target bench_tee_original_enigmap -j$(nproc)
 ```
 
+For large runs, also patch EnigMap's ORAM server frontend to use lazy
+initialization. In
+`external/EnigMap/ods/oram/common/oram_client_interface.hpp`, the
+`NonCachedServerFrontendInstance` member should pass `true` for the final
+`LATE_INIT` template parameter. Without this, the artifact eagerly encrypts and
+writes every dummy large bucket during construction, which is prohibitive for
+`2^24`.
+
 The benchmark repairs only EnigMap artifact setup. It bulk-loads a balanced OBST
 into a valid Path-ORAM state, then leaves query execution on the original
 `OBST::Get()` path. It also resizes EnigMap's default memory backend per
