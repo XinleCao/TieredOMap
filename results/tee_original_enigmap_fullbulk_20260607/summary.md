@@ -24,11 +24,25 @@ then executes queries through the original `OBST::Get()` implementation.
 
 ## Key Results
 
-| logN | Flat us | FO answer us | FO total us | FO answer speedup | FO total speedup | TM us | TM speedup | Hit pct |
+Response latency follows the same hot/cold/average split as the client/server
+experiments. `FO hot response` is the early hot-phase response time, `FO cold
+response` is the cold-query response time, and `FO avg response` is the workload
+average under the measured hit ratio.
+
+| logN | Flat response us | FO hot response us | FO cold response us | FO avg response us | FO avg speedup | FO total us | FO total speedup | Hit pct |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16 | 2203.495 | 704.140 | 2361.215 | 3.129 | 0.933 | 664.918 | 3.314 | 75.000 |
-| 20 | 3584.886 | 1106.723 | 3703.745 | 3.239 | 0.968 | 1069.465 | 3.352 | 73.000 |
-| 24 | 5189.755 | 1658.419 | 5370.560 | 3.129 | 0.966 | 1607.158 | 3.229 | 71.000 |
+| 16 | 2203.495 | 160.431 | 2335.266 | 704.140 | 3.129 | 2361.215 | 0.933 | 75.000 |
+| 20 | 3584.886 | 160.847 | 3664.092 | 1106.723 | 3.239 | 3703.745 | 0.968 | 73.000 |
+| 24 | 5189.755 | 160.476 | 5325.795 | 1658.419 | 3.129 | 5370.560 | 0.966 | 71.000 |
+
+For TM, response time and completion time coincide because the server skips the
+unneeded tier once tier membership is public.
+
+| logN | TM hot response us | TM cold response us | TM avg response us | TM speedup | Hit pct |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 159.781 | 2180.238 | 664.895 | 3.314 | 75.000 |
+| 20 | 160.103 | 3528.029 | 1069.443 | 3.352 | 73.000 |
+| 24 | 159.745 | 5150.748 | 1607.136 | 3.229 | 71.000 |
 
 The `2^24` run completed successfully. Its EnigMap backend estimate was
 72.00 GiB and peak RSS was about 88.9 GB, so it stayed within the large-memory
@@ -43,9 +57,10 @@ path, while cold queries still use EnigMap's original `OBST::Get()`.
 
 The FO configuration has two distinct metrics. Its server completion time is
 slightly slower than the flat baseline because FO still performs both hot-side
-and cold-side work. Its answer latency is much better, however: hot queries can
-release the response after the hot phase while the oblivious cold-side work
-continues. The measured FO answer speedup is about 3.1x to 3.2x in this run.
+and cold-side work. Its response latency is much better, however: hot queries
+can release the response after the hot phase while the oblivious cold-side work
+continues. Under this workload, the hot/cold mix gives an average FO response
+speedup of about 3.1x to 3.2x.
 
 This run is therefore useful for two claims: TM improves server completion time,
 and FO improves time-to-answer without exposing tier membership in the query

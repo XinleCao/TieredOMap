@@ -58,11 +58,13 @@ into a valid Path-ORAM state, then leaves query execution on the original
 database size; the original artifact default is only `1 << 28` bytes and aborts
 around `2^15` keys.
 
-The CSV separates `measured_total_us` from `measured_answer_us`. In FO mode,
-`measured_answer_us` records early response latency for hot queries and final
-completion latency for cold queries. `measured_total_us` always records the full
-server-side work, including the oblivious cold-side work that continues after an
-early hot response.
+The CSV separates response latency from full server completion time.
+`measured_hot_us` records hot-query response latency, `measured_cold_us` records
+cold-query response latency, and `measured_answer_us` records the workload
+average under the observed hit ratio. In FO mode, hot queries can release an
+early response after the hot phase; `measured_total_us` still records the full
+server-side work, including the oblivious cold-side work that continues after
+that early response.
 
 ## Environments
 
