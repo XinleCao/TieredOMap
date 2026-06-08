@@ -1,0 +1,150 @@
+============================================
+ TEE Original EnigMap Paper Run
+ outdir=/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901
+ logNs=16 20 24
+ n=1024  s=1.0  Q=200
+ env=large trusted_kb=8192 page_us=8
+============================================
+
+[256B_map] logN=16
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=0
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=16 EnigMap backend=0.28 GiB required
+logN=16 stage=data_generation sec=0.010
+logN=16 stage=flat_bulk_setup sec=0.131
+logN=16 stage=flat_queries sec=0.438
+logN=16 stage=packed_FO_setup sec=0.098
+logN=16 stage=packed_FO_queries sec=0.508
+logN=16 stage=packed_TM_setup sec=0.096
+logN=16 stage=packed_TM_queries sec=0.190
+       large    16           flat_original_enigmap      2190.0      2190.0     1.00     1.00       -
+       large    16      packed_FO_original_enigmap      2530.0      2530.0     0.87     0.87      68
+       large    16      packed_TM_original_enigmap       939.7       939.6     2.33     2.33      68
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/256B_map/log16/tee_original_enigmap.csv
+TimeTracker::Log:
+
+[4KB_full_query] logN=16
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=4096
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=16 EnigMap backend=0.28 GiB required
+logN=16 stage=data_generation sec=0.005
+[tee_data_oram] cache saved: "/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/data_oram_cache/pathoram-v1-N65536-bs4-vs4096"
+logN=16 stage=data_oram_setup_or_load sec=1.434
+logN=16 stage=flat_bulk_setup sec=0.119
+logN=16 stage=flat_queries sec=0.479
+logN=16 stage=packed_FO_setup sec=0.085
+logN=16 stage=packed_FO_queries sec=0.509
+logN=16 stage=packed_TM_setup sec=0.084
+logN=16 stage=packed_TM_queries sec=0.180
+       large    16           flat_original_enigmap      2394.6      2394.6     1.00     1.00       -
+       large    16      packed_FO_original_enigmap      2534.4      2534.4     0.94     0.94      68
+       large    16      packed_TM_original_enigmap       891.8       891.8     2.69     2.69      68
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/4KB_full_query/log16/tee_original_enigmap.csv
+TimeTracker::Log:
+
+[256B_map] logN=20
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=0
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=20 EnigMap backend=4.50 GiB required
+logN=20 stage=data_generation sec=0.150
+logN=20 stage=flat_bulk_setup sec=2.045
+logN=20 stage=flat_queries sec=0.712
+logN=20 stage=packed_FO_setup sec=1.642
+logN=20 stage=packed_FO_queries sec=0.816
+logN=20 stage=packed_TM_setup sec=1.605
+logN=20 stage=packed_TM_queries sec=0.394
+       large    20           flat_original_enigmap      3559.7      3559.7     1.00     1.00       -
+       large    20      packed_FO_original_enigmap      3911.9      3911.9     0.91     0.91      54
+       large    20      packed_TM_original_enigmap      1804.1      1804.1     1.97     1.97      54
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/256B_map/log20/tee_original_enigmap.csv
+TimeTracker::Log:
+
+[4KB_full_query] logN=20
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=4096
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=20 EnigMap backend=4.50 GiB required
+logN=20 stage=data_generation sec=0.073
+[tee_data_oram] cache saved: "/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/data_oram_cache/pathoram-v1-N1048576-bs4-vs4096"
+logN=20 stage=data_oram_setup_or_load sec=24.336
+logN=20 stage=flat_bulk_setup sec=1.897
+logN=20 stage=flat_queries sec=0.767
+logN=20 stage=packed_FO_setup sec=1.452
+logN=20 stage=packed_FO_queries sec=0.836
+logN=20 stage=packed_TM_setup sec=1.429
+logN=20 stage=packed_TM_queries sec=0.403
+       large    20           flat_original_enigmap      3836.4      3836.4     1.00     1.00       -
+       large    20      packed_FO_original_enigmap      4013.1      4013.1     0.96     0.96      54
+       large    20      packed_TM_original_enigmap      1851.9      1851.9     2.07     2.07      54
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/4KB_full_query/log20/tee_original_enigmap.csv
+TimeTracker::Log:
+
+[256B_map] logN=24
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=0
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=24 EnigMap backend=72.00 GiB required
+logN=24 stage=data_generation sec=2.373
+logN=24 stage=flat_bulk_setup sec=33.131
+logN=24 stage=flat_queries sec=1.053
+logN=24 stage=packed_FO_setup sec=26.497
+logN=24 stage=packed_FO_queries sec=1.652
+logN=24 stage=packed_TM_setup sec=25.118
+logN=24 stage=packed_TM_queries sec=1.150
+       large    24           flat_original_enigmap      5266.6      5266.6     1.00     1.00       -
+       large    24      packed_FO_original_enigmap      5592.5      5592.5     0.94     0.94      44
+       large    24      packed_TM_original_enigmap      3081.3      3081.3     1.71     1.71      44
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/256B_map/log24/tee_original_enigmap.csv
+TimeTracker::Log:
+
+[4KB_full_query] logN=24
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=4096
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=24 EnigMap backend=72.00 GiB required
+logN=24 stage=data_generation sec=1.157
+[tee_data_oram] cache saved: "/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/data_oram_cache/pathoram-v1-N16777216-bs4-vs4096"
+logN=24 stage=data_oram_setup_or_load sec=2885.262
+logN=24 stage=flat_bulk_setup sec=31.566
+logN=24 stage=flat_queries sec=1.891
+logN=24 stage=packed_FO_setup sec=24.097
+logN=24 stage=packed_FO_queries sec=2.426
+logN=24 stage=packed_TM_setup sec=23.382
+logN=24 stage=packed_TM_queries sec=1.785
+       large    24           flat_original_enigmap      9451.1      9451.1     1.00     1.00       -
+       large    24      packed_FO_original_enigmap      8930.4      8930.4     1.06     1.06      44
+       large    24      packed_TM_original_enigmap      5718.3      5718.3     1.65     1.65      44
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/4KB_full_query/log24/tee_original_enigmap.csv
+TimeTracker::Log:
+
+Done. Combined CSV files:
+  /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/tee_original_enigmap_256B_map.csv
+  /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/tee_original_enigmap_4KB_full_query.csv
+  /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/tee_original_enigmap_combined.csv
