@@ -1,0 +1,20 @@
+Building tracker with 49 total tracers.
+Building profiler with 49 total tracers.
+Building MaxTracker
+Installing signal handler
+=== Original EnigMap cold-map experiment ===
+env=large trusted_kb=8192 page_us=8 data_val=0
+     profile  logN                          config     meas_us    model_us    spd_m  spd_mod    hit%
+logN=24 EnigMap backend=72.00 GiB required
+logN=24 stage=data_generation sec=2.373
+logN=24 stage=flat_bulk_setup sec=33.131
+logN=24 stage=flat_queries sec=1.053
+logN=24 stage=packed_FO_setup sec=26.497
+logN=24 stage=packed_FO_queries sec=1.652
+logN=24 stage=packed_TM_setup sec=25.118
+logN=24 stage=packed_TM_queries sec=1.150
+       large    24           flat_original_enigmap      5266.6      5266.6     1.00     1.00       -
+       large    24      packed_FO_original_enigmap      5592.5      5592.5     0.94     0.94      44
+       large    24      packed_TM_original_enigmap      3081.3      3081.3     1.71     1.71      44
+  -> /root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/256B_map/log24/tee_original_enigmap.csv
+TimeTracker::Log:

@@ -1,0 +1,48 @@
+# Server setup manifest
+date: Tue Jun  9 00:34:21 CST 2026
+hostname: iZ2zeddqgtkz1n6kr27158Z
+
+## TieredOMap_git HEAD
+cc77036e2793a80e119791beb769b73bc4729d72
+
+## EnigMap HEAD
+4d0bfdb9fc2039029959092796f4d869ee7172ee
+ M ods/oram/common/oram_client_interface.hpp
+?? build_noboost_linux/
+
+## EnigMap local diff
+diff --git a/ods/oram/common/oram_client_interface.hpp b/ods/oram/common/oram_client_interface.hpp
+index 8be87c4..de3b79a 100644
+--- a/ods/oram/common/oram_client_interface.hpp
++++ b/ods/oram/common/oram_client_interface.hpp
+@@ -49,7 +49,7 @@ namespace _ORAM::ORAMClientInterface {
+     //
+     // std::vector<LargeBucket_t> data;
+ 
+-    EM::MemoryServer::NonCachedServerFrontendInstance<LargeBucket_t, ::EM::Backend::MemServerBackend, true, false, false> server;
++    EM::MemoryServer::NonCachedServerFrontendInstance<LargeBucket_t, ::EM::Backend::MemServerBackend, true, false, true> server;
+ 
+     OCI_ONLY(
+       ORAMInterfaceVerifier<Block, Bucket> verifier;
+
+## Run directories
+/root/tieredomap_runs
+/root/tieredomap_runs/logs
+/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901
+/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/256B_map
+/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/4KB_full_query
+/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/data_oram_cache
+/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901/data_oram_runtime
+/root/tieredomap_runs/tee_runner_smoke
+/root/tieredomap_runs/tee_runner_smoke/256B_map
+/root/tieredomap_runs/tee_runner_smoke/4KB_full_query
+/root/tieredomap_runs/tee_runner_smoke/data_oram_cache
+/root/tieredomap_runs/tee_runner_smoke/data_oram_runtime
+
+## Disk usage
+4.0K	/root/tieredomap_runs/latest_tee_n1024_s10_path.txt
+8.0K	/root/tieredomap_runs/logs
+4.0K	/root/tieredomap_runs/server_setup_manifest_20260609.txt
+112G	/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901
+4.0K	/root/tieredomap_runs/tee_original_enigmap_n1024_s10_20260608_231901-small.tgz
+1.8M	/root/tieredomap_runs/tee_runner_smoke
