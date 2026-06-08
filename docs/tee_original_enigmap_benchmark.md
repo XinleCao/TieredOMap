@@ -90,7 +90,7 @@ Large trusted memory:
 
 ```bash
 ./build/bench_tee_original_enigmap \
-  --min_logN 12 --max_logN 18 --n 128 --Q 200 --s 1.2 \
+  --min_logN 12 --max_logN 18 --n 1024 --Q 200 --s 1.0 \
   --env large --outdir results_local/enig_large
 ```
 
@@ -98,7 +98,7 @@ Constrained trusted memory model:
 
 ```bash
 ./build/bench_tee_original_enigmap \
-  --min_logN 12 --max_logN 18 --n 128 --Q 200 --s 1.2 \
+  --min_logN 12 --max_logN 18 --n 1024 --Q 200 --s 1.0 \
   --env constrained --trusted_kb 8192 --page_us 8 \
   --outdir results_local/enig_constrained
 ```
@@ -107,10 +107,21 @@ Real trusted hardware:
 
 ```bash
 ./build/bench_tee_original_enigmap \
-  --min_logN 12 --max_logN 18 --n 128 --Q 200 --s 1.2 \
+  --min_logN 12 --max_logN 18 --n 1024 --Q 200 --s 1.0 \
   --env hardware --trusted_kb 8192 \
   --outdir results_sgx/enig_hardware
 ```
+
+For the current paper-facing TEE table, use the dedicated runner:
+
+```bash
+bash scripts/run_tee_original_enigmap_paper.sh results/tee_original_enigmap_n1024_s10
+```
+
+By default it runs $N \in \{2^{16},2^{20},2^{24}\}$ with
+`n=1024`, Zipf `s=1.0`, and `Q=200`. It emits both the 256B map-side
+comparison and the 4KB full-query comparison with a reusable disk data-ORAM
+cache.
 
 ## CSV Columns
 

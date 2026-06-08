@@ -39,7 +39,7 @@ using EnigLargeBucket = EnigPathOram::ORAMClientInterface_t::LargeBucket_t;
 struct Config {
     int min_logN = 8;
     int max_logN = 12;
-    int n = 128;
+    int n = 1024;
     int value_size = 256;
     int data_value_size = 0;
     int Q = 50;
