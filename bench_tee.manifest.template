@@ -1,9 +1,12 @@
 [libos]
 entrypoint = "/bench_tee"
 
+# Generate with:
+# gramine-manifest -Darch_libdir=/lib/x86_64-linux-gnu -Dtieredomap_root=$PWD bench_tee.manifest.template bench_tee.manifest
+
 [loader]
 log_level = "error"
-argv = ["/bench_tee", "--min_logN", "24", "--max_logN", "24", "--n", "1024", "--val", "256", "--Q", "200", "--s", "1.0", "--outdir", "/root/TieredOMap/tee_results_sgx"]
+argv = ["/bench_tee", "--min_logN", "24", "--max_logN", "24", "--n", "1024", "--val", "256", "--Q", "200", "--s", "1.0", "--outdir", "{{ tieredomap_root }}/tee_results_sgx"]
 
 [loader.env]
 LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
@@ -22,11 +25,11 @@ uri = "file:/usr/lib/x86_64-linux-gnu"
 
 [[fs.mounts]]
 path = "/bench_tee"
-uri = "file:/root/TieredOMap/build/bench_tee"
+uri = "file:{{ tieredomap_root }}/build/bench_tee"
 
 [[fs.mounts]]
-path = "/root/TieredOMap/tee_results_sgx"
-uri = "file:/root/TieredOMap/tee_results_sgx"
+path = "{{ tieredomap_root }}/tee_results_sgx"
+uri = "file:{{ tieredomap_root }}/tee_results_sgx"
 type = "chroot"
 
 [[fs.mounts]]
@@ -44,7 +47,7 @@ max_threads = 4
 debug = false
 edmm_enable = false
 trusted_files = [
-    "file:/root/TieredOMap/build/bench_tee",
+    "file:{{ tieredomap_root }}/build/bench_tee",
     "file:{{ gramine.libos }}",
     "file:{{ gramine.runtimedir() }}/",
     "file:/lib/x86_64-linux-gnu/libcrypto.so.3",
@@ -55,7 +58,7 @@ trusted_files = [
     "file:/lib64/ld-linux-x86-64.so.2",
 ]
 allowed_files = [
-    "file:/root/TieredOMap/tee_results_sgx/",
+    "file:{{ tieredomap_root }}/tee_results_sgx/",
     "file:/tmp/",
 ]
 

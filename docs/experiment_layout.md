@@ -13,9 +13,13 @@ experiments.
 
 Important current entry points:
 
+- `ARTIFACT.md`: shortest reviewer path for build, smoke tests, table mapping,
+  and environment notes.
 - `scripts/run_revised_experiments.sh`: current mainline runner.
   It runs the FO-only client/server experiment and the TEE FO/BatchTM
   experiment under large and constrained trusted-memory settings.
+- `scripts/run_table2_client_fo_remote.sh`: current paper-facing
+  client/server FO table runner.
 - `scripts/run_tee_original_enigmap_paper.sh`: current paper-facing TEE runner
   against the original EnigMap code.  It uses `n=1024`, Zipf `s=1.0`, and runs
   both the 256B map-side and 4KB full-query settings.
@@ -30,6 +34,9 @@ Important current entry points:
 
 ## Result Directories
 
+- `results/paper_tables/`: compact CSV snapshots that match the submitted paper
+  tables.  Treat this directory as the authoritative reviewer-facing table
+  mapping.
 - `results/`: legacy tracked local CSVs from earlier paper experiments.
 - `results_final/`: tracked CSVs used as final-style local experiment snapshots.
 - `server_results/`: tracked server-side experiment snapshots and recovered runs.
@@ -48,7 +55,9 @@ results_local/client_state/stash_ablation/
 
 When a result becomes paper-facing, move or copy only the selected CSV into a
 tracked result directory with a clear name.  Do not commit large raw run
-directories unless they are needed for reproducibility.
+directories unless they are needed for reproducibility.  Do not commit logs
+that contain public IPs, private key paths, remote usernames, or machine-local
+absolute paths.
 
 For the paper-facing stash-only ablation, use:
 

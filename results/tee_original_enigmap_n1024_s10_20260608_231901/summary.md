@@ -17,4 +17,6 @@ Headline results:
 - `256B_map`: FO answer time reduces EnigMap server-side latency by 37.7--52.1%; BatchTM reduces total server-side latency by 41.5--57.1%.
 - `4KB_full_query`: FO answer time reduces EnigMap server-side latency by 39.6--61.2%; BatchTM reduces total server-side latency by 39.5--62.8%.
 
-The reusable large data-ORAM setup was kept on the server and was not copied into this repository. Only CSVs and logs are archived here.
+The reusable large data-ORAM setup was kept on the experiment server and was
+not copied into this repository. The public artifact keeps only selected CSV
+snapshots and this summary.

@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ─── Library ─────────────────────────────────────────────────────────────────
+# Library
 
 add_library(tiered_omap STATIC
     src/oram/binary_tree_storage.cpp
@@ -33,12 +33,12 @@ target_include_directories(tiered_omap PUBLIC
 
 target_compile_options(tiered_omap PRIVATE -Wall -Wextra -Wpedantic)
 
-# ─── OpenSSL (AES-128 encryption) ────────────────────────────────────────────
+# OpenSSL (AES-128 encryption)
 
 find_package(OpenSSL REQUIRED)
 target_link_libraries(tiered_omap PUBLIC OpenSSL::Crypto)
 
-# ─── Google Test (optional) ───────────────────────────────────────────────────
+# Google Test (optional)
 
 find_package(GTest QUIET)
 
@@ -61,10 +61,10 @@ if(GTest_FOUND)
         add_test(NAME ${tgt} COMMAND ${tgt})
     endforeach()
 else()
-    message(STATUS "GTest not found — skipping test targets")
+    message(STATUS "GTest not found - skipping test targets")
 endif()
 
-# ─── Benchmark ───────────────────────────────────────────────────────────────
+# Benchmark
 
 function(add_tiered_benchmark target)
     add_executable(${target} benchmark/${target}.cpp)
@@ -102,7 +102,7 @@ if(EXISTS "${ENIGMAP_ROOT}/ods/otree/otree.hpp" AND EXISTS "${ENIGMAP_COMMON_LIB
     )
 endif()
 
-# ─── ORAM Server ─────────────────────────────────────────────────────────────
+# ORAM Server
 
 add_executable(oram_server tools/oram_server.cpp)
 target_link_libraries(oram_server PRIVATE tiered_omap)

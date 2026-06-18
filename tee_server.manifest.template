@@ -1,6 +1,9 @@
 [libos]
 entrypoint = "/tee_server"
 
+# Generate with:
+# gramine-manifest -Darch_libdir=/lib/x86_64-linux-gnu -Dtieredomap_root=$PWD tee_server.manifest.template tee_server.manifest
+
 [loader]
 log_level = "error"
 argv = ["/tee_server", "--min_logN", "14", "--max_logN", "22", "--n", "1024", "--val", "256", "--port", "12345"]
@@ -22,7 +25,7 @@ uri = "file:/usr/lib/x86_64-linux-gnu"
 
 [[fs.mounts]]
 path = "/tee_server"
-uri = "file:/root/TieredOMap/build/tee_server"
+uri = "file:{{ tieredomap_root }}/build/tee_server"
 
 [[fs.mounts]]
 path = "/etc"
@@ -34,7 +37,7 @@ max_threads = 4
 debug = false
 edmm_enable = false
 trusted_files = [
-    "file:/root/TieredOMap/build/tee_server",
+    "file:{{ tieredomap_root }}/build/tee_server",
     "file:{{ gramine.libos }}",
     "file:{{ gramine.runtimedir() }}/",
     "file:/lib/x86_64-linux-gnu/libcrypto.so.3",

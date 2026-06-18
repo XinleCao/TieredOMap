@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-OUTDIR="/root/TieredOMap/tee_results_sgx"
-BUILDDIR="/root/TieredOMap/build"
-WORKDIR="/root/TieredOMap"
+WORKDIR="${TIEREDOMAP_ROOT:-$PWD}"
+BUILDDIR="${TIEREDOMAP_BUILDDIR:-$WORKDIR/build}"
+OUTDIR="${TIEREDOMAP_OUTDIR:-$WORKDIR/tee_results_sgx}"
 mkdir -p "$OUTDIR"
 rm -f "$OUTDIR"/*.csv
 
@@ -81,7 +81,7 @@ enable_sigterm_injection = true
 EOF
 
     cd "$WORKDIR"
-    gramine-manifest -Darch_libdir=/lib/x86_64-linux-gnu bench_run.manifest.template bench_run.manifest
+    gramine-manifest -Darch_libdir=/lib/x86_64-linux-gnu -Dtieredomap_root="$WORKDIR" bench_run.manifest.template bench_run.manifest
     gramine-sgx-sign --manifest bench_run.manifest --output bench_run.manifest.sgx 2>/dev/null
 
     echo "[$(date)] Running logN=$min_logN..$max_logN with enclave=$enclave_size ..."
