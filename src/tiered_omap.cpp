@@ -60,6 +60,11 @@ void TieredOMap::enable_maintenance(const MaintenanceConfig& mc) {
     maint_->init_cache(cache_entries);
 }
 
+void TieredOMap::benchmark_set_maintenance_access_count(int total) {
+    if (maint_)
+        maint_->benchmark_set_total_accesses(total);
+}
+
 void TieredOMap::init(
     const std::vector<std::pair<int, Bytes>>& all_data,
     const std::vector<int>& hot_keys) {
@@ -398,6 +403,8 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
             result.cold_bw = ir.cold_bw;
             result.total_bw = ir.total_bw;
             result.rounds_to_answer = ir.rounds_to_answer;
+            result.answer_elapsed_us = ir.answer_elapsed_us;
+            result.total_elapsed_us = ir.total_elapsed_us;
             result.last_access_fp = ir.last_access_fp;
             query_stats_ready = true;
             if (debug_access_) {
@@ -645,6 +652,8 @@ AccessResult TieredOMap::access(int key, const Bytes* new_value) {
         result.cold_bw = ir.cold_bw;
         result.total_bw = ir.total_bw;
         result.rounds_to_answer = ir.rounds_to_answer;
+        result.answer_elapsed_us = ir.answer_elapsed_us;
+        result.total_elapsed_us = ir.total_elapsed_us;
         return result;
     }
 
@@ -931,6 +940,7 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                                             int cold_insert_key,
                                             bool hot_dummy_pb,
                                             bool cold_dummy_pb) {
+    auto access_start = std::chrono::high_resolution_clock::now();
     AccessResult result;
     bool fo = !use_partial_dummy;
 
@@ -963,6 +973,9 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
             std::max(result.hot_bw.rounds, result.cold_bw.rounds) +
             data_bw.rounds;
         result.rounds_to_answer = static_cast<int>(result.total_bw.rounds);
+        result.answer_elapsed_us = std::chrono::duration<double, std::micro>(
+            std::chrono::high_resolution_clock::now() - access_start).count();
+        result.total_elapsed_us = result.answer_elapsed_us;
         if (!is_hot) result.cold_ref = ref;
         return result;
     }
@@ -1108,6 +1121,8 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                 Bytes sv = new_value ? *new_value : b.value;
                 data_oram_.add_to_stash({hot_data_blk, hot_data_new_leaf, std::move(sv)});
                 answer_round = total_rounds;
+                result.answer_elapsed_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::high_resolution_clock::now() - access_start).count();
             }
             hot_data_st = NEED_WRITE;
         }
@@ -1120,6 +1135,8 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
                 Bytes sv = new_value ? *new_value : b.value;
                 data_oram_.add_to_stash({cold_data_blk, cold_data_new_leaf, std::move(sv)});
                 answer_round = total_rounds;
+                result.answer_elapsed_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::high_resolution_clock::now() - access_start).count();
             }
             cold_data_st = NEED_WRITE;
         }
@@ -1295,6 +1312,10 @@ AccessResult TieredOMap::interleaved_access(int key, const Bytes* new_value,
 
     result.rounds_to_answer = answer_round > 0 ? answer_round
         : static_cast<int>(result.total_bw.rounds);
+    result.total_elapsed_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - access_start).count();
+    if (result.answer_elapsed_us <= 0.0)
+        result.answer_elapsed_us = result.total_elapsed_us;
 
     return result;
 }

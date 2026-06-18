@@ -122,6 +122,11 @@ public:
     const MaintenanceConfig& config() const { return cfg_; }
     const std::vector<CacheEntry>& cache() const { return cache_; }
 
+    void benchmark_set_total_accesses(int total) {
+        total_accesses_ = std::max(0, total);
+        obs_epoch_ = total_accesses_ / cfg_.observation_window;
+    }
+
 private:
     bool can_maintain() const {
         return total_accesses_ > 0 && obs_epoch_ > 0;

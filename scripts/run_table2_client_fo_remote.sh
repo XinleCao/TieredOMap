@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Run Table 2 client/server FO rows one configuration at a time.
-# Intended for the storage server host: start oram_server separately, then run
-# this client through TCP localhost while modeling the measured WAN RTT.
+# Intended for the client host: start oram_server separately on the storage
+# server, then run this client over TCP. By default response_ms is measured
+# wall-clock time. Set RTT_MS explicitly only for a modeled round-count run.
 
 set -euo pipefail
 
 Q=${Q:-1024}
 WARMUP=${WARMUP:-0}
 VALUE_SIZE=${VALUE_SIZE:-4096}
-RTT_MS=${RTT_MS:-28.87}
+RTT_MS=${RTT_MS:-}
 RECV_TIMEOUT=${RECV_TIMEOUT:-7200}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-12345}
@@ -23,7 +24,11 @@ BUILD_DIR="$PROJECT_DIR/build"
 mkdir -p "$OUTDIR"
 
 echo "Table 2 client/server FO run"
-echo "  Q=$Q warmup=$WARMUP value_size=$VALUE_SIZE rtt_ms=$RTT_MS"
+if [[ -n "$RTT_MS" ]]; then
+    echo "  Q=$Q warmup=$WARMUP value_size=$VALUE_SIZE response=modeled rtt_ms=$RTT_MS"
+else
+    echo "  Q=$Q warmup=$WARMUP value_size=$VALUE_SIZE response=measured_wall_clock"
+fi
 echo "  recv_timeout=$RECV_TIMEOUT"
 echo "  host=$HOST port=$PORT"
 echo "  backends=$BACKENDS"
@@ -34,9 +39,9 @@ for backend in $BACKENDS; do
     for logN in $LOGNS; do
         echo ""
         echo "==== $(date '+%F %T') backend=$backend logN=$logN ===="
-        free -h || true
+        if command -v free >/dev/null 2>&1; then free -h; fi
         df -h / || true
-        "$BUILD_DIR/bench_paper" \
+        cmd=("$BUILD_DIR/bench_paper" \
             --exp=client_fo \
             --Q="$Q" \
             --warmup="$WARMUP" \
@@ -44,11 +49,14 @@ for backend in $BACKENDS; do
             --backend="$backend" \
             --value_size="$VALUE_SIZE" \
             --client_fo_standalone=0 \
-            --rtt_ms="$RTT_MS" \
             --recv_timeout="$RECV_TIMEOUT" \
             --outdir="$OUTDIR" \
             --host="$HOST" \
-            --port="$PORT"
+            --port="$PORT")
+        if [[ -n "$RTT_MS" ]]; then
+            cmd+=(--rtt_ms="$RTT_MS")
+        fi
+        "${cmd[@]}"
         echo "==== $(date '+%F %T') done backend=$backend logN=$logN ===="
     done
 done

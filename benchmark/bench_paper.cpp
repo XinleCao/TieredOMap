@@ -1248,15 +1248,21 @@ struct ClientBwSample {
     double total = 0.0;
     double rounds = 0.0;
     double answer_rounds = 0.0;
+    double total_response_us = 0.0;
+    double answer_response_us = 0.0;
     int hot = 0;
     int count = 0;
 
-    void add(const AccessResult& r) {
+    void add(const AccessResult& r, double measured_total_us) {
         down += r.total_bw.bytes_downloaded;
         up += r.total_bw.bytes_uploaded;
         total += r.total_bw.total_bytes();
         rounds += r.total_bw.rounds;
         answer_rounds += r.rounds_to_answer;
+        total_response_us += r.total_elapsed_us > 0.0
+            ? r.total_elapsed_us : measured_total_us;
+        answer_response_us += r.answer_elapsed_us > 0.0
+            ? r.answer_elapsed_us : measured_total_us;
         if (r.found_in_hot) ++hot;
         ++count;
     }
@@ -1267,6 +1273,8 @@ struct ClientBwSample {
     double avg_total_kb() const { return total / denom() / 1024.0; }
     double avg_rounds() const { return rounds / denom(); }
     double avg_answer_rounds() const { return answer_rounds / denom(); }
+    double avg_total_response_us() const { return total_response_us / denom(); }
+    double avg_answer_response_us() const { return answer_response_us / denom(); }
     double hit_pct() const { return count > 0 ? 100.0 * hot / count : 0.0; }
 };
 
@@ -1298,11 +1306,59 @@ static ClientBwSample measure_client_bw(TieredOMap& tm, int N, const Cfg& cfg,
     ClientBwSample s;
     ZipfSampler z(N, cfg.s, measure_seed);
     for (int i = 0; i < cfg.Q; ++i) {
+        auto t0 = Clock::now();
         auto r = tm.access(z.sample());
-        s.add(r);
+        auto t1 = Clock::now();
+        double measured_total_us = std::chrono::duration<double, std::micro>(
+            t1 - t0).count();
+        s.add(r, measured_total_us);
         g_progress.query_tick(i, cfg.Q);
     }
     return s;
+}
+
+static ClientBwSample measure_one_client_bw(TieredOMap& tm, int key) {
+    ClientBwSample s;
+    auto t0 = Clock::now();
+    auto r = tm.access(key);
+    auto t1 = Clock::now();
+    double measured_total_us = std::chrono::duration<double, std::micro>(
+        t1 - t0).count();
+    s.add(r, measured_total_us);
+    return s;
+}
+
+static ClientBwSample amortized_dynamic_sample(
+    const ClientBwSample& normal,
+    const std::vector<ClientBwSample>& phased,
+    int interval) {
+    ClientBwSample out = normal;
+    double inv = 1.0 / std::max(interval, 1);
+    for (const auto& p : phased) {
+        out.down += (p.down - normal.down) * inv;
+        out.up += (p.up - normal.up) * inv;
+        out.total += (p.total - normal.total) * inv;
+        out.rounds += (p.rounds - normal.rounds) * inv;
+        out.answer_rounds += (p.answer_rounds - normal.answer_rounds) * inv;
+        out.total_response_us +=
+            (p.total_response_us - normal.total_response_us) * inv;
+        out.answer_response_us +=
+            (p.answer_response_us - normal.answer_response_us) * inv;
+    }
+    out.count = 1;
+    out.hot = normal.hot;
+    return out;
+}
+
+static int benchmark_counter_before_phase(const MaintenanceConfig& mc,
+                                          int phase) {
+    int interval = std::max(1, mc.swap_interval);
+    int obs = std::max(1, mc.observation_window);
+    int normalized = ((phase % interval) + interval) % interval;
+    int target = obs + normalized;
+    if (normalized == 0)
+        target = ((obs + interval - 1) / interval) * interval;
+    return std::max(0, target - 1);
 }
 
 static void exp_client_dynamic_bw(const Cfg& cfg) {
@@ -1314,11 +1370,18 @@ static void exp_client_dynamic_bw(const Cfg& cfg) {
     existing.close();
     std::ofstream csv(csv_path, append ? std::ios::app : std::ios::out);
     if (!append)
-        csv << "backend,logN,config,B_obs,B_swap,cache_size,piggyback,warmup_q,"
+        csv << "backend,logN,config,base_config,B_obs,B_swap,cache_size,piggyback,warmup_q,"
             << "avg_down_KB,avg_up_KB,avg_bw_KB,avg_rounds,avg_answer_rnd,"
-            << "hit_pct,delta_bw_KB,bw_over_static_pct,delta_rounds\n";
+            << "hit_pct,avg_response_ms,avg_answer_ms,delta_bw_KB,"
+            << "bw_over_base_pct,delta_rounds,delta_response_ms,"
+            << "response_over_base_pct,delta_answer_ms,"
+            << "answer_over_base_pct\n";
 
     auto logNs = selected_logNs(cfg);
+    auto response_ms = [&](double measured_us, double rounds) -> double {
+        return cfg.rtt_us > 0 ? rounds * cfg.rtt_us / 1000.0
+                              : measured_us / 1000.0;
+    };
 
     for (auto& [label, be] : PAPER_BACKENDS) {
         if (!cfg.backend_filter.empty() && cfg.backend_filter != label)
@@ -1328,7 +1391,7 @@ static void exp_client_dynamic_bw(const Cfg& cfg) {
             int N = 1 << logN;
             int n = std::min(cfg.n, N / 2);
             MaintenanceConfig mc = make_client_dynamic_config(cfg, n);
-            int warmup_q = client_dynamic_warmup_q(cfg, mc);
+            int hot_key = std::min(mc.cache_size, n - 1);
 
             ClientBwSample stat;
             {
@@ -1336,7 +1399,7 @@ static void exp_client_dynamic_bw(const Cfg& cfg) {
                                   + std::to_string(logN) + " static_fo");
                 auto tm = setup_paper_tiered(cfg, be, N, n,
                                              SecurityMode::FullOblivious, true);
-                stat = measure_client_bw(*tm, N, cfg, warmup_q, 42, 4242);
+                stat = measure_one_client_bw(*tm, hot_key);
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(1)
                    << stat.avg_total_kb() << "KB "
@@ -1344,6 +1407,7 @@ static void exp_client_dynamic_bw(const Cfg& cfg) {
                 g_progress.config_done(ss.str());
             }
 
+            ClientBwSample dyn_base;
             ClientBwSample dyn;
             {
                 g_progress.config(std::string(label) + " logN="
@@ -1351,7 +1415,26 @@ static void exp_client_dynamic_bw(const Cfg& cfg) {
                 auto tm = setup_paper_tiered(cfg, be, N, n,
                                              SecurityMode::FullOblivious, true,
                                              0, mc);
-                dyn = measure_client_bw(*tm, N, cfg, warmup_q, 42, 4242);
+                int interval = std::max(1, mc.swap_interval);
+                int scan_phase = 0;
+                int hot_phase = std::max(1, interval / 3);
+                int cold_phase = std::max(2, 2 * interval / 3);
+                int normal_phase = 1;
+                if (normal_phase == hot_phase || normal_phase == cold_phase)
+                    normal_phase = std::min(interval - 1, normal_phase + 1);
+
+                tm->benchmark_set_maintenance_access_count(
+                    benchmark_counter_before_phase(mc, normal_phase));
+                ClientBwSample normal = measure_one_client_bw(*tm, hot_key);
+                dyn_base = normal;
+
+                std::vector<ClientBwSample> phased;
+                for (int phase : {scan_phase, hot_phase, cold_phase}) {
+                    tm->benchmark_set_maintenance_access_count(
+                        benchmark_counter_before_phase(mc, phase));
+                    phased.push_back(measure_one_client_bw(*tm, hot_key));
+                }
+                dyn = amortized_dynamic_sample(normal, phased, interval);
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(1)
                    << dyn.avg_total_kb() << "KB "
@@ -1360,29 +1443,55 @@ static void exp_client_dynamic_bw(const Cfg& cfg) {
             }
 
             auto write_row = [&](const char* be_label, const char* cfg_label,
+                                 const char* base_label,
                                  const ClientBwSample& s,
                                  const ClientBwSample& base) {
                 double delta_bw = s.avg_total_kb() - base.avg_total_kb();
                 double bw_pct = base.avg_total_kb() > 0
                     ? delta_bw / base.avg_total_kb() * 100.0 : 0.0;
                 double delta_rounds = s.avg_rounds() - base.avg_rounds();
+                double resp_ms = response_ms(s.avg_total_response_us(),
+                                             s.avg_rounds());
+                double base_resp_ms = response_ms(base.avg_total_response_us(),
+                                                  base.avg_rounds());
+                double ans_ms = response_ms(s.avg_answer_response_us(),
+                                            s.avg_answer_rounds());
+                double base_ans_ms = response_ms(base.avg_answer_response_us(),
+                                                 base.avg_answer_rounds());
+                double delta_resp_ms = resp_ms - base_resp_ms;
+                double resp_pct = base_resp_ms > 0.0
+                    ? delta_resp_ms / base_resp_ms * 100.0 : 0.0;
+                double delta_ans_ms = ans_ms - base_ans_ms;
+                double ans_pct = base_ans_ms > 0.0
+                    ? delta_ans_ms / base_ans_ms * 100.0 : 0.0;
                 csv << be_label << "," << logN << "," << cfg_label << ","
+                    << base_label << ","
                     << mc.observation_window << "," << mc.swap_interval << ","
                     << mc.cache_size << "," << (mc.piggyback ? 1 : 0) << ","
-                    << warmup_q << ","
+                    << (std::string(cfg_label) == "dynamic_fo"
+                        ? mc.observation_window : 0) << ","
                     << std::fixed << std::setprecision(2)
                     << s.avg_down_kb() << "," << s.avg_up_kb() << ","
                     << s.avg_total_kb() << ","
                     << std::setprecision(1)
                     << s.avg_rounds() << "," << s.avg_answer_rounds() << ","
                     << s.hit_pct() << ","
+                    << response_ms(s.avg_total_response_us(), s.avg_rounds())
+                    << ","
+                    << response_ms(s.avg_answer_response_us(),
+                                   s.avg_answer_rounds()) << ","
                     << std::setprecision(2) << delta_bw << ","
                     << bw_pct << ","
-                    << std::setprecision(1) << delta_rounds << "\n";
+                    << std::setprecision(1) << delta_rounds << ","
+                    << std::setprecision(2) << delta_resp_ms << ","
+                    << resp_pct << ","
+                    << delta_ans_ms << ","
+                    << ans_pct << "\n";
             };
 
-            write_row(label, "static_fo", stat, stat);
-            write_row(label, "dynamic_fo", dyn, stat);
+            write_row(label, "static_fo", "static_fo", stat, stat);
+            write_row(label, "dynamic_no_maint", "static_fo", dyn_base, stat);
+            write_row(label, "dynamic_fo", "dynamic_no_maint", dyn, dyn_base);
             csv.flush();
 
             double over = stat.avg_total_kb() > 0

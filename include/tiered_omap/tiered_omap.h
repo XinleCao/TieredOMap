@@ -55,6 +55,8 @@ struct AccessResult {
     BandwidthStats cold_bw;
     BandwidthStats total_bw;
     int rounds_to_answer = 0;
+    double answer_elapsed_us = 0.0;
+    double total_elapsed_us = 0.0;
     int last_access_fp = 0;
     Bytes scan_ref;
     Bytes cold_ref;
@@ -126,6 +128,7 @@ public:
     DynamicDebugState dynamic_debug_state() const;
 
     void enable_maintenance(const MaintenanceConfig& mc);
+    void benchmark_set_maintenance_access_count(int total);
 
 private:
     Bytes data_access(int blk, const Bytes* new_value = nullptr) {
