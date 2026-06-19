@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_paper_experiments.sh — Run all paper experiments.
+# run_paper_experiments.sh - Run all paper experiments.
 #
 # Local mode (storage in same process):
 #   bash scripts/run_paper_experiments.sh [max_logN] [Q]
@@ -9,10 +9,10 @@
 #   2. On client machine:  bash scripts/run_paper_experiments.sh [max_logN] [Q] [host] [port]
 #
 # Examples:
-#   bash scripts/run_paper_experiments.sh                       # local, logN≤20, Q=200
+#   bash scripts/run_paper_experiments.sh                       # local, logN<=20, Q=200
 #   bash scripts/run_paper_experiments.sh 22 500                # local, larger scale
-#   bash scripts/run_paper_experiments.sh 20 200 10.0.0.1       # TCP, default port 12345
-#   bash scripts/run_paper_experiments.sh 20 200 10.0.0.1 9999  # TCP, custom port
+#   bash scripts/run_paper_experiments.sh 20 200 SERVER_IP      # TCP, default port 12345
+#   bash scripts/run_paper_experiments.sh 20 200 SERVER_IP 9999 # TCP, custom port
 
 set -e
 
@@ -68,7 +68,7 @@ echo "[4/10] Exp: Hot-set size effect..."
 $BENCH --exp=hotsize --Q=$Q --outdir=$OUTDIR $NET_ARGS
 
 echo ""
-echo "[5/10] Exp: Latency (analytical rounds × RTT)..."
+echo "[5/10] Exp: Latency (analytical rounds x RTT)..."
 $BENCH --exp=latency --Q=$Q --outdir=$OUTDIR $NET_ARGS
 
 echo ""

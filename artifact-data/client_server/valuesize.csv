@@ -1,0 +1,13 @@
+value_size,mode,avg_bw_KB
+64,Baseline,526
+256,Baseline,557
+1024,Baseline,683
+4096,Baseline,1187
+64,TM,379
+256,TM,410
+1024,TM,536
+4096,TM,1040
+64,FO,637
+256,FO,668
+1024,FO,794
+4096,FO,1298

@@ -1,0 +1,4 @@
+logN,config,hot_us,cold_us,total_us,hit_pct,enclave_KB
+24,flat_avl,301200.0,301200.0,301200.0,,8000
+24,packed_FO,680.4,279930.4,280009.6,48.0,7584
+24,packed_TM,396.9,280315.7,164149.4,41.5,4456
